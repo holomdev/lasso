@@ -1,15 +1,12 @@
 //! lasso — screen capture tool for Windows.
 //!
-//! Phase 1: the `capture` module (DXGI Output Duplication with a GDI BitBlt
-//! fallback, multi-monitor virtual desktop, per-monitor DPI).
-//! Phase 2: the interactive region-selection overlay.
-//!
-//! Usage:
+//! Commands:
 //!   lasso monitors
-//!   lasso capture [--out FILE.png] [--backend dxgi|gdi]
-//!   lasso select  [--out FILE.png]
+//!   lasso capture [--out FILE.png] [--backend dxgi|gdi] [--clipboard]
+//!   lasso select  [--out FILE.png] [--clipboard]
 
 mod capture;
+mod clipboard;
 mod dpi;
 mod overlay;
 
@@ -32,14 +29,16 @@ fn usage() {
         "lasso — screen capture\n\n\
          USAGE:\n  \
          lasso monitors\n  \
-         lasso capture [--out FILE.png] [--backend dxgi|gdi]\n  \
-         lasso select  [--out FILE.png]\n\n\
+         lasso capture [--out FILE.png] [--backend dxgi|gdi] [--clipboard]\n  \
+         lasso select  [--out FILE.png] [--clipboard]\n\n\
          OPTIONS:\n  \
          -o, --out FILE      output file (capture default: {capture}, select default: {select})\n  \
          -b, --backend NAME  force dxgi or gdi; without it, DXGI with a GDI fallback\n  \
+         -c, --clipboard     also copy the result to the clipboard\n  \
          -h, --help          this help\n\n\
          SELECT KEYS:\n  \
-         left drag           define the region\n  \
+         left drag           define the region, drag inside to move it, drag an edge to resize\n  \
+         arrows              nudge the region by 1 px, or 10 px with Shift\n  \
          Enter               save the region, or the whole screen when none is selected\n  \
          Esc / right click   cancel",
         capture = DEFAULT_CAPTURE_OUT,
@@ -60,6 +59,7 @@ fn main() -> Result<()> {
         "capture" => {
             let mut out = String::from(DEFAULT_CAPTURE_OUT);
             let mut backend: Option<Backend> = None;
+            let mut copy = false;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -76,14 +76,16 @@ fn main() -> Result<()> {
                             other => bail!("unknown backend: {other} (use dxgi or gdi)"),
                         });
                     }
+                    "--clipboard" | "-c" => copy = true,
                     other => bail!("unknown argument: {other}"),
                 }
                 i += 1;
             }
-            cmd_capture(&out, backend)
+            cmd_capture(&out, backend, copy)
         }
         "select" => {
             let mut out = String::from(DEFAULT_SELECT_OUT);
+            let mut copy = false;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -91,11 +93,12 @@ fn main() -> Result<()> {
                         i += 1;
                         out = args.get(i).context("--out needs a value")?.clone();
                     }
+                    "--clipboard" | "-c" => copy = true,
                     other => bail!("unknown argument: {other}"),
                 }
                 i += 1;
             }
-            cmd_select(&out)
+            cmd_select(&out, copy)
         }
         "-h" | "--help" | "help" => {
             usage();
@@ -137,7 +140,7 @@ fn cmd_monitors() -> Result<()> {
     Ok(())
 }
 
-fn cmd_capture(out: &str, backend: Option<Backend>) -> Result<()> {
+fn cmd_capture(out: &str, backend: Option<Backend>, copy: bool) -> Result<()> {
     let (vx, vy, vw, vh) = capture::virtual_desktop();
     eprintln!("[desktop] virtual = {vw}x{vh} @ ({vx},{vy})");
     for m in capture::monitors()? {
@@ -169,10 +172,15 @@ fn cmd_capture(out: &str, backend: Option<Backend>) -> Result<()> {
     println!("pixels  : {} bytes", frame.bgra.len());
     println!("elapsed : {:.1} ms", elapsed.as_secs_f64() * 1000.0);
     println!("file    : {out}");
+
+    if copy {
+        clipboard::copy_bgra(&frame.bgra, frame.width, frame.height)?;
+        println!("clipboard: copied {}x{}", frame.width, frame.height);
+    }
     Ok(())
 }
 
-fn cmd_select(out: &str) -> Result<()> {
+fn cmd_select(out: &str, copy: bool) -> Result<()> {
     let started = Instant::now();
     let frame = capture::capture_virtual_desktop(None)?;
     eprintln!(
@@ -188,13 +196,23 @@ fn cmd_select(out: &str) -> Result<()> {
         return Ok(());
     };
 
+    let bounds = (
+        selection.x,
+        selection.y,
+        selection.width,
+        selection.height,
+    );
+
+    if copy {
+        let region = frame
+            .to_bgra_sub(bounds.0, bounds.1, bounds.2, bounds.3)
+            .context("the selected region falls outside the capture")?;
+        clipboard::copy_bgra(&region, selection.width, selection.height)?;
+        println!("clipboard: copied {}x{}", selection.width, selection.height);
+    }
+
     let image = frame
-        .to_rgba_sub(
-            selection.x,
-            selection.y,
-            selection.width,
-            selection.height,
-        )
+        .to_rgba_sub(bounds.0, bounds.1, bounds.2, bounds.3)
         .context("the selected region falls outside the capture")?;
 
     ensure_parent(out)?;

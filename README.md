@@ -3,8 +3,8 @@
 A screenshot tool for Windows, written in Rust.
 
 > **Status:** early development. The capture engine, the interactive region
-> selection and the magnifier work end to end; the toolbar, annotations and
-> sharing are next.
+> selection, the magnifier and the clipboard work end to end; the tray icon,
+> annotations and sharing are next.
 
 ## Overview
 
@@ -20,7 +20,8 @@ scaling:
   can span monitors with different scale factors without drifting.
 - **Per-monitor DPI aware** (`PER_MONITOR_AWARE_V2`, falling back to the
   Windows 8.1 mode).
-- PNG output.
+- **PNG output**, or straight to the **clipboard** when the image is going to be
+  pasted somewhere rather than kept.
 
 Selecting a region freezes the screen and dims everything outside the
 selection, so the area you are about to keep is the only part at full
@@ -49,6 +50,8 @@ cargo run -- capture
 cargo run -- select
 cargo run -- capture --backend gdi
 cargo run -- capture --out C:\shots\full.png
+cargo run -- capture --clipboard
+cargo run -- select --clipboard
 ```
 
 ### Commands
@@ -56,8 +59,11 @@ cargo run -- capture --out C:\shots\full.png
 | Command | What it does |
 |---|---|
 | `lasso monitors` | Prints the virtual-desktop bounds and every monitor |
-| `lasso capture [--out FILE] [--backend dxgi\|gdi]` | Captures the virtual desktop to a PNG |
-| `lasso select [--out FILE]` | Captures, shows the selection overlay, and saves the chosen region |
+| `lasso capture [--out FILE] [--backend dxgi\|gdi] [--clipboard]` | Captures the virtual desktop to a PNG |
+| `lasso select [--out FILE] [--clipboard]` | Captures, shows the selection overlay, and saves the chosen region |
+
+Both commands take `--clipboard` (`-c`) to put the result on the clipboard as
+well, so it can be pasted somewhere without going through a file.
 
 ### Selection keys
 
@@ -80,6 +86,7 @@ throwaway runs never leave files that could be committed by accident. Pass
 ```
 src/
   main.rs            CLI: monitors | capture | select
+  clipboard.rs       Publishing a frame as CF_DIB
   dpi.rs             DPI awareness bootstrap
   capture/
     mod.rs           Frame, Backend, MonitorInfo, virtual desktop, fallback
@@ -104,7 +111,7 @@ src/
 - [ ] Cursor compositing
 - [ ] Screen rotation
 - [ ] Global hotkeys and tray icon
-- [ ] Clipboard copy
+- [x] Clipboard copy
 - [ ] Annotation tools
 - [ ] Upload and share
 
@@ -154,6 +161,25 @@ zero, which is why only the magnifier ever looked wrong.
 
 The magnifier is drawn with nearest-neighbour stretching, since a magnifier wants
 blocky pixels rather than a smoothed average of them.
+
+### Clipboard
+
+A capture is published as `CF_DIB`: a `BITMAPINFOHEADER` followed by 32-bit
+pixels. Two details matter.
+
+The rows are written **bottom-up**, with a positive `biHeight`. The capture
+naturally holds them top-down, but a DIB pasted that way would show the image
+upside down.
+
+`CF_DIBV5` is deliberately not used. It carries an alpha channel, and a screen
+capture is opaque, so it would only add a format that some applications handle
+worse than the plain one.
+
+The clipboard takes ownership of the memory handed to `SetClipboardData`, so it
+is released only when publishing failed.
+
+The result is checked by reading the clipboard back from a separate process and
+comparing pixels against the saved PNG, which also rules out a vertical flip.
 
 ### Tests
 

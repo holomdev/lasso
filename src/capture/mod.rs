@@ -72,11 +72,11 @@ impl Frame {
             .expect("buffer is sized by construction")
     }
 
-    /// Copy a sub-rectangle of the frame into an RGBA image.
+    /// Copy a sub-rectangle of the frame as BGRA8 rows.
     ///
     /// Returns `None` for an empty rectangle or one that falls outside the
     /// frame, so callers cannot index past the capture.
-    pub fn to_rgba_sub(&self, x: i32, y: i32, width: u32, height: u32) -> Option<image::RgbaImage> {
+    pub fn to_bgra_sub(&self, x: i32, y: i32, width: u32, height: u32) -> Option<Vec<u8>> {
         if x < 0 || y < 0 || width == 0 || height == 0 {
             return None;
         }
@@ -90,6 +90,12 @@ impl Frame {
             let start = ((y as usize + row) * self.width as usize + x as usize) * 4;
             buf.extend_from_slice(&self.bgra[start..start + row_bytes]);
         }
+        Some(buf)
+    }
+
+    /// The same sub-rectangle as an RGBA image, for writing a PNG.
+    pub fn to_rgba_sub(&self, x: i32, y: i32, width: u32, height: u32) -> Option<image::RgbaImage> {
+        let mut buf = self.to_bgra_sub(x, y, width, height)?;
         for px in buf.chunks_exact_mut(4) {
             px.swap(0, 2); // B <-> R
         }
