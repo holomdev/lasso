@@ -15,6 +15,10 @@
 //! The window is created over the exact virtual-desktop rectangle, so client
 //! coordinates map 1:1 onto capture pixels and the selected rectangle can be
 //! used to crop the frame directly.
+//!
+//! Painting is double buffered: every layer is composed into the back buffer
+//! held by [`canvas::Canvas`] and the result reaches the window with a single
+//! blit, so a drag never shows half-drawn frames.
 
 mod canvas;
 
@@ -36,8 +40,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, HCURSOR,
     HWND_TOPMOST, IDC_CROSS, LoadCursorW, MSG, PostQuitMessage, RegisterClassW, SW_SHOW,
     SWP_SHOWWINDOW, SetCursor, SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage,
-    WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN,
-    WM_SETCURSOR, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT,
+    WM_RBUTTONDOWN, WM_SETCURSOR, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::capture::Frame;
@@ -96,6 +100,9 @@ pub fn select_region(frame: &Frame) -> Result<Option<Selection>> {
     let height = frame.height;
     let (vx, vy) = frame.origin;
 
+    // Built before the window so a failure here cannot leave a window behind.
+    let canvas = canvas::Canvas::new(&frame.bgra, width, height)?;
+
     let hmodule = unsafe { GetModuleHandleW(None) }.context("GetModuleHandleW failed")?;
     let hinstance = HINSTANCE(hmodule.0);
     let class_name = w!("LassoOverlay");
@@ -135,7 +142,7 @@ pub fn select_region(frame: &Frame) -> Result<Option<Selection>> {
 
     STATE.with(|slot| {
         *slot.borrow_mut() = Some(State {
-            canvas: canvas::Canvas::new(&frame.bgra, width, height),
+            canvas,
             cursor,
             white: unsafe { CreateSolidBrush(WHITE) },
             black: unsafe { CreateSolidBrush(BLACK) },
@@ -225,6 +232,10 @@ fn invalidate_around(hwnd: HWND, previous: Option<RECT>, current: Option<RECT>) 
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
+        // Handled so Windows never paints a background behind the capture;
+        // an erased background is the other classic source of flicker.
+        WM_ERASEBKGND => LRESULT(1),
+
         WM_SETCURSOR => {
             STATE.with(|slot| {
                 if let Some(st) = slot.borrow().as_ref() {
@@ -263,8 +274,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if let Some(st) = slot.borrow_mut().as_mut() {
                     if st.dragging {
                         let next = rect_from(st.anchor, point);
-                        let previous = st.current.replace(next);
-                        dirty = Some((previous, Some(next)));
+                        // Sub-pixel mouse movement lands on the same rectangle;
+                        // repainting it again would only add work and flicker.
+                        if st.current != Some(next) {
+                            let previous = st.current.replace(next);
+                            dirty = Some((previous, Some(next)));
+                        }
                     }
                 }
             });
@@ -341,7 +356,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
             STATE.with(|slot| {
                 if let Some(st) = slot.borrow().as_ref() {
-                    paint(hdc, st);
+                    paint(hdc, st, &ps.rcPaint);
                 }
             });
             unsafe {
@@ -384,43 +399,34 @@ fn full_screen(canvas: &canvas::Canvas) -> Selection {
     }
 }
 
-fn paint(hdc: HDC, st: &State) {
-    let saved = unsafe { SaveDC(hdc) };
-    if saved == 0 {
-        return;
-    }
+/// Compose every layer into the back buffer and present the invalid region with
+/// a single blit.
+fn paint(window_dc: HDC, st: &State, invalid: &RECT) {
+    let selection = st.current.filter(|rect| validate(*rect).is_some());
+    st.canvas.compose(invalid, selection.as_ref());
 
-    let font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
-    unsafe {
-        SelectObject(hdc, font);
-    }
+    let mem = st.canvas.dc();
+    let saved = unsafe { SaveDC(mem) };
+    if saved != 0 {
+        let font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
+        unsafe {
+            SelectObject(mem, font);
+        }
 
-    st.canvas.paint_dimmed(hdc);
-
-    if let Some(rect) = st.current {
-        if validate(rect).is_some() {
-            // The bright copy is clipped to the selection; the clip change is
-            // confined to its own save level.
-            let inner = unsafe { SaveDC(hdc) };
-            st.canvas.paint_bright(hdc, &rect);
-            if inner != 0 {
-                unsafe {
-                    let _ = RestoreDC(hdc, inner);
-                }
+        if let Some(rect) = st.current {
+            draw_border(mem, &rect, st.white, st.black);
+            if selection.is_some() {
+                draw_size_label(mem, &rect, st.label_bg);
             }
-            draw_border(hdc, &rect, st.white, st.black);
-            draw_size_label(hdc, &rect, st.label_bg);
-        } else {
-            // Mid-drag with no area yet: mark where the drag started.
-            draw_border(hdc, &rect, st.white, st.black);
+        }
+        draw_hint(mem, &st.canvas);
+
+        unsafe {
+            let _ = RestoreDC(mem, saved);
         }
     }
 
-    draw_hint(hdc, &st.canvas);
-
-    unsafe {
-        let _ = RestoreDC(hdc, saved);
-    }
+    st.canvas.present(window_dc, invalid);
 }
 
 fn draw_border(hdc: HDC, rect: &RECT, white: HBRUSH, black: HBRUSH) {

@@ -1,19 +1,24 @@
-//! Off-screen pixel buffers for the selection overlay.
+//! Off-screen buffers for the selection overlay.
 //!
-//! Two copies of the capture are kept: an untouched one and a dimmed one. The
-//! overlay paints the dimmed copy across the whole window and then the bright
-//! copy clipped to the selection, so the dimming effect costs no per-frame CPU
-//! work at all.
+//! Three layers are kept:
 //!
-//! Both buffers are plain BGRA8, top-down, with no padding, which is exactly
-//! what `Frame` already holds, so this type stays free of GDI device contexts.
+//! * `base` - the untouched capture,
+//! * `dim`  - the same capture darkened once, when the overlay opens,
+//! * a back buffer (a DIB section plus its memory DC) that everything is
+//!   composed into and then presented with a single blit.
+//!
+//! Composing off-screen matters: painting the dimmed copy, the bright copy and
+//! the border straight onto the window DC makes those three steps visible one
+//! after the other, which is exactly what flicker looks like while dragging.
 
 use std::ffi::c_void;
 
+use anyhow::{Context, Result};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Gdi::{
-    IntersectClipRect, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC,
-    SRCCOPY,
+    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BitBlt, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS,
+    DeleteDC, DeleteObject, HDC, HGDIOBJ, HBITMAP, IntersectClipRect, RestoreDC, SRCCOPY, SaveDC,
+    SelectObject, StretchDIBits,
 };
 
 /// How much of the original brightness the dimmed copy keeps, out of 256.
@@ -24,29 +29,65 @@ pub struct Canvas {
     dim: Vec<u8>,
     width: u32,
     height: u32,
+    bmi: BITMAPINFO,
+    /// Memory DC holding the back buffer, where the overlay composes.
+    mem: HDC,
+    back: HBITMAP,
+    original: HGDIOBJ,
 }
 
 impl Canvas {
-    /// Build both buffers from a BGRA8 capture.
-    pub fn new(bgra: &[u8], width: u32, height: u32) -> Self {
+    /// Build the layers and the back buffer from a BGRA8 capture.
+    pub fn new(bgra: &[u8], width: u32, height: u32) -> Result<Self> {
         let expected = width as usize * height as usize * 4;
         debug_assert_eq!(bgra.len(), expected, "capture size must match its bounds");
 
+        let mut bmi = BITMAPINFO::default();
+        bmi.bmiHeader = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width as i32,
+            biHeight: -(height as i32), // negative => top-down rows
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        };
+
         let mut dim = Vec::with_capacity(bgra.len());
         for px in bgra.chunks_exact(4) {
-            // Scale the colour channels; keep alpha opaque.
             let b = (px[0] as u32 * DIM_KEEP / 256) as u8;
             let g = (px[1] as u32 * DIM_KEEP / 256) as u8;
             let r = (px[2] as u32 * DIM_KEEP / 256) as u8;
             dim.extend_from_slice(&[b, g, r, 0xFF]);
         }
 
-        Self {
+        let mem = unsafe { CreateCompatibleDC(None) };
+        if mem.0.is_null() {
+            anyhow::bail!("CreateCompatibleDC failed");
+        }
+
+        let mut bits: *mut c_void = std::ptr::null_mut();
+        let back = match unsafe { CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0) } {
+            Ok(b) => b,
+            Err(e) => {
+                unsafe {
+                    let _ = DeleteDC(mem);
+                }
+                return Err(e).context("CreateDIBSection failed for the back buffer");
+            }
+        };
+        let original = unsafe { SelectObject(mem, HGDIOBJ(back.0)) };
+
+        Ok(Self {
             base: bgra.to_vec(),
             dim,
             width,
             height,
-        }
+            bmi,
+            mem,
+            back,
+            original,
+        })
     }
 
     pub fn width(&self) -> u32 {
@@ -57,26 +98,16 @@ impl Canvas {
         self.height
     }
 
-    /// Top-down 32-bit header matching the buffers above.
-    fn bitmap_info(&self) -> BITMAPINFO {
-        let mut bmi = BITMAPINFO::default();
-        bmi.bmiHeader = BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: self.width as i32,
-            biHeight: -(self.height as i32), // negative => top-down rows
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..Default::default()
-        };
-        bmi
+    /// The back buffer's device context. Callers draw the border and the label
+    /// here, never on the window DC.
+    pub fn dc(&self) -> HDC {
+        self.mem
     }
 
-    fn stretch(&self, dst: HDC, pixels: &[u8]) {
-        let bmi = self.bitmap_info();
+    fn stretch(&self, pixels: &[u8]) {
         unsafe {
             StretchDIBits(
-                dst,
+                self.mem,
                 0,
                 0,
                 self.width as i32,
@@ -86,23 +117,77 @@ impl Canvas {
                 self.width as i32,
                 self.height as i32,
                 Some(pixels.as_ptr() as *const c_void),
-                &bmi,
+                &self.bmi,
                 DIB_RGB_COLORS,
                 SRCCOPY,
             );
         }
     }
 
-    /// Paint the dimmed capture across the whole window.
-    pub fn paint_dimmed(&self, dst: HDC) {
-        self.stretch(dst, &self.dim);
+    /// Compose the dimmed capture, and the bright capture inside `selection`,
+    /// into the back buffer, limited to `invalid`.
+    pub fn compose(&self, invalid: &RECT, selection: Option<&RECT>) {
+        let saved = unsafe { SaveDC(self.mem) };
+        if saved == 0 {
+            return;
+        }
+        let _ = unsafe {
+            IntersectClipRect(
+                self.mem,
+                invalid.left,
+                invalid.top,
+                invalid.right,
+                invalid.bottom,
+            )
+        };
+
+        self.stretch(&self.dim);
+
+        if let Some(sel) = selection {
+            let inner = unsafe { SaveDC(self.mem) };
+            let _ = unsafe { IntersectClipRect(self.mem, sel.left, sel.top, sel.right, sel.bottom) };
+            self.stretch(&self.base);
+            if inner != 0 {
+                unsafe {
+                    let _ = RestoreDC(self.mem, inner);
+                }
+            }
+        }
+
+        unsafe {
+            let _ = RestoreDC(self.mem, saved);
+        }
     }
 
-    /// Paint the bright capture, clipped to `rect`.
-    pub fn paint_bright(&self, dst: HDC, rect: &RECT) {
-        unsafe {
-            IntersectClipRect(dst, rect.left, rect.top, rect.right, rect.bottom);
+    /// Copy the composed region to the window in a single blit.
+    pub fn present(&self, dst: HDC, rect: &RECT) {
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        if width <= 0 || height <= 0 {
+            return;
         }
-        self.stretch(dst, &self.base);
+        unsafe {
+            let _ = BitBlt(
+                dst,
+                rect.left,
+                rect.top,
+                width,
+                height,
+                Some(self.mem),
+                rect.left,
+                rect.top,
+                SRCCOPY,
+            );
+        }
+    }
+}
+
+impl Drop for Canvas {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.mem, self.original);
+            let _ = DeleteObject(HGDIOBJ(self.back.0));
+            let _ = DeleteDC(self.mem);
+        }
     }
 }
