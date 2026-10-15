@@ -21,6 +21,7 @@ use anyhow::{bail, Context, Result};
 use capture::Backend;
 use std::path::Path;
 use std::time::Instant;
+use windows::Win32::Foundation::HWND;
 
 /// Default destination for full-screen captures.
 ///
@@ -36,6 +37,8 @@ fn usage() {
         "lasso — screen capture\n\n\
          USAGE:\n  \
          lasso [tray] [--hotkey COMBO]\n  \
+         lasso settings      open the settings window on its own\n  \
+         lasso about         show the version and license\n  \
          lasso monitors\n  \
          lasso capture [--out FILE.png] [--backend dxgi|gdi] [--clipboard]\n  \
          lasso select  [--out FILE.png] [--clipboard]\n\n\
@@ -82,6 +85,11 @@ fn main() -> Result<()> {
                 i += 1;
             }
             tray::run(hotkey)
+        }
+        "settings" => cmd_settings(),
+        "about" => {
+            tray::show_about(HWND::default());
+            Ok(())
         }
         "monitors" => cmd_monitors(),
         "capture" => {
@@ -147,6 +155,28 @@ fn ensure_parent(path: &str) -> Result<()> {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("could not create {}", parent.display()))?;
         }
+    }
+    Ok(())
+}
+
+/// Open the settings window without starting the resident mode.
+///
+/// The tray menu is the usual way in, but it should not be the only one: a
+/// machine whose notification area is unavailable still has to be configurable,
+/// and this is also what a shortcut or a script would call.
+fn cmd_settings() -> Result<()> {
+    let current = settings::Settings::load();
+
+    // No owner window, because there is no tray window to be modal to here.
+    match settings_window::open(HWND::default(), &current)? {
+        Some(updated) => {
+            updated.save().context("could not save the settings")?;
+            match settings::path() {
+                Some(path) => println!("saved    : {}", path.display()),
+                None => println!("saved    : no application-data directory was found"),
+            }
+        }
+        None => println!("cancelled"),
     }
     Ok(())
 }

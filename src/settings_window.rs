@@ -124,8 +124,16 @@ thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
 }
 
+/// Run `f` against the window state, or nothing at all when it is already in use.
+///
+/// The state is thread-local and several of the Win32 calls made here send
+/// messages that come straight back into this module: writing to the hotkey field
+/// runs its window procedure, which reads the same state. A plain `borrow_mut`
+/// would panic in that case, and a panic inside a window procedure cannot unwind,
+/// so it would abort the process instead of failing one call. This is the guard
+/// that keeps re-entry from becoming fatal.
 fn with_state<T>(f: impl FnOnce(&mut State) -> T) -> Option<T> {
-    STATE.with(|slot| slot.borrow_mut().as_mut().map(f))
+    STATE.with(|slot| slot.try_borrow_mut().ok()?.as_mut().map(f))
 }
 
 /// Show the window and block until the user is finished with it.
@@ -426,30 +434,52 @@ fn child(
 }
 
 /// Put the loaded settings into the controls.
+///
+/// Every handle is read out first and written to afterwards. Writing to the
+/// hotkey field sends it a message, its window procedure runs, and that procedure
+/// reads the same state; doing the writes while the borrow is still held would
+/// re-enter it.
 fn load_values() {
-    let (hotkey, output_dir, clipboard, save_file, tray_left_click) =
-        match with_state(|state| {
-            (
-                state.hotkey,
-                state.current.output_dir.clone(),
-                state.current.clipboard,
-                state.current.save_file,
-                state.tray_left_click,
-            )
-        }) {
-            Some(values) => values,
-            None => return,
-        };
+    let Some(values) = with_state(|state| {
+        (
+            state.hotkey,
+            state.current.output_dir.clone(),
+            state.current.clipboard,
+            state.current.save_file,
+            state.tray_left_click,
+            state.hotkey_field,
+            state.hotkey_hint,
+            state.output_dir,
+            state.output_hint,
+            state.tray_click,
+            state.clipboard,
+            state.save_file,
+        )
+    }) else {
+        return;
+    };
+    let (
+        hotkey,
+        output_dir,
+        clipboard_on,
+        save_on,
+        tray_left_click,
+        hotkey_field,
+        hotkey_hint,
+        output_control,
+        output_hint_control,
+        tray_control,
+        clipboard_control,
+        save_control,
+    ) = values;
 
-    with_state(|state| {
-        let _ = set_text(state.hotkey_field, &hotkey_text(hotkey));
-        let _ = set_text(state.hotkey_hint, HOTKEY_HINT);
-        let _ = set_text(state.output_dir, &output_dir);
-        let _ = set_text(state.output_hint, OUTPUT_HINT);
-        set_checked(state.clipboard, clipboard);
-        set_checked(state.save_file, save_file);
-        let _ = set_text(state.tray_click, &tray_click_text(tray_left_click));
-    });
+    let _ = set_text(hotkey_field, &hotkey_text(hotkey));
+    let _ = set_text(hotkey_hint, HOTKEY_HINT);
+    let _ = set_text(output_control, &output_dir);
+    let _ = set_text(output_hint_control, OUTPUT_HINT);
+    let _ = set_text(tray_control, &tray_click_text(tray_left_click));
+    set_checked(clipboard_control, clipboard_on);
+    set_checked(save_control, save_on);
 }
 
 /// Replace the field's window procedure so it can capture a combination.

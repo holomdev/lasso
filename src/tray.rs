@@ -295,8 +295,13 @@ fn dispose() {
 }
 
 /// Run `f` against the resident state while the mode owns one.
+///
+/// Shared state behind a window procedure has to survive re-entry: several Win32
+/// calls made here send messages that come straight back. A plain `borrow_mut`
+/// would panic, and a panic inside a window procedure cannot unwind, which turns
+/// a recoverable mistake into an aborted process.
 fn with_state<T>(f: impl FnOnce(&mut State) -> T) -> Option<T> {
-    STATE.with(|slot| slot.borrow_mut().as_mut().map(f))
+    STATE.with(|slot| slot.try_borrow_mut().ok()?.as_mut().map(f))
 }
 
 /// The notification data describing the single tray icon.
@@ -580,7 +585,10 @@ fn apply_settings() -> Result<()> {
 }
 
 /// Describe the program.
-fn show_about(owner: HWND) {
+///
+/// Reachable both from the tray menu and from `lasso about`, which is why it is
+/// crate-visible rather than private to this module.
+pub(crate) fn show_about(owner: HWND) {
     let message = format!(
         "lasso {}\n\nA screenshot tool for Windows.\n\nLicense: {}\n{}",
         env!("CARGO_PKG_VERSION"),
