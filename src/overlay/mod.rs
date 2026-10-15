@@ -9,6 +9,12 @@
 //! moves it, dragging one of the eight handles resizes it, and the arrow keys
 //! nudge it one pixel at a time (ten with Shift).
 //!
+//! A small crosshair is drawn at the pointer, and a magnifier beside it shows
+//! the surrounding pixels scaled up with the pixel under the pointer marked.
+//! Both mark the same pixel, so an edge can be placed exactly. The magnifier
+//! steps aside while the whole region is being dragged, where it would only be
+//! in the way.
+//!
 //! Keys and buttons:
 //!
 //! * left drag on empty space - define a new region
@@ -69,8 +75,8 @@ pub struct Selection {
 /// stray click rather than a region.
 const MIN_SIDE: i32 = 4;
 
-/// Padding added when invalidating, so the border, the handles and the label are
-/// all repainted.
+/// Padding added when invalidating, so the border, the handles, the pointer
+/// marker, the magnifier and the label are all repainted.
 const DIRTY_PAD: i32 = 40;
 
 const WHITE: COLORREF = COLORREF(0x00FF_FFFF);
@@ -150,6 +156,10 @@ struct State {
     black: HBRUSH,
     label_bg: HBRUSH,
     drag: Drag,
+    /// Last known pointer position, in client coordinates. `None` until the
+    /// pointer first moves over the window, which is also when the marker and
+    /// the magnifier appear.
+    pointer: Option<(i32, i32)>,
     current: Option<RECT>,
     result: Option<Selection>,
 }
@@ -224,6 +234,7 @@ pub fn select_region(frame: &Frame) -> Result<Option<Selection>> {
             black: unsafe { CreateSolidBrush(BLACK) },
             label_bg: unsafe { CreateSolidBrush(LABEL_BG) },
             drag: Drag::Idle,
+            pointer: None,
             current: None,
             result: None,
         });
@@ -262,18 +273,34 @@ fn point_from(lparam: LPARAM) -> (i32, i32) {
     (x, y)
 }
 
-/// Repaint only the area the selection touched, plus padding for the border,
-/// the handles and the label. `None` rectangles are simply skipped.
-fn invalidate_around(hwnd: HWND, previous: Option<RECT>, current: Option<RECT>) {
-    let dirty = match (previous, current) {
-        (Some(p), Some(c)) => geometry::union(p, c),
-        (Some(p), None) => p,
-        (None, Some(c)) => c,
-        (None, None) => return,
-    };
-    let padded = geometry::inflated(&dirty, DIRTY_PAD);
-    unsafe {
-        let _ = InvalidateRect(Some(hwnd), Some(&padded), false);
+/// Panel placement for a pointer position.
+///
+/// The panel always steps away from the selection centre, so while an edge is
+/// being dragged it sits outside the region instead of over the handles on the
+/// opposite side.
+fn panel_for(st: &State, pointer: (i32, i32)) -> RECT {
+    let bias = st
+        .current
+        .map(|rect| geometry::outward(&rect, pointer))
+        .unwrap_or_default();
+    geometry::magnifier_panel_biased(pointer, st.canvas.width(), st.canvas.height(), bias)
+}
+
+/// Invalidate the union of several rectangles, padded. `None` entries are
+/// skipped, and nothing is invalidated when every entry is `None`.
+fn invalidate_rects(hwnd: HWND, rects: &[Option<RECT>], pad: i32) {
+    let mut acc: Option<RECT> = None;
+    for rect in rects.iter().flatten() {
+        acc = Some(match acc {
+            Some(existing) => geometry::union(existing, *rect),
+            None => *rect,
+        });
+    }
+    if let Some(dirty) = acc {
+        let padded = geometry::inflated(&dirty, pad);
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), Some(&padded), false);
+        }
     }
 }
 
@@ -325,12 +352,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
         WM_LBUTTONDOWN => {
             let point = point_from(lparam);
-            let (previous, current) = STATE.with(|slot| {
+            STATE.with(|slot| {
                 let mut binding = slot.borrow_mut();
                 let Some(st) = binding.as_mut() else {
-                    return (None, None);
+                    return;
                 };
-                let previous = st.current;
+                let previous_selection = st.current;
+                let previous_magnifier = st.pointer.map(|p| panel_for(st, p));
+                st.pointer = Some(point);
+
                 match st.current.map(|rect| (rect, geometry::zone_of(&rect, point))) {
                     Some((rect, Zone::Resize(edges))) => {
                         st.drag = Drag::Resize { edges, start: rect };
@@ -349,26 +379,39 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         st.active_cursor = st.cursors.cross;
                     }
                 }
-                (previous, st.current)
+
+                let current_magnifier = panel_for(st, point);
+                invalidate_rects(
+                    hwnd,
+                    &[
+                        previous_selection,
+                        st.current,
+                        previous_magnifier,
+                        Some(current_magnifier),
+                    ],
+                    DIRTY_PAD,
+                );
             });
             unsafe {
                 let _ = SetCapture(hwnd);
             }
-            // Starting away from the selection drops it, so the previous region
-            // has to be dimmed back immediately.
-            invalidate_around(hwnd, previous, current);
             LRESULT(0)
         }
 
         WM_MOUSEMOVE => {
             let point = point_from(lparam);
-            let mut dirty = None;
             STATE.with(|slot| {
                 let mut binding = slot.borrow_mut();
                 let Some(st) = binding.as_mut() else {
                     return;
                 };
-                let next = match st.drag {
+
+                let previous_pointer = st.pointer;
+                let previous_selection = st.current;
+                let previous_magnifier = previous_pointer.map(|p| panel_for(st, p));
+
+                st.pointer = Some(point);
+                match st.drag {
                     Drag::Idle => {
                         // Keep the cursor in step with the zone under the
                         // pointer, which is what makes the handles discoverable.
@@ -376,45 +419,64 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             Some(rect) => st.cursors.for_zone(geometry::zone_of(&rect, point)),
                             None => st.cursors.cross,
                         };
-                        None
                     }
-                    Drag::Create { anchor } => Some(geometry::rectangle(anchor, point)),
-                    Drag::Move { grab, start } => Some(geometry::moved(&start, grab, point)),
-                    Drag::Resize { edges, start } => Some(geometry::resized(&start, edges, point)),
-                };
-                if let Some(next) = next {
-                    // Sub-pixel mouse movement lands on the same rectangle;
-                    // repainting it again would only add work and flicker.
-                    if st.current != Some(next) {
-                        let previous = st.current.replace(next);
-                        dirty = Some((previous, Some(next)));
+                    Drag::Create { anchor } => {
+                        st.current = Some(geometry::rectangle(anchor, point));
+                    }
+                    Drag::Move { grab, start } => {
+                        st.current = Some(geometry::moved(&start, grab, point));
+                    }
+                    Drag::Resize { edges, start } => {
+                        st.current = Some(geometry::resized(&start, edges, point));
                     }
                 }
+
+                // A mouse move that lands on the same pixel and leaves the
+                // selection alone has nothing to show.
+                if previous_pointer == Some(point) && previous_selection == st.current {
+                    return;
+                }
+
+                let current_magnifier = panel_for(st, point);
+                invalidate_rects(
+                    hwnd,
+                    &[
+                        previous_selection,
+                        st.current,
+                        previous_magnifier,
+                        Some(current_magnifier),
+                    ],
+                    DIRTY_PAD,
+                );
             });
-            if let Some((previous, current)) = dirty {
-                invalidate_around(hwnd, previous, current);
-            }
             LRESULT(0)
         }
 
         WM_LBUTTONUP => {
             let point = point_from(lparam);
-            let (previous, current) = STATE.with(|slot| {
+            STATE.with(|slot| {
                 let mut binding = slot.borrow_mut();
                 let Some(st) = binding.as_mut() else {
-                    return (None, None);
+                    return;
                 };
+                let previous_magnifier = st.pointer.map(|p| panel_for(st, p));
+                st.pointer = Some(point);
                 st.drag = Drag::Idle;
                 st.active_cursor = match st.current {
                     Some(rect) => st.cursors.for_zone(geometry::zone_of(&rect, point)),
                     None => st.cursors.cross,
                 };
-                (st.current, st.current)
+
+                let current_magnifier = panel_for(st, point);
+                invalidate_rects(
+                    hwnd,
+                    &[st.current, previous_magnifier, Some(current_magnifier)],
+                    DIRTY_PAD,
+                );
             });
             unsafe {
                 let _ = ReleaseCapture();
             }
-            invalidate_around(hwnd, previous, current);
             LRESULT(0)
         }
 
@@ -464,18 +526,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                 }
             } else if let Some(delta) = arrow_delta(key, if shifted() { 10 } else { 1 }) {
-                let mut dirty = None;
                 STATE.with(|slot| {
-                    if let Some(st) = slot.borrow_mut().as_mut() {
-                        if let Some(nudged) = st.current.map(|rect| translate(&rect, delta)) {
-                            let previous = st.current.replace(nudged);
-                            dirty = Some((previous, Some(nudged)));
-                        }
-                    }
+                    let mut binding = slot.borrow_mut();
+                    let Some(st) = binding.as_mut() else {
+                        return;
+                    };
+                    let Some(nudged) = st.current.map(|rect| translate(&rect, delta)) else {
+                        return;
+                    };
+                    let previous = st.current.replace(nudged);
+                    let magnifier = st.pointer.map(|p| panel_for(st, p));
+                    invalidate_rects(hwnd, &[previous, Some(nudged), magnifier], DIRTY_PAD);
                 });
-                if let Some((previous, current)) = dirty {
-                    invalidate_around(hwnd, previous, current);
-                }
             }
             LRESULT(0)
         }
@@ -552,6 +614,8 @@ fn paint(window_dc: HDC, st: &State, invalid: &RECT) {
                 }
             }
         }
+        draw_pointer_marker(mem, st);
+        draw_magnifier(mem, st);
         draw_hint(mem, &st.canvas);
 
         unsafe {
@@ -597,6 +661,116 @@ fn draw_handles(hdc: HDC, rect: &RECT, white: HBRUSH, black: HBRUSH) {
             FillRect(hdc, &square, white);
             FrameRect(hdc, &square, black);
         }
+    }
+}
+
+/// A crosshair drawn by the overlay itself, centred on the exact pixel the
+/// magnifier marks.
+///
+/// Relying on the system cursor alone leaves the marked pixel ambiguous, since
+/// what the cursor draws and where its hotspot sits are not guaranteed to
+/// coincide. Drawing our own removes the doubt.
+fn draw_pointer_marker(hdc: HDC, st: &State) {
+    let Some(pointer) = st.pointer else {
+        return;
+    };
+    let arm = geometry::MARKER_ARM;
+    let gap = geometry::MARKER_GAP;
+
+    let arms = [
+        RECT {
+            left: pointer.0 - arm,
+            top: pointer.1,
+            right: pointer.0 - gap,
+            bottom: pointer.1 + 1,
+        },
+        RECT {
+            left: pointer.0 + gap + 1,
+            top: pointer.1,
+            right: pointer.0 + arm + 1,
+            bottom: pointer.1 + 1,
+        },
+        RECT {
+            left: pointer.0,
+            top: pointer.1 - arm,
+            right: pointer.0 + 1,
+            bottom: pointer.1 - gap,
+        },
+        RECT {
+            left: pointer.0,
+            top: pointer.1 + gap + 1,
+            right: pointer.0 + 1,
+            bottom: pointer.1 + arm + 1,
+        },
+    ];
+
+    // A dark halo first, so the crosshair reads over light and dark content.
+    for arm_rect in arms {
+        let halo = geometry::inflated(&arm_rect, 1);
+        unsafe {
+            FillRect(hdc, &halo, st.black);
+        }
+    }
+    for arm_rect in arms {
+        unsafe {
+            FillRect(hdc, &arm_rect, st.white);
+        }
+    }
+}
+
+/// The zoomed view around the pointer, with the exact pixel under it marked.
+fn draw_magnifier(hdc: HDC, st: &State) {
+    let Some(pointer) = st.pointer else {
+        return;
+    };
+    // Moving the whole region is not a precision task, and here the panel only
+    // gets in the way.
+    if matches!(st.drag, Drag::Move { .. }) {
+        return;
+    }
+
+    let canvas = &st.canvas;
+    let panel = panel_for(st, pointer);
+    let content = geometry::magnifier_content(&panel);
+    let source = geometry::magnifier_source(pointer);
+
+    // Black outline, white frame, dark backdrop for whatever falls off the
+    // capture.
+    let frame = geometry::inflated(&panel, -1);
+    unsafe {
+        FillRect(hdc, &panel, st.black);
+        FillRect(hdc, &frame, st.white);
+        FillRect(hdc, &content, st.label_bg);
+    }
+
+    // Only the part of the source that exists is drawn, mapped onto the
+    // matching part of the panel, so a corner still lines up correctly.
+    let visible = geometry::intersect(&source, canvas.width(), canvas.height());
+    if visible.right > visible.left && visible.bottom > visible.top {
+        let dest = geometry::magnifier_dest(&content, &source, &visible);
+        canvas.magnify(&dest, &visible);
+    }
+
+    let marked = geometry::magnifier_marked(&content);
+    let (cross_x, cross_y) = geometry::magnifier_crosshair(&content);
+    let horizontal = RECT {
+        left: content.left,
+        top: cross_y,
+        right: content.right,
+        bottom: cross_y + 1,
+    };
+    let vertical = RECT {
+        left: cross_x,
+        top: content.top,
+        right: cross_x + 1,
+        bottom: content.bottom,
+    };
+    unsafe {
+        FillRect(hdc, &horizontal, st.white);
+        FillRect(hdc, &vertical, st.white);
+        FrameRect(hdc, &marked, st.black);
+        let inner = geometry::inflated(&marked, -1);
+        FrameRect(hdc, &inner, st.white);
     }
 }
 

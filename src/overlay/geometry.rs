@@ -1,8 +1,8 @@
 //! Pure geometry for the selection overlay.
 //!
-//! Kept apart from the window code so hit testing and resize maths can be
-//! tested without ever opening a window. Everything here works on `RECT` in
-//! client coordinates.
+//! Kept apart from the window code so hit testing, resize maths and the
+//! magnifier mapping can be tested without ever opening a window. Everything
+//! here works on `RECT` in client coordinates.
 
 use windows::Win32::Foundation::RECT;
 
@@ -11,6 +11,24 @@ pub const TOLERANCE: i32 = 5;
 
 /// Drawn size, in pixels, of a resize handle.
 pub const HANDLE: i32 = 6;
+
+// ---------------------------------------------------------------------------
+// Magnifier
+// ---------------------------------------------------------------------------
+
+/// How far each source pixel is scaled up inside the magnifier.
+pub const MAGNIFIER_ZOOM: i32 = 8;
+/// Outer size of the magnifier panel, in client pixels.
+pub const MAGNIFIER_PANEL: i32 = 120;
+/// Frame thickness: one black pixel, then white.
+pub const MAGNIFIER_BORDER: i32 = 4;
+/// Distance kept between the pointer and the panel.
+pub const MAGNIFIER_GAP: i32 = 20;
+
+/// Half-length of the pointer marker's arms, and the gap left at its centre so
+/// the marked pixel itself stays visible.
+pub const MARKER_ARM: i32 = 9;
+pub const MARKER_GAP: i32 = 2;
 
 /// Which sides of a rectangle a drag moves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -162,6 +180,127 @@ pub fn inflated(r: &RECT, by: i32) -> RECT {
         right: r.right + by,
         bottom: r.bottom + by,
     }
+}
+
+/// Source pixels the magnifier shows per axis.
+///
+/// The content area is an exact whole number of source pixels, and the span is
+/// even, so the pixel under the pointer lands exactly on the centre of the
+/// panel. Both properties are asserted in the tests below: if either breaks,
+/// the magnifier starts pointing at the wrong pixel.
+pub fn magnifier_span() -> i32 {
+    (MAGNIFIER_PANEL - 2 * MAGNIFIER_BORDER) / MAGNIFIER_ZOOM
+}
+
+/// The area inside the panel's frame, where magnified pixels are drawn.
+pub fn magnifier_content(panel: &RECT) -> RECT {
+    inflated(panel, -MAGNIFIER_BORDER)
+}
+
+/// Which side of the pointer the magnifier should prefer. Each component is
+/// -1, 0 or +1; 0 lets the placement use its default side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Bias {
+    pub horizontal: i32,
+    pub vertical: i32,
+}
+
+/// Bias pointing away from the centre of `rect`, so a panel placed with it
+/// steps outside the selection instead of over the handles on the far side.
+pub fn outward(rect: &RECT, point: (i32, i32)) -> Bias {
+    let centre_x = (rect.left + rect.right) / 2;
+    let centre_y = (rect.top + rect.bottom) / 2;
+    Bias {
+        horizontal: if point.0 >= centre_x { 1 } else { -1 },
+        vertical: if point.1 >= centre_y { 1 } else { -1 },
+    }
+}
+
+/// Panel placement with the default bias, used by the tests.
+#[cfg(test)]
+pub fn magnifier_panel(pointer: (i32, i32), width: u32, height: u32) -> RECT {
+    magnifier_panel_biased(pointer, width, height, Bias::default())
+}
+
+/// Panel placement preferring the side given by `bias`, falling back to the
+/// opposite side when the preferred one has no room.
+pub fn magnifier_panel_biased(pointer: (i32, i32), width: u32, height: u32, bias: Bias) -> RECT {
+    let panel = MAGNIFIER_PANEL;
+    let left = place(pointer.0, bias.horizontal, panel, width as i32);
+    let top = place(pointer.1, bias.vertical, panel, height as i32);
+    RECT {
+        left,
+        top,
+        right: left + panel,
+        bottom: top + panel,
+    }
+}
+
+/// One axis of panel placement: after the pointer, or before it.
+fn place(coordinate: i32, bias: i32, panel: i32, maximum: i32) -> i32 {
+    let after = coordinate + MAGNIFIER_GAP;
+    let before = coordinate - MAGNIFIER_GAP - panel;
+
+    let (preferred, other) = if bias < 0 {
+        (before, after)
+    } else {
+        (after, before)
+    };
+
+    let fits = |start: i32| start >= 0 && start + panel <= maximum;
+    let chosen = if fits(preferred) {
+        preferred
+    } else if fits(other) {
+        other
+    } else {
+        // Neither side fits. This only happens on a capture narrower than the
+        // panel, where clamping is better than leaving the capture entirely.
+        preferred
+    };
+    chosen.max(0).min((maximum - panel).max(0))
+}
+
+/// Capture pixels the magnifier samples, centred on the pointer.
+pub fn magnifier_source(pointer: (i32, i32)) -> RECT {
+    let span = magnifier_span();
+    let left = pointer.0 - span / 2;
+    let top = pointer.1 - span / 2;
+    RECT {
+        left,
+        top,
+        right: left + span,
+        bottom: top + span,
+    }
+}
+
+/// Where the `visible` part of `source` lands inside `content`.
+pub fn magnifier_dest(content: &RECT, source: &RECT, visible: &RECT) -> RECT {
+    RECT {
+        left: content.left + (visible.left - source.left) * MAGNIFIER_ZOOM,
+        top: content.top + (visible.top - source.top) * MAGNIFIER_ZOOM,
+        right: content.left + (visible.right - source.left) * MAGNIFIER_ZOOM,
+        bottom: content.top + (visible.bottom - source.top) * MAGNIFIER_ZOOM,
+    }
+}
+
+/// The square marking the source pixel under the pointer.
+pub fn magnifier_marked(content: &RECT) -> RECT {
+    let index = magnifier_span() / 2;
+    RECT {
+        left: content.left + index * MAGNIFIER_ZOOM,
+        top: content.top + index * MAGNIFIER_ZOOM,
+        right: content.left + (index + 1) * MAGNIFIER_ZOOM,
+        bottom: content.top + (index + 1) * MAGNIFIER_ZOOM,
+    }
+}
+
+/// Middle of the marked pixel, where the crosshair meets.
+pub fn magnifier_crosshair(content: &RECT) -> (i32, i32) {
+    let marked = magnifier_marked(content);
+    (
+        (marked.left + marked.right) / 2,
+        (marked.top + marked.bottom) / 2,
+    )
 }
 
 #[cfg(test)]
@@ -321,14 +460,8 @@ mod tests {
         // Grabbed 10 px inside from the left and 20 px down from the top.
         let moved_rect = moved(&start, (10, 20), (500, 400));
         assert_eq!(moved_rect, rect(490, 380, 690, 480));
-        assert_eq!(
-            moved_rect.right - moved_rect.left,
-            start.right - start.left
-        );
-        assert_eq!(
-            moved_rect.bottom - moved_rect.top,
-            start.bottom - start.top
-        );
+        assert_eq!(moved_rect.right - moved_rect.left, start.right - start.left);
+        assert_eq!(moved_rect.bottom - moved_rect.top, start.bottom - start.top);
     }
 
     #[test]
@@ -351,5 +484,209 @@ mod tests {
     fn rectangle_ignores_point_order() {
         assert_eq!(rectangle((300, 200), (100, 100)), rect(100, 100, 300, 200));
         assert_eq!(rectangle((100, 100), (300, 200)), rect(100, 100, 300, 200));
+    }
+
+    #[test]
+    fn magnifier_constants_fill_the_content_exactly() {
+        let inner = MAGNIFIER_PANEL - 2 * MAGNIFIER_BORDER;
+        assert_eq!(
+            inner % MAGNIFIER_ZOOM,
+            0,
+            "the content area must hold a whole number of source pixels"
+        );
+
+        let span = magnifier_span();
+        assert_eq!(
+            span % 2,
+            0,
+            "an odd span would push the pointer's pixel off the centre"
+        );
+        assert!(
+            span >= 8,
+            "only {span} source pixels of context: too few to place an edge"
+        );
+    }
+
+    #[test]
+    fn the_marked_pixel_is_the_one_under_the_pointer() {
+        for pointer in [(500, 400), (0, 0), (1, 1), (1919, 1079), (960, 540)] {
+            let source = magnifier_source(pointer);
+            let panel = magnifier_panel(pointer, 1920, 1080);
+            let content = magnifier_content(&panel);
+            let marked = magnifier_marked(&content);
+
+            // Walk the marked square back to a capture pixel.
+            let column = source.left + (marked.left - content.left) / MAGNIFIER_ZOOM;
+            let row = source.top + (marked.top - content.top) / MAGNIFIER_ZOOM;
+            assert_eq!(
+                (column, row),
+                pointer,
+                "the magnifier must mark the pixel under the pointer"
+            );
+        }
+    }
+
+    #[test]
+    fn the_marked_pixel_sits_at_the_centre_of_the_content() {
+        let content = rect(300, 200, 300 + MAGNIFIER_PANEL, 200 + MAGNIFIER_PANEL);
+        let content = magnifier_content(&content);
+        let marked = magnifier_marked(&content);
+
+        let centre_x = (content.left + content.right) / 2;
+        let centre_y = (content.top + content.bottom) / 2;
+        assert_eq!(marked.left, centre_x);
+        assert_eq!(marked.top, centre_y);
+
+        let (cross_x, cross_y) = magnifier_crosshair(&content);
+        assert_eq!(cross_x, centre_x + MAGNIFIER_ZOOM / 2);
+        assert_eq!(cross_y, centre_y + MAGNIFIER_ZOOM / 2);
+    }
+
+    #[test]
+    fn a_source_wholly_on_the_capture_maps_onto_the_whole_content() {
+        let pointer = (500, 400);
+        let source = magnifier_source(pointer);
+        let visible = intersect(&source, 1920, 1080);
+        assert_eq!(visible, source, "the sample is fully on screen");
+
+        let panel = magnifier_panel(pointer, 1920, 1080);
+        let content = magnifier_content(&panel);
+        assert_eq!(magnifier_dest(&content, &source, &visible), content);
+    }
+
+    #[test]
+    fn an_offscreen_sample_maps_to_the_matching_part_of_the_content() {
+        // The top-left pixel: half of the sample reaches off the capture.
+        let pointer = (0, 0);
+        let source = magnifier_source(pointer);
+        assert!(source.left < 0 && source.top < 0);
+
+        let visible = intersect(&source, 1920, 1080);
+        assert_eq!(visible.left, 0);
+        assert_eq!(visible.top, 0);
+
+        let content = rect(0, 0, MAGNIFIER_PANEL, MAGNIFIER_PANEL);
+        let content = magnifier_content(&content);
+        let dest = magnifier_dest(&content, &source, &visible);
+
+        let half = magnifier_span() / 2;
+        assert_eq!(dest.left, content.left + half * MAGNIFIER_ZOOM);
+        assert_eq!(dest.top, content.top + half * MAGNIFIER_ZOOM);
+        assert_eq!(dest.right, content.right);
+        assert_eq!(dest.bottom, content.bottom);
+    }
+
+    #[test]
+    fn the_panel_flips_near_the_edges_and_never_leaves_the_capture() {
+        // Middle of the screen: below and to the right of the pointer.
+        let middle = magnifier_panel((500, 400), 1920, 1080);
+        assert_eq!(middle.left, 500 + MAGNIFIER_GAP);
+        assert_eq!(middle.top, 400 + MAGNIFIER_GAP);
+
+        // Bottom-right corner: flips to the other side, stays on the capture.
+        let corner = magnifier_panel((1910, 1070), 1920, 1080);
+        assert!(corner.left >= 0 && corner.right <= 1920);
+        assert!(corner.top >= 0 && corner.bottom <= 1080);
+        assert!(corner.right < 1910, "flipped to the left");
+        assert!(corner.bottom < 1070, "flipped above");
+
+        // A capture smaller than the panel still yields an on-capture panel.
+        let tiny = magnifier_panel((5, 5), 50, 50);
+        assert_eq!(tiny.left, 0);
+        assert_eq!(tiny.top, 0);
+    }
+
+    #[test]
+    fn the_panel_can_be_biased_to_a_chosen_side() {
+        let right = magnifier_panel_biased(
+            (500, 400),
+            1920,
+            1080,
+            Bias {
+                horizontal: 1,
+                vertical: 0,
+            },
+        );
+        assert_eq!(right.left, 500 + MAGNIFIER_GAP);
+
+        let left = magnifier_panel_biased(
+            (500, 400),
+            1920,
+            1080,
+            Bias {
+                horizontal: -1,
+                vertical: 0,
+            },
+        );
+        assert_eq!(left.right, 500 - MAGNIFIER_GAP);
+
+        let above = magnifier_panel_biased(
+            (500, 400),
+            1920,
+            1080,
+            Bias {
+                horizontal: 0,
+                vertical: -1,
+            },
+        );
+        assert_eq!(above.bottom, 400 - MAGNIFIER_GAP);
+
+        let below = magnifier_panel_biased(
+            (500, 400),
+            1920,
+            1080,
+            Bias {
+                horizontal: 0,
+                vertical: 1,
+            },
+        );
+        assert_eq!(below.top, 400 + MAGNIFIER_GAP);
+    }
+
+    #[test]
+    fn a_biased_panel_falls_back_when_the_preferred_side_has_no_room() {
+        // Asking for the left side while the pointer is against the left edge:
+        // there is no room, so it uses the right instead of leaving the capture.
+        let panel = magnifier_panel_biased(
+            (2, 400),
+            1920,
+            1080,
+            Bias {
+                horizontal: -1,
+                vertical: 0,
+            },
+        );
+        assert!(panel.left >= 0, "the panel must stay on the capture");
+        assert_eq!(panel.left, 2 + MAGNIFIER_GAP, "it fell back to the right");
+    }
+
+    #[test]
+    fn outward_points_away_from_the_selection_centre() {
+        let selection = rect(100, 100, 300, 200);
+
+        // Grabbing the right edge above its middle: right and up.
+        assert_eq!(
+            outward(&selection, (300, 120)),
+            Bias {
+                horizontal: 1,
+                vertical: -1
+            }
+        );
+        // Right edge below the middle: right and down.
+        assert_eq!(
+            outward(&selection, (300, 180)),
+            Bias {
+                horizontal: 1,
+                vertical: 1
+            }
+        );
+        // Left edge above the middle: left and up.
+        assert_eq!(
+            outward(&selection, (100, 120)),
+            Bias {
+                horizontal: -1,
+                vertical: -1
+            }
+        );
     }
 }
