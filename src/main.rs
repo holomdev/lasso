@@ -1,6 +1,8 @@
 //! lasso — screen capture tool for Windows.
 //!
 //! Commands:
+//!   lasso
+//!   lasso tray
 //!   lasso monitors
 //!   lasso capture [--out FILE.png] [--backend dxgi|gdi] [--clipboard]
 //!   lasso select  [--out FILE.png] [--clipboard]
@@ -8,7 +10,10 @@
 mod capture;
 mod clipboard;
 mod dpi;
+mod hotkey;
+mod icon;
 mod overlay;
+mod tray;
 
 use anyhow::{bail, Context, Result};
 use capture::Backend;
@@ -28,6 +33,7 @@ fn usage() {
     eprintln!(
         "lasso — screen capture\n\n\
          USAGE:\n  \
+         lasso [tray] [--hotkey COMBO]\n  \
          lasso monitors\n  \
          lasso capture [--out FILE.png] [--backend dxgi|gdi] [--clipboard]\n  \
          lasso select  [--out FILE.png] [--clipboard]\n\n\
@@ -35,6 +41,7 @@ fn usage() {
          -o, --out FILE      output file (capture default: {capture}, select default: {select})\n  \
          -b, --backend NAME  force dxgi or gdi; without it, DXGI with a GDI fallback\n  \
          -c, --clipboard     also copy the result to the clipboard\n  \
+         -k, --hotkey COMBO  global hotkey for the resident mode, e.g. Ctrl+Shift+X\n  \
          -h, --help          this help\n\n\
          SELECT KEYS:\n  \
          left drag           define the region, drag inside to move it, drag an edge to resize\n  \
@@ -48,13 +55,31 @@ fn usage() {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let command = args.first().map(String::as_str).unwrap_or("capture");
+    // With no arguments the program becomes resident, which is how it is
+    // normally started: from a shortcut, or from the startup folder.
+    let command = args.first().map(String::as_str).unwrap_or("tray");
 
     // Must happen before any window or DC is created.
     let awareness = dpi::enable_per_monitor();
     eprintln!("[dpi] awareness = {}", awareness.as_str());
 
     match command {
+        "tray" => {
+            let mut hotkey = hotkey::Hotkey::DEFAULT;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--hotkey" | "-k" => {
+                        i += 1;
+                        let value = args.get(i).context("--hotkey needs a value")?;
+                        hotkey = hotkey::Hotkey::parse(value).map_err(anyhow::Error::msg)?;
+                    }
+                    other => bail!("unknown argument: {other}"),
+                }
+                i += 1;
+            }
+            tray::run(hotkey)
+        }
         "monitors" => cmd_monitors(),
         "capture" => {
             let mut out = String::from(DEFAULT_CAPTURE_OUT);
