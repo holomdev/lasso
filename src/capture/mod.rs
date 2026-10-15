@@ -71,6 +71,30 @@ impl Frame {
         image::RgbaImage::from_raw(self.width, self.height, buf)
             .expect("buffer is sized by construction")
     }
+
+    /// Copy a sub-rectangle of the frame into an RGBA image.
+    ///
+    /// Returns `None` for an empty rectangle or one that falls outside the
+    /// frame, so callers cannot index past the capture.
+    pub fn to_rgba_sub(&self, x: i32, y: i32, width: u32, height: u32) -> Option<image::RgbaImage> {
+        if x < 0 || y < 0 || width == 0 || height == 0 {
+            return None;
+        }
+        if x as u32 + width > self.width || y as u32 + height > self.height {
+            return None;
+        }
+
+        let row_bytes = width as usize * 4;
+        let mut buf = Vec::with_capacity(row_bytes * height as usize);
+        for row in 0..height as usize {
+            let start = ((y as usize + row) * self.width as usize + x as usize) * 4;
+            buf.extend_from_slice(&self.bgra[start..start + row_bytes]);
+        }
+        for px in buf.chunks_exact_mut(4) {
+            px.swap(0, 2); // B <-> R
+        }
+        image::RgbaImage::from_raw(width, height, buf)
+    }
 }
 
 /// One monitor of the virtual desktop.
@@ -178,5 +202,72 @@ pub fn capture_virtual_desktop(prefer: Option<Backend>) -> Result<Frame> {
             eprintln!("[capture] falling back to GDI BitBlt");
             gdi::capture(x, y, w, h)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Frame whose pixels encode their own coordinates, so a crop can be
+    /// checked exactly instead of by eye.
+    ///
+    /// Stored BGRA holds `0x40` in blue, `y` in green and `x` in red, which
+    /// after the channel swap must read back as R = x, G = y, B = 0x40.
+    fn coordinate_frame(width: u32, height: u32) -> Frame {
+        let mut bgra = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                bgra.extend_from_slice(&[0x40, y as u8, x as u8, 0xFF]);
+            }
+        }
+        Frame {
+            width,
+            height,
+            bgra,
+            origin: (0, 0),
+            backend: Backend::Gdi,
+        }
+    }
+
+    #[test]
+    fn sub_image_matches_the_requested_rectangle() {
+        let frame = coordinate_frame(6, 4);
+        let image = frame
+            .to_rgba_sub(2, 1, 3, 2)
+            .expect("the region lies inside the frame");
+
+        assert_eq!(image.width(), 3);
+        assert_eq!(image.height(), 2);
+        for row in 0..2u32 {
+            for col in 0..3u32 {
+                let px = image.get_pixel(col, row).0;
+                assert_eq!(px[0], (2 + col) as u8, "red at ({col}, {row})");
+                assert_eq!(px[1], (1 + row) as u8, "green at ({col}, {row})");
+                assert_eq!(px[2], 0x40, "blue at ({col}, {row})");
+                assert_eq!(px[3], 0xFF, "alpha at ({col}, {row})");
+            }
+        }
+    }
+
+    #[test]
+    fn sub_image_rejects_regions_outside_the_frame() {
+        let frame = coordinate_frame(4, 4);
+
+        assert!(frame.to_rgba_sub(-1, 0, 1, 1).is_none(), "negative x");
+        assert!(frame.to_rgba_sub(0, -1, 1, 1).is_none(), "negative y");
+        assert!(frame.to_rgba_sub(0, 0, 0, 1).is_none(), "zero width");
+        assert!(frame.to_rgba_sub(0, 0, 1, 0).is_none(), "zero height");
+        assert!(frame.to_rgba_sub(3, 0, 2, 1).is_none(), "past the right edge");
+        assert!(frame.to_rgba_sub(0, 3, 1, 2).is_none(), "past the bottom edge");
+        assert!(frame.to_rgba_sub(3, 3, 1, 1).is_some(), "last pixel is valid");
+    }
+
+    #[test]
+    fn whole_frame_swaps_bgra_to_rgba() {
+        let frame = coordinate_frame(3, 2);
+        let image = frame.to_rgba_image();
+        let px = image.get_pixel(2, 1).0;
+        assert_eq!([px[0], px[1], px[2], px[3]], [2, 1, 0x40, 0xFF]);
     }
 }
