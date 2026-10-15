@@ -13,6 +13,8 @@ mod dpi;
 mod hotkey;
 mod icon;
 mod overlay;
+mod settings;
+mod settings_window;
 mod tray;
 
 use anyhow::{bail, Context, Result};
@@ -65,14 +67,15 @@ fn main() -> Result<()> {
 
     match command {
         "tray" => {
-            let mut hotkey = hotkey::Hotkey::DEFAULT;
+            // Without the flag the combination comes from the settings file.
+            let mut hotkey = None;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
                     "--hotkey" | "-k" => {
                         i += 1;
                         let value = args.get(i).context("--hotkey needs a value")?;
-                        hotkey = hotkey::Hotkey::parse(value).map_err(anyhow::Error::msg)?;
+                        hotkey = Some(hotkey::Hotkey::parse(value).map_err(anyhow::Error::msg)?);
                     }
                     other => bail!("unknown argument: {other}"),
                 }

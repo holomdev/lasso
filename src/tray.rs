@@ -15,11 +15,9 @@
 //!   is meant to be visible.
 //!
 //! Both tray gestures and the hotkey end in the same pipeline the `capture` and
-//! `select` subcommands use, so there is one implementation of capturing and
-//! one of publishing to the clipboard. The difference is the destination: this
-//! mode copies to the clipboard and writes no file, because the output location
-//! is not configurable yet and inventing a path per invocation would leave
-//! files behind that nothing can find again.
+//! `select` subcommands use, so there is one implementation of capturing. Where
+//! the result goes is decided by the settings file: the clipboard, a file in the
+//! chosen folder, or both.
 //!
 //! The region overlay runs a nested message loop of its own, so tray and hotkey
 //! messages keep being delivered while a selection is on screen. A busy flag in
@@ -50,20 +48,15 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
     DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, HICON, HMENU,
-    MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SW_HIDE,
+    MB_ICONINFORMATION, MB_OK, MessageBoxW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW,
+    PostQuitMessage, RegisterClassW, SW_HIDE,
     SW_SHOWNORMAL, SetForegroundWindow, ShowWindow, SM_CXSMICON, TPM_RETURNCMD, TPM_RIGHTBUTTON,
     TrackPopupMenu, TranslateMessage, WM_APP, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_NULL,
     WM_RBUTTONUP, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
-use crate::{capture, clipboard, hotkey, icon, overlay};
-
-/// Directory the resident mode refers to.
-///
-/// The same `target/` tree the command subcommands already use, which version
-/// control ignores, so a capture that never reaches the clipboard cannot litter
-/// a checkout.
-const OUTPUT_DIR: &str = "target/test-output";
+use crate::settings::{Settings, TrayClick};
+use crate::{capture, clipboard, hotkey, icon, overlay, settings, settings_window};
 
 /// Identifier of the single tray icon, stable for the lifetime of the process.
 const TRAY_ICON_ID: u32 = 1;
@@ -85,7 +78,9 @@ const HOTKEY_ID: i32 = 1;
 const ID_CAPTURE_SCREEN: usize = 1;
 const ID_SELECT_REGION: usize = 2;
 const ID_OPEN_OUTPUT: usize = 3;
-const ID_QUIT: usize = 4;
+const ID_SETTINGS: usize = 4;
+const ID_ABOUT: usize = 5;
+const ID_QUIT: usize = 6;
 
 /// The shell resources and the window state of the resident mode.
 struct State {
@@ -94,9 +89,9 @@ struct State {
     /// one belongs to the process and has to be destroyed on the way out.
     icon: HICON,
     menu: HMENU,
-    /// The combination the hotkey was registered with, so the message can be
-    /// matched and the failure report can name it.
-    hotkey: hotkey::Hotkey,
+    /// The settings this run is using, so a capture can consult them without
+    /// reading the file again.
+    settings: Settings,
     /// Set while a capture or the overlay is running, so a request that arrives
     /// during the overlay's nested message loop is ignored instead of stacking
     /// a second overlay on top of it.
@@ -110,7 +105,15 @@ thread_local! {
 }
 
 /// Start the resident mode and return once the message loop has ended.
-pub fn run(hotkey: hotkey::Hotkey) -> Result<()> {
+pub fn run(hotkey_override: Option<hotkey::Hotkey>) -> Result<()> {
+    // The settings are read first, because the hotkey the mode registers comes
+    // from them; a combination on the command line replaces it for this run only
+    // and is not written back.
+    let mut settings = settings::Settings::load();
+    if let Some(hotkey) = hotkey_override {
+        settings.hotkey = hotkey;
+    }
+
     let hmodule = unsafe { GetModuleHandleW(None) }.context("GetModuleHandleW failed")?;
     let hinstance = HINSTANCE(hmodule.0);
 
@@ -161,7 +164,7 @@ pub fn run(hotkey: hotkey::Hotkey) -> Result<()> {
             hwnd,
             icon,
             menu,
-            hotkey,
+            settings,
             busy: false,
             icon_added: false,
             hotkey_registered: false,
@@ -240,24 +243,14 @@ fn install() -> Result<()> {
         );
     }
 
-    let hwnd = with_state(|state| state.hwnd);
-    let Some(hwnd) = hwnd else {
-        bail!("the resident window is missing");
-    };
-
-    let hotkey = with_state(|state| state.hotkey).unwrap_or(hotkey::Hotkey::DEFAULT);
-    match unsafe {
-        RegisterHotKey(
-            Some(hwnd),
-            HOTKEY_ID,
-            HOT_KEY_MODIFIERS(hotkey.modifiers.bits()),
-            u32::from(hotkey.key),
-        )
-    } {
+    let hotkey = with_state(|state| state.settings.hotkey).unwrap_or(hotkey::Hotkey::DEFAULT);
+    match register_hotkey(hotkey) {
         Ok(()) => {
             with_state(|state| state.hotkey_registered = true);
         }
-        Err(err) => eprintln!("[tray] RegisterHotKey({hotkey}) failed: {err}"),
+        // Reported rather than fatal: a combination another program already owns
+        // leaves the mode running with the icon alone.
+        Err(err) => eprintln!("[tray] {err:#}"),
     }
 
     // Neither route in means there is nothing to interact with.
@@ -347,6 +340,14 @@ fn create_menu() -> Result<HMENU> {
                 .context("AppendMenuW(separator) failed")?;
             AppendMenuW(menu, MF_STRING, ID_OPEN_OUTPUT, w!("Open output folder"))
                 .context("AppendMenuW(Open output folder) failed")?;
+            AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null())
+                .context("AppendMenuW(separator) failed")?;
+            AppendMenuW(menu, MF_STRING, ID_SETTINGS, w!("Settings..."))
+                .context("AppendMenuW(Settings) failed")?;
+            AppendMenuW(menu, MF_STRING, ID_ABOUT, w!("About lasso"))
+                .context("AppendMenuW(About) failed")?;
+            AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null())
+                .context("AppendMenuW(separator) failed")?;
             AppendMenuW(menu, MF_STRING, ID_QUIT, w!("Quit"))
                 .context("AppendMenuW(Quit) failed")?;
             Ok(())
@@ -360,26 +361,84 @@ fn create_menu() -> Result<HMENU> {
     }
 }
 
-/// Capture the whole virtual desktop and put it on the clipboard.
-fn capture_to_clipboard() -> Result<()> {
+/// Capture the whole virtual desktop and publish it.
+fn capture_screen() -> Result<()> {
     let frame = capture::capture_virtual_desktop(None)?;
-    clipboard::copy_bgra(&frame.bgra, frame.width, frame.height)
+    publish(&frame, None)
 }
 
-/// Capture, let the user mark a region, and put that region on the clipboard.
+/// Capture, let the user mark a region, and publish that region.
 ///
 /// Cancelling the overlay is not a failure: nothing happens and the mode stays
 /// ready for the next request.
-fn select_to_clipboard() -> Result<()> {
+fn select_region() -> Result<()> {
     let frame = capture::capture_virtual_desktop(None)?;
     let Some(selection) = overlay::select_region(&frame)? else {
         return Ok(());
     };
+    publish(&frame, Some(selection))
+}
 
-    let region = frame
-        .to_bgra_sub(selection.x, selection.y, selection.width, selection.height)
-        .context("the selected region falls outside the capture")?;
-    clipboard::copy_bgra(&region, selection.width, selection.height)
+/// Send a capture wherever the settings ask for.
+///
+/// The two destinations are independent, so a capture can go to the clipboard,
+/// to a file, or to both.
+fn publish(frame: &capture::Frame, region: Option<overlay::Selection>) -> Result<()> {
+    let settings = with_state(|state| state.settings.clone()).unwrap_or_default();
+    if !settings.clipboard && !settings.save_file {
+        return Ok(());
+    }
+
+    let (x, y, width, height) = match region {
+        Some(selection) => (
+            selection.x,
+            selection.y,
+            selection.width,
+            selection.height,
+        ),
+        None => (0, 0, frame.width, frame.height),
+    };
+
+    if settings.clipboard {
+        let pixels = frame
+            .to_bgra_sub(x, y, width, height)
+            .context("the region falls outside the capture")?;
+        clipboard::copy_bgra(&pixels, width, height)?;
+    }
+
+    if settings.save_file {
+        let image = match region {
+            Some(_) => frame.to_rgba_sub(x, y, width, height),
+            None => Some(frame.to_rgba_image()),
+        }
+        .context("the region falls outside the capture")?;
+
+        let path = saved_path(&settings.output_dir);
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("could not create {}", parent.display()))?;
+        }
+        image
+            .save(&path)
+            .with_context(|| format!("could not write {path}"))?;
+    }
+
+    Ok(())
+}
+
+/// A fresh file name for a saved capture.
+///
+/// The timestamp is what keeps two captures from overwriting each other without
+/// asking the user anything.
+fn saved_path(directory: &str) -> String {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    std::path::Path::new(directory)
+        .join(format!("lasso-{stamp}.png"))
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Run a capture action unless one is already running.
@@ -438,26 +497,123 @@ fn show_menu() {
 
     // A dismissed menu reports zero, which matches no item.
     match chosen as usize {
-        ID_CAPTURE_SCREEN => start(capture_to_clipboard),
-        ID_SELECT_REGION => start(select_to_clipboard),
+        ID_CAPTURE_SCREEN => start(capture_screen),
+        ID_SELECT_REGION => start(select_region),
         ID_OPEN_OUTPUT => open_output_folder(hwnd),
+        ID_SETTINGS => open_settings(),
+        ID_ABOUT => show_about(hwnd),
         ID_QUIT => quit(),
         _ => {}
     }
 }
 
-/// Open the capture destination in the default file manager.
+/// Register the mode's single global hotkey.
+fn register_hotkey(hotkey: hotkey::Hotkey) -> Result<()> {
+    let hwnd = with_state(|state| state.hwnd).context("the resident window is missing")?;
+    unsafe {
+        RegisterHotKey(
+            Some(hwnd),
+            HOTKEY_ID,
+            HOT_KEY_MODIFIERS(hotkey.modifiers.bits()),
+            u32::from(hotkey.key),
+        )
+    }
+    .with_context(|| format!("RegisterHotKey({hotkey}) was refused"))
+}
+
+/// Open the settings window and apply whatever comes back.
+///
+/// Guarded the same way a capture is: while the window is up, another request
+/// must not start on top of it.
+fn open_settings() {
+    let idle = with_state(|state| {
+        let idle = !state.busy;
+        state.busy = true;
+        idle
+    })
+    .unwrap_or(false);
+    if !idle {
+        return;
+    }
+
+    if let Err(err) = apply_settings() {
+        eprintln!("[tray] settings: {err:#}");
+    }
+
+    with_state(|state| state.busy = false);
+}
+
+/// Show the window, then save and re-register whatever changed.
+fn apply_settings() -> Result<()> {
+    let Some((owner, current)) = with_state(|state| (state.hwnd, state.settings.clone())) else {
+        return Ok(());
+    };
+
+    let Some(updated) = settings_window::open(owner, &current)? else {
+        // Cancelled: nothing to do and nothing to report.
+        return Ok(());
+    };
+
+    // The new combination is registered before the old one is dropped, so a
+    // refused shortcut cannot leave the mode with none at all.
+    if updated.hotkey != current.hotkey {
+        register_hotkey(updated.hotkey).with_context(|| {
+            format!(
+                "{} is still the shortcut, because the new one could not be taken",
+                current.hotkey
+            )
+        })?;
+        if let Some(hwnd) = with_state(|state| state.hwnd) {
+            unsafe {
+                let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+            }
+        }
+    }
+
+    if updated != current {
+        updated.save().context("could not save the settings")?;
+    }
+
+    with_state(|state| state.settings = updated);
+    with_state(|state| state.hotkey_registered = true);
+    Ok(())
+}
+
+/// Describe the program.
+fn show_about(owner: HWND) {
+    let message = format!(
+        "lasso {}\n\nA screenshot tool for Windows.\n\nLicense: {}\n{}",
+        env!("CARGO_PKG_VERSION"),
+        env!("CARGO_PKG_LICENSE"),
+        env!("CARGO_PKG_REPOSITORY")
+    );
+    let text = wide(&message);
+    let caption = wide("About lasso");
+    unsafe {
+        MessageBoxW(
+            Some(owner),
+            PCWSTR::from_raw(text.as_ptr()),
+            PCWSTR::from_raw(caption.as_ptr()),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
+}
+
+/// Look at a directory in the default file manager.
 ///
 /// The path is made absolute before it is handed over, because the handler
 /// resolves a relative one against its own working directory rather than this
 /// process's.
 fn open_output_folder(hwnd: HWND) {
-    if let Err(err) = std::fs::create_dir_all(OUTPUT_DIR) {
-        eprintln!("[tray] could not create {OUTPUT_DIR}: {err}");
+    let directory = with_state(|state| state.settings.output_dir.clone())
+        .unwrap_or_else(|| settings::Settings::default().output_dir);
+
+    if let Err(err) = std::fs::create_dir_all(&directory) {
+        eprintln!("[tray] could not create {directory}: {err}");
         return;
     }
 
-    let folder = std::path::absolute(OUTPUT_DIR).unwrap_or_else(|_| PathBuf::from(OUTPUT_DIR));
+    let folder = std::path::absolute(&directory).unwrap_or_else(|_| PathBuf::from(&directory));
     let path = wide(&folder.to_string_lossy());
 
     unsafe {
@@ -493,9 +649,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         // The icon was added without asking for the newer notification layout,
         // so the mouse message arrives on its own in `lParam`.
         WM_TRAY => {
+            // Which button opens the menu is a setting; the other one starts a
+            // selection straight away, which is the whole point of the icon.
+            let capture_on_left =
+                with_state(|state| state.settings.tray_left_click).unwrap_or(TrayClick::Menu)
+                    == TrayClick::Capture;
             match lparam.0 as u32 {
-                WM_LBUTTONUP => show_menu(),
-                WM_RBUTTONUP => start(select_to_clipboard),
+                WM_LBUTTONUP if capture_on_left => start(select_region),
+                WM_RBUTTONUP if !capture_on_left => start(select_region),
+                WM_LBUTTONUP | WM_RBUTTONUP => show_menu(),
                 _ => {}
             }
             LRESULT(0)
@@ -503,7 +665,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
         WM_HOTKEY => {
             if wparam.0 as i32 == HOTKEY_ID {
-                start(select_to_clipboard);
+                start(select_region);
             }
             LRESULT(0)
         }

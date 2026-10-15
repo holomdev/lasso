@@ -3,8 +3,8 @@
 A screenshot tool for Windows, written in Rust.
 
 > **Status:** early development. The capture engine, the interactive region
-> selection, the magnifier, the clipboard and the resident tray mode work end to
-> end; the settings window, annotations and sharing are next.
+> selection, the magnifier, the clipboard, the resident tray mode and the
+> settings window work end to end; annotations and sharing are next.
 
 ## Overview
 
@@ -27,6 +27,9 @@ Started with no arguments, lasso runs resident with an icon in the notification
 area and a global hotkey, so a capture costs one keystroke instead of a terminal
 command. A left click on the icon opens a menu, a right click starts a selection
 straight away, and the chosen region goes to the clipboard.
+
+That menu also opens the settings, where the shortcut, the destinations and what
+the left click does are chosen, and an About dialog.
 
 Selecting a region freezes the screen and dims everything outside the
 selection, so the area you are about to keep is the only part at full
@@ -73,6 +76,35 @@ cargo run -- tray --hotkey Ctrl+Shift+Y
 Both commands take `--clipboard` (`-c`) to put the result on the clipboard as
 well, so it can be pasted somewhere without going through a file.
 
+### Settings
+
+The resident mode reads `%APPDATA%\lasso\lasso.ini`. It is plain text, so it can
+be edited by hand, copied between machines and kept under version control:
+
+```ini
+hotkey = Ctrl+Shift+X
+clipboard = yes
+save_file = no
+output_dir = C:\Users\you\Pictures\lasso
+tray_left_click = menu
+```
+
+| Key | Meaning |
+|---|---|
+| `hotkey` | Global shortcut that starts a selection. At least one modifier is required |
+| `clipboard` | Put each capture on the clipboard |
+| `save_file` | Also write each capture to `output_dir` |
+| `output_dir` | Where saved captures go |
+| `tray_left_click` | `menu` or `capture`: what a left click on the tray icon does |
+
+A line the program does not recognise is **kept exactly as written**, including
+keys written by a newer build, so editing the file by hand never silently loses
+entries. A value that cannot be understood leaves that one setting at its default
+and reports the line it came from, rather than refusing to start.
+
+`--hotkey` overrides the file's combination for a single run and does not write
+back, which is what makes it usable from a shortcut.
+
 ### Selection keys
 
 | Input | Result |
@@ -98,6 +130,8 @@ src/
   dpi.rs             DPI awareness bootstrap
   hotkey.rs          Global hotkey combinations, parsed and rendered
   icon.rs            Reading the embedded .ico for the size Windows asks for
+  settings.rs        The settings model, and the lasso.ini they live in
+  settings_window.rs The window that edits them
   tray.rs            Resident mode: tray icon, menu, hotkey, message loop
   capture/
     mod.rs           Frame, Backend, MonitorInfo, virtual desktop, fallback
@@ -130,8 +164,8 @@ tools/
 - [x] Clipboard copy
 - [x] Resident mode: notification-area icon, context menu, global hotkey
 - [x] Embedded application icon, generated at every size it ships
-- [ ] Settings window: hotkey, output and tray click behaviour, saved to `lasso.ini`
-- [ ] About dialog
+- [x] Settings window: hotkey, output and tray click behaviour, saved to `lasso.ini`
+- [x] About dialog
 - [ ] Annotation tools
 - [ ] Upload and share
 
@@ -181,6 +215,26 @@ zero, which is why only the magnifier ever looked wrong.
 
 The magnifier is drawn with nearest-neighbour stretching, since a magnifier wants
 blocky pixels rather than a smoothed average of them.
+
+### Settings window
+
+The controls are created in plain code after the window exists, not in
+`WM_CREATE`: that runs inside `CreateWindowExW`, before the caller has had any
+chance to hand over the owner and the settings the controls have to be filled
+from.
+
+The hotkey field is a read-only `EDIT` whose window procedure is replaced. A
+read-only edit still takes focus and still receives key messages, which makes it
+the smallest thing that can capture a combination; a control painted from scratch
+would be far more code for a field that shows one line.
+
+The window pumps a nested message loop and never posts `WM_QUIT`, because that
+would end the resident mode's loop as well. It reports completion through a flag
+instead.
+
+A new shortcut is registered **before** the previous one is released, so a
+combination another program already owns leaves the old one working rather than
+leaving the mode with no shortcut at all.
 
 ### Notification area
 
