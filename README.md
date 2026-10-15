@@ -69,6 +69,8 @@ cargo run -- tray --hotkey Ctrl+Shift+Y
 | Command | What it does |
 |---|---|
 | `lasso` or `lasso tray [--hotkey COMBO]` | Runs resident, with a notification-area icon and a global hotkey |
+| `lasso settings` | Opens the settings window on its own, without running resident |
+| `lasso about` | Shows the version, the license and the repository |
 | `lasso monitors` | Prints the virtual-desktop bounds and every monitor |
 | `lasso capture [--out FILE] [--backend dxgi\|gdi] [--clipboard]` | Captures the virtual desktop to a PNG |
 | `lasso select [--out FILE] [--clipboard]` | Captures, shows the selection overlay, and saves the chosen region |
@@ -78,8 +80,10 @@ well, so it can be pasted somewhere without going through a file.
 
 ### Settings
 
-The resident mode reads `%APPDATA%\lasso\lasso.ini`. It is plain text, so it can
-be edited by hand, copied between machines and kept under version control:
+The resident mode reads `%APPDATA%\lasso\lasso.ini`, and edits it through the
+settings window — from the tray menu, or with `lasso settings` when the resident
+mode is not running. It is plain text, so it can also be edited by hand, copied
+between machines and kept under version control:
 
 ```ini
 hotkey = Ctrl+Shift+X
