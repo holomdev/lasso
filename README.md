@@ -180,6 +180,7 @@ tools/
   ui-roundtrip.ps1   Drives the window and checks the settings file it wrote
   overlay-check.ps1  Drives the selection overlay and captures what it shows
   overlay-actions.ps1 Presses each of the strip's action buttons and reports the effect
+```
 
 ## Roadmap
 
@@ -201,11 +202,18 @@ tools/
 - [x] About dialog
 - [x] Annotation tools: a strip beside the region with arrow, rectangle, ellipse and
       pencil, a colour and width, undo and redo, and the three ways out
-- [ ] Upload and share
 
-The `Global hotkeys and tray icon` line that used to sit here was a duplicate of the
-resident-mode entry above it: the icon and the hotkey are what that mode is. Removed
-rather than ticked twice.
+Two items that used to be listed here were removed rather than done, so that a reader does
+not take their absence for an oversight.
+
+`Global hotkeys and tray icon` was a duplicate of the resident-mode entry above it: the
+icon and the hotkey are what that mode is.
+
+`Upload and share` is out of scope. It is not a missing feature but a different one: an
+upload target means depending on a service somebody else runs, with an account, an API and
+a URL that ages, and that falls outside what a capture tool is for. The clipboard already
+covers the case that matters — put it somewhere and paste it. A hosted destination would be
+a separate program that this one happens to launch.
 
 ## Implementation notes
 
