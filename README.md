@@ -242,12 +242,31 @@ leaving the mode with no shortcut at all.
 
 ### Notification area
 
-Adding the icon is treated as optional. `Shell_NotifyIconW` reports failure with
-`ERROR_ACCESS_DENIED` (5) in a session with no working shell — one where
-`Shell_TrayWnd` exists but no `explorer.exe` runs — and refusing to start because
-of that would take the hotkey down with it, even though the hotkey does not
-depend on the shell at all. The mode warns, keeps the hotkey, and leaves the
-console visible: without an icon, the console is the only way to stop it.
+Adding the icon is treated as optional. `Shell_NotifyIconW` can refuse it, and in
+the environment this was developed in it refuses with `ERROR_ACCESS_DENIED` (5)
+for every process tried: one started by the development agent, one started as an
+interactive scheduled task, and an independent implementation using a system icon
+and a matching structure. Comparing integrity levels found the difference: those
+processes ran at Low, while `Shell_TrayWnd` and the applications whose icons do
+appear run at Medium. Windows blocks a lower-integrity process from sending
+messages to a higher-integrity window, and registering an icon is such a message,
+so the call is refused before the shell ever sees it. The scheduled-task run is the
+one case whose own integrity level was not confirmed.
+
+That is a property of the environment the code ran in and not of the code, which is
+the ordinary `Shell_NotifyIconW` sequence. Refusing to start over it would take the
+hotkey down with it, even though the hotkey does not depend on the shell at all.
+The mode warns, keeps the hotkey, and leaves the console visible: without an icon,
+the console is the only way to stop it.
+
+The attempt is repeated on a timer for the first half minute, because the mode can
+be started before the shell is ready, and again whenever the shell announces that it
+has restarted: an icon belongs to the shell that accepted it, so a restart takes it
+away.
+
+The console is hidden only when this process owns it. A console shared with a shell
+belongs to that shell, and hiding it would take the user's own terminal window with
+it.
 
 ### Clipboard
 
