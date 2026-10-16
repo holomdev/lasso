@@ -68,6 +68,15 @@ const TRAY_ICON_ID: u32 = 1;
 /// messages of their own.
 const WM_TRAY: u32 = WM_APP + 1;
 
+/// A primary click reported by the newer callback layout.
+const NIN_SELECT: u32 = 0x0400;
+
+/// The keyboard equivalent of the same.
+const NIN_KEYSELECT: u32 = 0x0401;
+
+/// A secondary click can also arrive as this instead of the mouse message.
+const WM_CONTEXTMENU: u32 = 0x007B;
+
 /// Identifier of the global hotkey. Only one is registered, and the value only
 /// has to be unique within this thread's registrations.
 const HOTKEY_ID: i32 = 1;
@@ -801,11 +810,38 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let capture_on_left =
                 with_state(|state| state.settings.tray_left_click).unwrap_or(TrayClick::Menu)
                     == TrayClick::Capture;
-            match lparam.0 as u32 {
-                WM_LBUTTONUP if capture_on_left => start(select_region),
-                WM_RBUTTONUP if !capture_on_left => start(select_region),
-                WM_LBUTTONUP | WM_RBUTTONUP => show_menu(),
-                _ => {}
+
+            // Which click this was. Under the callback layout this icon is added
+            // with, a primary click arrives as `WM_LBUTTONUP` and a secondary one
+            // as `WM_RBUTTONUP`. The `NIN_*` codes belong to the newer layout and
+            // a secondary click can also be reported as `WM_CONTEXTMENU`.
+            // Accepting every form means both buttons behave the same whichever
+            // way the shell chooses to report them.
+            let message = lparam.0 as u32;
+            let primary = matches!(message, WM_LBUTTONUP | NIN_SELECT | NIN_KEYSELECT);
+            let secondary = matches!(message, WM_RBUTTONUP | WM_CONTEXTMENU);
+
+            if primary || secondary {
+                // Written down because a click that behaves backwards is
+                // otherwise indistinguishable from a setting that says so: this
+                // line records which message the shell actually sent.
+                if let Some(path) = settings::path().map(|p| p.with_file_name("lasso.log")) {
+                    let line = format!("tray callback 0x{message:04X}\n");
+                    if let Ok(mut log) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                    {
+                        use std::io::Write;
+                        let _ = log.write_all(line.as_bytes());
+                    }
+                }
+
+                if (primary && capture_on_left) || (secondary && !capture_on_left) {
+                    start(select_region)
+                } else {
+                    show_menu()
+                }
             }
             LRESULT(0)
         }
