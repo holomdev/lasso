@@ -33,11 +33,11 @@ use windows::Win32::Foundation::{
     COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    CLIP_DEFAULT_PRECIS, COLOR_BTNFACE, COLOR_WINDOW, CreateCompatibleDC, CreateFontW, CreateSolidBrush,
-    DEFAULT_CHARSET, DEFAULT_GUI_FONT, DEFAULT_PITCH, DEFAULT_QUALITY, DeleteDC, DeleteObject,
-    FF_DONTCARE, GetObjectW, GetStockObject, GetSysColor, GetTextExtentPoint32W, HBRUSH, HGDIOBJ,
-    InvalidateRect, LOGFONTW, OUT_DEFAULT_PRECIS, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE,
-    RDW_UPDATENOW, RedrawWindow, SelectObject,
+    CLIP_DEFAULT_PRECIS, COLOR_BTNFACE, COLOR_WINDOW, CreateCompatibleDC, CreateFontW,
+    CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_GUI_FONT, DEFAULT_PITCH, DEFAULT_QUALITY, DeleteDC,
+    DeleteObject, FF_DONTCARE, GetObjectW, GetStockObject, GetSysColor, GetTextExtentPoint32W, HBRUSH,
+    HDC, HGDIOBJ, InvalidateRect, LOGFONTW, NULL_BRUSH, OUT_DEFAULT_PRECIS, RDW_ALLCHILDREN,
+    RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow, SelectObject, SetBkMode, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem, GetDpiForWindow};
@@ -308,6 +308,15 @@ pub fn open(owner: HWND, current: &Settings, dpi: Option<u32>) -> Result<Option<
     // names as its background.
     let label_brush = unsafe { CreateSolidBrush(COLORREF(GetSysColor(COLOR_BTNFACE))) };
     let window_brush = unsafe { CreateSolidBrush(COLORREF(GetSysColor(COLOR_WINDOW))) };
+    if std::env::var_os("LASSO_TRACE_LAYOUT").is_some() {
+        eprintln!(
+            "[brush] label={:p} from COLOR_BTNFACE={:#010x}  window={:p} from COLOR_WINDOW={:#010x}",
+            label_brush.0,
+            unsafe { GetSysColor(COLOR_BTNFACE) },
+            window_brush.0,
+            unsafe { GetSysColor(COLOR_WINDOW) },
+        );
+    }
 
     // The size given to CreateWindowExW covers the whole window, caption and
     // frame included, while the layout is written in client coordinates. Turning
@@ -1373,18 +1382,35 @@ unsafe extern "system" fn window_proc(
         // read-only edit - which is what the hotkey field is - and for a disabled
         // one. An edit is the only one of those that should come out white.
         WM_CTLCOLORSTATIC => {
-            let (label_brush, window_brush) =
-                with_state(|state| (state.label_brush, state.window_brush)).unwrap_or_default();
+            let window_brush = with_state(|state| state.window_brush).unwrap_or_default();
             let control = HWND(lparam.0 as *mut core::ffi::c_void);
-            let brush = if is_edit(control) {
-                window_brush
-            } else {
-                label_brush
-            };
-            if brush.is_invalid() {
+            let dc = HDC(wparam.0 as *mut core::ffi::c_void);
+
+            if is_edit(control) {
+                // A field is a box on the page: white behind its text, which is
+                // what tells somebody there is somewhere to type.
+                if !window_brush.is_invalid() {
+                    return LRESULT(window_brush.0 as isize);
+                }
                 return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
             }
-            LRESULT(brush.0 as isize)
+
+            // A label paints **no background at all**, and that is the whole point.
+            // Handing it a brush — even one of exactly the right colour — makes it
+            // fill its entire rectangle, and a label's rectangle is wider than its
+            // text. The fill lands on whatever lies under the parts the text does
+            // not cover, and the widest thing there is the frame's own border. That
+            // is what put a clean band of the page's colour straight through the
+            // bottom edge of every group.
+            //
+            // A null brush is how a control is told to leave its background alone.
+            // The text is put in transparent mode as well so it does not fill its
+            // own glyph boxes either, and then it simply sits on what is there.
+            unsafe {
+                let _ = SetBkMode(dc, TRANSPARENT);
+            }
+            let nothing = unsafe { GetStockObject(NULL_BRUSH) };
+            LRESULT(nothing.0 as isize)
         }
 
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
