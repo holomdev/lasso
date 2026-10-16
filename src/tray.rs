@@ -36,7 +36,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
-use windows::Win32::System::Console::GetConsoleWindow;
+use windows::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS,
@@ -49,10 +49,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
     DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, HICON, HMENU,
     MB_ICONINFORMATION, MB_OK, MessageBoxW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW,
-    PostQuitMessage, RegisterClassW, SW_HIDE,
-    SW_SHOWNORMAL, SetForegroundWindow, ShowWindow, SM_CXSMICON, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    TrackPopupMenu, TranslateMessage, WM_APP, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_NULL,
-    WM_RBUTTONUP, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
+    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SW_HIDE,
+    SW_SHOWNORMAL, SetForegroundWindow, SetTimer, KillTimer, ShowWindow, SM_CXSMICON,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_DESTROY,
+    WM_HOTKEY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW,
+    WS_POPUP,
 };
 
 use crate::settings::{Settings, TrayClick};
@@ -70,6 +71,19 @@ const WM_TRAY: u32 = WM_APP + 1;
 /// Identifier of the global hotkey. Only one is registered, and the value only
 /// has to be unique within this thread's registrations.
 const HOTKEY_ID: i32 = 1;
+
+/// Timer used while the notification area has not accepted the icon yet.
+const RETRY_TIMER_ID: usize = 1;
+
+/// How long to wait between attempts at the icon, in milliseconds.
+const RETRY_INTERVAL_MS: u32 = 5000;
+
+/// How many times the icon is attempted at startup before giving up.
+///
+/// The shell can be slow to start and the mode may be launched before it. After
+/// these run out the icon is only attempted again when the shell announces that
+/// it has restarted, which is the case that can happen at any time.
+const ICON_RETRIES: u32 = 6;
 
 /// Context menu identifiers.
 ///
@@ -92,6 +106,14 @@ struct State {
     /// The settings this run is using, so a capture can consult them without
     /// reading the file again.
     settings: Settings,
+    /// The id of the message the shell sends to every top-level window when it
+    /// restarts. An icon belongs to the shell that accepted it, so the one this
+    /// process added disappears with it and has to be added again.
+    taskbar_created: u32,
+    /// Attempts left at putting the icon in the notification area.
+    retries_left: u32,
+    /// Set once the console has been hidden, so it only ever happens once.
+    console_hidden: bool,
     /// Set while a capture or the overlay is running, so a request that arrives
     /// during the overlay's nested message loop is ignored instead of stacking
     /// a second overlay on top of it.
@@ -113,6 +135,10 @@ pub fn run(hotkey_override: Option<hotkey::Hotkey>) -> Result<()> {
     if let Some(hotkey) = hotkey_override {
         settings.hotkey = hotkey;
     }
+
+    // Looked up rather than assumed: the message only has a number once the shell
+    // has registered it, and that number is what identifies it from then on.
+    let taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
 
     let hmodule = unsafe { GetModuleHandleW(None) }.context("GetModuleHandleW failed")?;
     let hinstance = HINSTANCE(hmodule.0);
@@ -165,6 +191,9 @@ pub fn run(hotkey_override: Option<hotkey::Hotkey>) -> Result<()> {
             icon,
             menu,
             settings,
+            taskbar_created,
+            retries_left: ICON_RETRIES,
+            console_hidden: false,
             busy: false,
             icon_added: false,
             hotkey_registered: false,
@@ -181,14 +210,9 @@ pub fn run(hotkey_override: Option<hotkey::Hotkey>) -> Result<()> {
         return Err(err);
     }
 
-    // Hidden only once the icon is actually in place. Nothing here writes a
-    // result to the console, so it is hidden rather than left behind as an empty
-    // window — but without the icon the console carries the warning and is the
-    // only way left to stop the mode, so it stays.
-    if with_state(|state| state.icon_added).unwrap_or(false) {
-        hide_console();
-    }
-
+    // Hidden only once the icon is actually in place, which `retry_icon` reports
+    // by calling this. Nothing here writes a result to the console, so it is
+    // hidden rather than left behind as an empty window.
     let mut msg = MSG::default();
     unsafe {
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -220,6 +244,107 @@ fn hide_console() {
     }
 }
 
+/// Try to put the icon in the notification area.
+///
+/// A refusal is not final: the shell can be slow to start, and there are
+/// environments where the call is refused outright. The caller decides what to do
+/// about it.
+fn add_icon() -> bool {
+    let added = with_state(|state| unsafe {
+        Shell_NotifyIconW(NIM_ADD, &notify_data(state.hwnd, state.icon)).as_bool()
+    })
+    .unwrap_or(false);
+
+    if added {
+        let hwnd = with_state(|state| {
+            state.icon_added = true;
+            state.hwnd
+        });
+        if let Some(hwnd) = hwnd {
+            unsafe {
+                let _ = KillTimer(Some(hwnd), RETRY_TIMER_ID);
+            }
+        }
+    }
+    added
+}
+
+/// Install the icon, and arrange another attempt when it is refused.
+fn retry_icon() {
+    if with_state(|state| state.icon_added).unwrap_or(false) {
+        return;
+    }
+
+    if add_icon() {
+        eprintln!("[tray] the icon is in the notification area");
+        // With the icon up, the console is no longer the only way to stop this.
+        hide_console_once();
+        return;
+    }
+
+    let code = unsafe { GetLastError() };
+    let scheduled = with_state(|state| {
+        state.retries_left = state.retries_left.saturating_sub(1);
+        (state.retries_left, state.hwnd)
+    });
+
+    match scheduled {
+        Some((left, hwnd)) if left > 0 => {
+            eprintln!(
+                "[tray] the notification area refused the icon (error {}); \
+                 trying again in {} s",
+                code.0,
+                RETRY_INTERVAL_MS / 1000
+            );
+            unsafe {
+                SetTimer(Some(hwnd), RETRY_TIMER_ID, RETRY_INTERVAL_MS, None);
+            }
+        }
+        _ => {
+            eprintln!(
+                "[tray] the notification area refused the icon (error {}); continuing without \
+                 it, and trying again if the shell restarts",
+                code.0
+            );
+        }
+    }
+}
+
+/// The shell has restarted, which takes every icon with it.
+fn on_taskbar_created() {
+    with_state(|state| {
+        state.icon_added = false;
+        // A fresh shell is a fresh chance, however many attempts were used up.
+        state.retries_left = ICON_RETRIES;
+    });
+    retry_icon();
+}
+
+/// Hide the console, but only when it belongs to this process.
+///
+/// A console shared with a shell belongs to that shell, so hiding it would make
+/// the user's own terminal window disappear — and starting the resident mode from
+/// a terminal is an ordinary thing to do.
+fn hide_console_once() {
+    if with_state(|state| state.console_hidden).unwrap_or(true) {
+        return;
+    }
+    if !owns_console() {
+        return;
+    }
+    hide_console();
+    with_state(|state| state.console_hidden = true);
+}
+
+/// Whether the console this process uses was created for it alone.
+fn owns_console() -> bool {
+    let mut processes = [0u32; 2];
+    // The return is how many processes are attached. A number larger than the
+    // buffer means more than the two asked about, so it is shared.
+    let attached = unsafe { GetConsoleProcessList(&mut processes) };
+    attached <= 1
+}
+
 /// Add the tray icon and register the hotkey.
 ///
 /// Neither is treated as fatal on its own. The notification area can be missing
@@ -228,20 +353,9 @@ fn hide_console() {
 /// depend on it. The mode therefore keeps working with whichever of the two it
 /// got, and only refuses to start when it got neither.
 fn install() -> Result<()> {
-    let added = with_state(|state| unsafe {
-        Shell_NotifyIconW(NIM_ADD, &notify_data(state.hwnd, state.icon)).as_bool()
-    })
-    .unwrap_or(false);
-    if added {
-        with_state(|state| state.icon_added = true);
-    } else {
-        let code = unsafe { GetLastError() };
-        eprintln!(
-            "[tray] the notification area refused the icon (Shell_NotifyIconW error {}); \
-             continuing without it",
-            code.0
-        );
-    }
+    // One path for every attempt: a shell that is not ready yet, a shell that has
+    // just restarted, and a notification area that is not there at all.
+    retry_icon();
 
     let hotkey = with_state(|state| state.settings.hotkey).unwrap_or(hotkey::Hotkey::DEFAULT);
     match register_hotkey(hotkey) {
@@ -653,7 +767,18 @@ fn wide(text: &str) -> Vec<u16> {
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // The number of this message is only known at run time, so it cannot be a
+    // match arm.
+    if msg != 0 && with_state(|state| state.taskbar_created) == Some(msg) {
+        on_taskbar_created();
+        return LRESULT(0);
+    }
+
     match msg {
+        WM_TIMER if wparam.0 == RETRY_TIMER_ID => {
+            retry_icon();
+            LRESULT(0)
+        }
         // The icon was added without asking for the newer notification layout,
         // so the mouse message arrives on its own in `lParam`.
         WM_TRAY => {
