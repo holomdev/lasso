@@ -24,7 +24,7 @@
 use std::cell::RefCell;
 
 use anyhow::{Context, Result};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{DEFAULT_GUI_FONT, GetStockObject};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -66,11 +66,11 @@ const BST_UNCHECKED: isize = 0;
 
 /// Layout, in client coordinates. A fixed size is honest here: the window holds a
 /// known set of controls and nothing in it reflows.
-const PAD: i32 = 14;
+const PAD: i32 = 16;
 const LABEL_WIDTH: i32 = 104;
-const FIELD_HEIGHT: i32 = 22;
-const CLIENT_WIDTH: i32 = 392;
-const CLIENT_HEIGHT: i32 = 300;
+const FIELD_HEIGHT: i32 = 24;
+const CLIENT_WIDTH: i32 = 460;
+const CLIENT_HEIGHT: i32 = 336;
 const BUTTON_WIDTH: i32 = 92;
 
 /// Identifiers, so a message can say which control it came from.
@@ -157,16 +157,35 @@ pub fn open(owner: HWND, current: &Settings) -> Result<Option<Settings>> {
         let _ = RegisterClassW(&wc);
     }
 
+    let style = WINDOW_STYLE(WS_OVERLAPPED.0 | WS_CAPTION.0 | WS_SYSMENU.0);
+    let ex_style = WS_EX_DLGMODALFRAME;
+
+    // The size given to CreateWindowExW covers the whole window, caption and
+    // frame included, while the layout is written in client coordinates. Turning
+    // one into the other here is what keeps the bottom row of buttons inside the
+    // window instead of below its edge.
+    let mut frame = RECT {
+        left: 0,
+        top: 0,
+        right: CLIENT_WIDTH,
+        bottom: CLIENT_HEIGHT,
+    };
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::AdjustWindowRectEx(
+            &mut frame, style, false, ex_style,
+        );
+    }
+
     let window = unsafe {
         CreateWindowExW(
-            WS_EX_DLGMODALFRAME,
+            ex_style,
             class,
             w!("lasso settings"),
-            WINDOW_STYLE(WS_OVERLAPPED.0 | WS_CAPTION.0 | WS_SYSMENU.0),
+            style,
             0,
             0,
-            CLIENT_WIDTH,
-            CLIENT_HEIGHT,
+            frame.right - frame.left,
+            frame.bottom - frame.top,
             Some(owner),
             None,
             Some(instance),
