@@ -250,6 +250,11 @@ noise. The check then asks that the changed pixels form a small cluster covering
 the pointer's own position - which is what catches a hotspot error - and that they
 came out partly transparent rather than fully replaced.
 
+With `select`, the overlay is handed the frame **without** the pointer and the
+pointer is drawn afterwards, just before the region is published. Two reasons: the
+magnifier has to show the pixels underneath, which is what placing an edge
+precisely depends on, and a cancelled selection must not have drawn anything.
+
 ### Overlay rendering
 
 The overlay keeps two copies of the capture: the untouched pixels and a dimmed
@@ -401,9 +406,13 @@ placed outside the window still exists.
 
 ### Known limitations
 
-- The token the pointer is drawn from is read when the window is, so a pointer
-  that changes shape between the capture and the drawing is drawn with the newer
-  shape. It is in the right place either way.
+- The pointer is read and drawn in the same call, with nothing in between, so what
+  is drawn is the pointer as it is at that moment. What that moment is differs
+  between the two commands: `capture` reads it right after the pixels, while
+  `select` reads it after the region has been chosen, because cancelling must not
+  leave a pointer drawn on a frame nothing comes of. Pressing Enter with the
+  pointer where the region was marked is therefore what puts the pointer in the
+  saved image, and that is the normal case.
 - Screen rotation is still not handled: the capture sizes come from the virtual
   desktop, which reports the rotated dimensions, but nothing detects a rotated
   output or corrects for one.
