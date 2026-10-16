@@ -282,6 +282,17 @@ mod tests {
         }
     }
 
+    impl Canvas {
+        /// The pixel reader, reachable from the drawing tests in `super::draw`.
+        ///
+        /// A separate `impl` rather than an attribute on the one above: this whole block
+        /// is inside the test module, so `pub(super)` would mean "visible to the test
+        /// module's parent" and reach nothing useful.
+        pub(crate) fn back_pixel_for_test(&self, x: i32, y: i32) -> (u8, u8, u8) {
+            self.back_pixel(x, y)
+        }
+    }
+
     #[test]
     fn magnify_puts_the_pixel_under_the_pointer_at_the_marked_square() {
         // The panel is a screen-space overlay, so the test canvas has to be
@@ -307,7 +318,7 @@ mod tests {
         let marked = geometry::magnifier_marked(&content);
         let centre_x = (marked.left + marked.right) / 2;
         let centre_y = (marked.top + marked.bottom) / 2;
-        let (blue, green, _red) = canvas.back_pixel(centre_x, centre_y);
+        let (blue, green, _red) = canvas.back_pixel_for_test(centre_x, centre_y);
 
         assert_eq!(
             (blue as i32, green as i32),

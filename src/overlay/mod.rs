@@ -41,6 +41,8 @@
 #[allow(dead_code)]
 pub mod annotation;
 mod canvas;
+#[allow(dead_code)]
+mod draw;
 mod geometry;
 #[allow(dead_code)]
 pub mod toolbar;
