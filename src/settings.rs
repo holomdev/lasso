@@ -76,6 +76,12 @@ pub struct Settings {
     pub hotkey: Hotkey,
     /// Put the result on the clipboard when a capture finishes.
     pub clipboard: bool,
+    /// Draw the mouse pointer into the capture.
+    ///
+    /// Off by default: output duplication never includes the pointer and `BitBlt`
+    /// only does with `CAPTUREBLT`, so a pointer in the image is a decision rather
+    /// than something that comes for free.
+    pub cursor: bool,
     /// Also write the result to `output_dir`.
     pub save_file: bool,
     /// Where saved captures go.
@@ -99,6 +105,9 @@ impl Default for Settings {
         Settings {
             hotkey: Hotkey::DEFAULT,
             clipboard: true,
+            // Drawing the pointer changes what a capture contains, so it is asked
+            // for rather than assumed.
+            cursor: false,
             // Writing a file is the surprising half of the two, so it is off
             // until asked for; the clipboard is the reason the tool exists.
             save_file: false,
@@ -169,6 +178,13 @@ impl Settings {
                         yes_no(settings.save_file)
                     )),
                 },
+                "cursor" => match parse_bool(value) {
+                    Some(flag) => settings.cursor = flag,
+                    None => warnings.push(format!(
+                        "cursor: {value:?} is not a yes or no; keeping {}",
+                        yes_no(settings.cursor)
+                    )),
+                },
                 "output_dir" => {
                     if value.is_empty() {
                         warnings.push("output_dir: is empty; keeping the default".to_string());
@@ -200,6 +216,7 @@ impl Settings {
         text.push_str("# hotkey           global shortcut that starts a selection, e.g. Ctrl+Shift+X\n");
         text.push_str("#                  at least one modifier is required\n");
         text.push_str("# clipboard        copy each capture to the clipboard (yes/no)\n");
+        text.push_str("# cursor           draw the mouse pointer into the capture (yes/no)\n");
         text.push_str("# save_file        also write each capture to output_dir (yes/no)\n");
         text.push_str("# output_dir       where saved captures go\n");
         text.push_str("# tray_left_click  what a left click on the tray icon does: menu or capture\n");
@@ -207,6 +224,7 @@ impl Settings {
 
         text.push_str(&format!("hotkey = {}\n", self.hotkey));
         text.push_str(&format!("clipboard = {}\n", yes_no(self.clipboard)));
+        text.push_str(&format!("cursor = {}\n", yes_no(self.cursor)));
         text.push_str(&format!("save_file = {}\n", yes_no(self.save_file)));
         text.push_str(&format!("output_dir = {}\n", self.output_dir));
         text.push_str(&format!(
@@ -377,6 +395,7 @@ tray_left_click = sideways
         let original = Settings {
             hotkey: Hotkey::parse("Ctrl+Alt+PrintScreen").unwrap(),
             clipboard: false,
+            cursor: true,
             save_file: true,
             output_dir: "D:\\capturas".to_string(),
             tray_left_click: TrayClick::Capture,
@@ -397,6 +416,7 @@ tray_left_click = sideways
         let settings = Settings {
             hotkey: Hotkey::parse("Win+Shift+S").unwrap(),
             clipboard: false,
+            cursor: true,
             save_file: true,
             output_dir: "C:\\capturas".to_string(),
             tray_left_click: TrayClick::Capture,

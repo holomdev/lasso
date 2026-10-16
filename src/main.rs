@@ -42,13 +42,14 @@ fn usage() {
          lasso settings --dpi N   the same window laid out for a display of that scale\n  \
          lasso about         show the version and license\n  \
          lasso monitors\n  \
-         lasso capture [--out FILE.png] [--backend dxgi|gdi] [--clipboard]\n  \
-         lasso select  [--out FILE.png] [--clipboard]\n\n\
+         lasso capture [--out FILE.png] [--backend dxgi|gdi] [--clipboard] [--cursor]\n  \
+         lasso select  [--out FILE.png] [--clipboard] [--cursor]\n\n\
          OPTIONS:\n  \
          -o, --out FILE      output file (capture default: {capture}, select default: {select})\n  \
          -b, --backend NAME  force dxgi or gdi; without it, DXGI with a GDI fallback\n  \
          -c, --clipboard     also copy the result to the clipboard\n  \
          -k, --hotkey COMBO  global hotkey for the resident mode, e.g. Ctrl+Shift+X\n  \
+         --cursor            draw the mouse pointer into the capture\n  \
          -h, --help          this help\n\n\
          SELECT KEYS:\n  \
          left drag           define the region, drag inside to move it, drag an edge to resize\n  \
@@ -100,6 +101,7 @@ fn main() -> Result<()> {
             let mut out = String::from(DEFAULT_CAPTURE_OUT);
             let mut backend: Option<Backend> = None;
             let mut copy = false;
+            let mut with_cursor = false;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -117,15 +119,17 @@ fn main() -> Result<()> {
                         });
                     }
                     "--clipboard" | "-c" => copy = true,
+                    "--cursor" => with_cursor = true,
                     other => bail!("unknown argument: {other}"),
                 }
                 i += 1;
             }
-            cmd_capture(&out, backend, copy)
+            cmd_capture(&out, backend, copy, with_cursor)
         }
         "select" => {
             let mut out = String::from(DEFAULT_SELECT_OUT);
             let mut copy = false;
+            let mut with_cursor = false;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -134,11 +138,12 @@ fn main() -> Result<()> {
                         out = args.get(i).context("--out needs a value")?.clone();
                     }
                     "--clipboard" | "-c" => copy = true,
+                    "--cursor" => with_cursor = true,
                     other => bail!("unknown argument: {other}"),
                 }
                 i += 1;
             }
-            cmd_select(&out, copy)
+            cmd_select(&out, copy, with_cursor)
         }
         "-h" | "--help" | "help" => {
             usage();
@@ -231,7 +236,7 @@ fn cmd_monitors() -> Result<()> {
     Ok(())
 }
 
-fn cmd_capture(out: &str, backend: Option<Backend>, copy: bool) -> Result<()> {
+fn cmd_capture(out: &str, backend: Option<Backend>, copy: bool, with_cursor: bool) -> Result<()> {
     let (vx, vy, vw, vh) = capture::virtual_desktop();
     eprintln!("[desktop] virtual = {vw}x{vh} @ ({vx},{vy})");
     for m in capture::monitors()? {
@@ -247,7 +252,7 @@ fn cmd_capture(out: &str, backend: Option<Backend>, copy: bool) -> Result<()> {
     }
 
     let started = Instant::now();
-    let frame = capture::capture_virtual_desktop(backend)?;
+    let frame = capture::capture_virtual_desktop_with(backend, with_cursor)?;
     let elapsed = started.elapsed();
 
     ensure_parent(out)?;
@@ -271,9 +276,12 @@ fn cmd_capture(out: &str, backend: Option<Backend>, copy: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_select(out: &str, copy: bool) -> Result<()> {
+fn cmd_select(out: &str, copy: bool, with_cursor: bool) -> Result<()> {
     let started = Instant::now();
-    let frame = capture::capture_virtual_desktop(None)?;
+    // The overlay is given the capture without the pointer: it draws its own
+    // crosshair, and the magnifier has to show the pixels underneath, which is
+    // what placing an edge precisely depends on.
+    let mut frame = capture::capture_virtual_desktop(None)?;
     eprintln!(
         "[capture] {} {}x{} in {:.1} ms",
         frame.backend.as_str(),
@@ -286,6 +294,13 @@ fn cmd_select(out: &str, copy: bool) -> Result<()> {
         println!("cancelled");
         return Ok(());
     };
+
+    // What is saved and copied is the pointer as it was when the capture was
+    // taken, not where it is now: by this point it is wherever the drag left it,
+    // which is over the region rather than at the thing being captured.
+    if with_cursor {
+        capture::cursor::compose(&mut frame.bgra, frame.width, frame.height, frame.origin);
+    }
 
     let bounds = (selection.x, selection.y, selection.width, selection.height);
 

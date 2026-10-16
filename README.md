@@ -22,6 +22,9 @@ scaling:
   Windows 8.1 mode).
 - **PNG output**, or straight to the **clipboard** when the image is going to be
   pasted somewhere rather than kept.
+- The **mouse pointer**, drawn in on request. Neither backend includes it on its
+  own, so it is composited into the finished frame: `--cursor` for one capture,
+  or a check box in the settings for every capture.
 
 Started with no arguments, lasso runs resident with an icon in the notification
 area and a global hotkey, so a capture costs one keystroke instead of a terminal
@@ -85,11 +88,12 @@ cargo run -- tray --hotkey Ctrl+Shift+Y
 | `lasso settings --dpi N` | The same window, laid out for a display of that scale |
 | `lasso about` | Shows the version, the license and the repository |
 | `lasso monitors` | Prints the virtual-desktop bounds and every monitor |
-| `lasso capture [--out FILE] [--backend dxgi\|gdi] [--clipboard]` | Captures the virtual desktop to a PNG |
-| `lasso select [--out FILE] [--clipboard]` | Captures, shows the selection overlay, and saves the chosen region |
+| `lasso capture [--out FILE] [--backend dxgi\|gdi] [--clipboard] [--cursor]` | Captures the virtual desktop to a PNG |
+| `lasso select [--out FILE] [--clipboard] [--cursor]` | Captures, shows the selection overlay, and saves the chosen region |
 
 Both commands take `--clipboard` (`-c`) to put the result on the clipboard as
-well, so it can be pasted somewhere without going through a file.
+well, so it can be pasted somewhere without going through a file, and `--cursor`
+to draw the mouse pointer into the capture.
 
 ### Settings
 
@@ -101,6 +105,7 @@ between machines and kept under version control:
 ```ini
 hotkey = Ctrl+Shift+X
 clipboard = yes
+cursor = no
 save_file = no
 output_dir = C:\Users\you\Pictures\lasso
 tray_left_click = menu
@@ -110,6 +115,7 @@ tray_left_click = menu
 |---|---|
 | `hotkey` | Global shortcut that starts a selection. At least one modifier is required |
 | `clipboard` | Put each capture on the clipboard |
+| `cursor` | Draw the mouse pointer into the capture |
 | `save_file` | Also write each capture to `output_dir` |
 | `output_dir` | Where saved captures go |
 | `tray_left_click` | `menu` or `capture`: what a left click on the tray icon does |
@@ -181,7 +187,7 @@ tools/
       crosshair cursor, live size label
 - [x] Move, resize handles and arrow-key nudging of the region
 - [x] Magnifier and a pointer crosshair, for placing an edge precisely
-- [ ] Cursor compositing
+- [x] Cursor compositing, opt-in, on both backends and in the resident mode
 - [ ] Screen rotation
 - [ ] Global hotkeys and tray icon
 - [x] Clipboard copy
@@ -209,6 +215,40 @@ Two behaviours cost real debugging time and are handled explicitly in
 Both were pinned down by comparing the two capture routes on the same frame: the
 DXGI route produced a single colour and 0% non-black pixels while the GDI route
 produced the real desktop. With the fixes in place both routes agree.
+
+### The mouse pointer
+
+Neither route includes the pointer on its own, and the two do not agree about it
+when asked: output duplication never draws it, and `BitBlt` from the screen only
+does with `CAPTUREBLT`, which flickers the window being copied and refuses to copy
+layered windows at all. So the pointer is drawn into the finished frame by
+`capture/cursor.rs`, for both backends and for both the capture and the selection.
+
+A pointer is not a rectangle of pixels. It is a shape drawn with an AND mask and
+an XOR mask, and the pixels along its edge come out of those masks mixed with
+whatever was behind them. `DrawIconEx` is given a copy of the pixels the pointer
+is about to cover, so those edges are mixed with the screen they were over; draw
+the shape into a bitmap of its own and they are mixed with black instead, and the
+pointer arrives with dark fringes. That was the first version of this and the
+fringes are what it looked like.
+
+Two details decide whether the pointer lands in the right place:
+
+- `CURSORINFO::ptScreenPos` is the point the pointer is **pointing at**, not the
+  corner of its shape. The shape's top-left is that point less the hotspot from
+  `GetIconInfo`, and using the raw position puts the pointer up and to the left of
+  where it belongs.
+- `DrawIconEx` applies the masks against the destination origin, so the
+  coordinates it is given have to be in the bitmap it is drawing into, which is a
+  small rectangle around the pointer rather than the whole frame.
+
+`tools/cursor-check.ps1` checks it by putting a flat window of its own on screen,
+capturing the same rectangle with and without the pointer, and comparing. The
+window is what makes it work: on a live desktop the two captures differ over the
+whole screen as the desktop repaints itself, and the pointer is invisible in that
+noise. The check then asks that the changed pixels form a small cluster covering
+the pointer's own position - which is what catches a hotspot error - and that they
+came out partly transparent rather than fully replaced.
 
 ### Overlay rendering
 
@@ -244,7 +284,9 @@ blocky pixels rather than a smoothed average of them.
 The controls are created in plain code after the window exists, not in
 `WM_CREATE`: that runs inside `CreateWindowExW`, before the caller has had any
 chance to hand over the owner and the settings the controls have to be filled
-from.
+from. The window is cut into four group frames — the shortcut, what happens after
+a capture, where a file goes, and the tray icon — rather than one flat column of
+controls, which read as a list of unrelated lines.
 
 The hotkey field is a read-only `EDIT` whose window procedure is replaced. A
 read-only edit still takes focus and still receives key messages, which makes it
@@ -344,8 +386,12 @@ placed outside the window still exists.
 
 ### Known limitations
 
-- Output duplication never includes the cursor, so it has to be composited
-  separately.
+- The token the pointer is drawn from is read when the window is, so a pointer
+  that changes shape between the capture and the drawing is drawn with the newer
+  shape. It is in the right place either way.
+- Screen rotation is still not handled: the capture sizes come from the virtual
+  desktop, which reports the rotated dimensions, but nothing detects a rotated
+  output or corrects for one.
 - The tray icon needs a working notification area. Without one the resident mode
   falls back to the hotkey alone.
 - A binary carrying a `Low` mandatory integrity label can never show a tray icon.

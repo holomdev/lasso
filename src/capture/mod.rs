@@ -12,7 +12,11 @@
 //! Everything is done in **physical pixels** with the process declared
 //! per-monitor DPI aware, which is what allows a selection rectangle to span
 //! monitors with different scale factors without drifting.
+//!
+//! Neither route includes the mouse pointer on its own, so `cursor` draws it into
+//! the finished frame when a capture asks for it.
 
+pub mod cursor;
 pub mod dxgi;
 pub mod gdi;
 
@@ -190,6 +194,23 @@ pub fn monitors() -> Result<Vec<MonitorInfo>> {
 /// With `None` it tries DXGI first and falls back to GDI, reporting why on
 /// stderr.
 pub fn capture_virtual_desktop(prefer: Option<Backend>) -> Result<Frame> {
+    capture_virtual_desktop_with(prefer, false)
+}
+
+/// The same, with the mouse pointer drawn in when `with_cursor` is set.
+///
+/// The pointer is drawn after the frame is complete rather than during either
+/// route, so `capture` and `select` include the same pointer in the same place
+/// whichever backend produced the pixels.
+pub fn capture_virtual_desktop_with(prefer: Option<Backend>, with_cursor: bool) -> Result<Frame> {
+    let mut frame = capture_desktop(prefer)?;
+    if with_cursor {
+        cursor::compose(&mut frame.bgra, frame.width, frame.height, frame.origin);
+    }
+    Ok(frame)
+}
+
+fn capture_desktop(prefer: Option<Backend>) -> Result<Frame> {
     let (x, y, w, h) = virtual_desktop();
     if w == 0 || h == 0 {
         bail!("virtual desktop reports a zero size ({w}x{h})");

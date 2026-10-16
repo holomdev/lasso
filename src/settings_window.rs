@@ -127,6 +127,7 @@ const ID_HOTKEY: i32 = 100;
 const ID_HOTKEY_HINT: i32 = 101;
 const ID_CLIPBOARD: i32 = 102;
 const ID_SAVE_FILE: i32 = 103;
+const ID_CURSOR: i32 = 109;
 const ID_OUTPUT_DIR: i32 = 104;
 const ID_BROWSE: i32 = 105;
 const ID_OUTPUT_HINT: i32 = 106;
@@ -152,6 +153,7 @@ struct Controls {
 
     after_group: HWND,
     clipboard: HWND,
+    cursor: HWND,
     save_file: HWND,
 
     file_group: HWND,
@@ -184,6 +186,7 @@ impl Controls {
             self.hotkey_field,
             self.hotkey_hint,
             self.clipboard,
+            self.cursor,
             self.save_file,
             self.output_label,
             self.output_dir,
@@ -613,7 +616,8 @@ fn build_controls() -> Result<()> {
         instance,
     )?;
 
-    let (clipboard_rect, save_file_rect) = layout.checks();
+    let rects = layout.checks();
+    let (clipboard_rect, cursor_rect, save_file_rect) = (rects[0], rects[1], rects[2]);
     let clipboard = child(
         window,
         w!("BUTTON"),
@@ -621,6 +625,15 @@ fn build_controls() -> Result<()> {
         BS_AUTOCHECKBOX | WS_TABSTOP.0,
         ID_CLIPBOARD,
         clipboard_rect,
+        instance,
+    )?;
+    let cursor = child(
+        window,
+        w!("BUTTON"),
+        "Draw the mouse pointer into the capture",
+        BS_AUTOCHECKBOX | WS_TABSTOP.0,
+        ID_CURSOR,
+        cursor_rect,
         instance,
     )?;
     let save_file = child(
@@ -733,6 +746,7 @@ fn build_controls() -> Result<()> {
             hotkey_hint,
             after_group,
             clipboard,
+            cursor,
             save_file,
             file_group,
             output_label,
@@ -879,9 +893,10 @@ fn place_controls(layout: Layout, controls: Controls) {
     );
     batch = move_to(batch, controls.hotkey_hint, layout.hint(top));
 
-    let (clipboard, save_file) = layout.checks();
-    batch = move_to(batch, controls.clipboard, clipboard);
-    batch = move_to(batch, controls.save_file, save_file);
+    let rects = layout.checks();
+    batch = move_to(batch, controls.clipboard, rects[0]);
+    batch = move_to(batch, controls.cursor, rects[1]);
+    batch = move_to(batch, controls.save_file, rects[2]);
 
     let (output_label, output_dir, browse) = layout.output();
     batch = move_to(batch, controls.output_label, output_label);
@@ -928,6 +943,7 @@ struct Held {
     output_dir: String,
     tray_click: String,
     clipboard: bool,
+    cursor: bool,
     save_file: bool,
 }
 
@@ -946,6 +962,7 @@ impl Held {
                 output_dir: String::new(),
                 tray_click: String::new(),
                 clipboard: false,
+                cursor: false,
                 save_file: false,
             };
         };
@@ -954,6 +971,7 @@ impl Held {
             output_dir: text_of(controls.output_dir),
             tray_click: text_of(controls.tray_click),
             clipboard: is_checked(controls.clipboard),
+            cursor: is_checked(controls.cursor),
             save_file: is_checked(controls.save_file),
         }
     }
@@ -973,6 +991,7 @@ impl Held {
             let _ = set_text(controls.tray_click, &self.tray_click);
         }
         set_checked(controls.clipboard, self.clipboard);
+        set_checked(controls.cursor, self.cursor);
         set_checked(controls.save_file, self.save_file);
     }
 }
@@ -1123,6 +1142,7 @@ fn load_values() {
             state.hotkey,
             state.current.output_dir.clone(),
             state.current.clipboard,
+            state.current.cursor,
             state.current.save_file,
             state.tray_left_click,
             state.controls.hotkey_field,
@@ -1131,6 +1151,7 @@ fn load_values() {
             state.controls.output_hint,
             state.controls.tray_click,
             state.controls.clipboard,
+            state.controls.cursor,
             state.controls.save_file,
         )
     }) else {
@@ -1140,6 +1161,7 @@ fn load_values() {
         hotkey,
         output_dir,
         clipboard_on,
+        cursor_on,
         save_on,
         tray_left_click,
         hotkey_field,
@@ -1148,6 +1170,7 @@ fn load_values() {
         output_hint_control,
         tray_control,
         clipboard_control,
+        cursor_control,
         save_control,
     ) = values;
 
@@ -1157,6 +1180,7 @@ fn load_values() {
     let _ = set_text(output_hint_control, OUTPUT_HINT);
     let _ = set_text(tray_control, &tray_click_text(tray_left_click));
     set_checked(clipboard_control, clipboard_on);
+    set_checked(cursor_control, cursor_on);
     set_checked(save_control, save_on);
 }
 
@@ -1340,6 +1364,7 @@ fn save() {
     updated.output_dir = output_dir;
     updated.tray_left_click = tray_left_click;
     updated.clipboard = with_state(|state| is_checked(state.controls.clipboard)).unwrap_or(false);
+    updated.cursor = with_state(|state| is_checked(state.controls.cursor)).unwrap_or(false);
     updated.save_file = with_state(|state| is_checked(state.controls.save_file)).unwrap_or(false);
 
     finish(Some(updated));

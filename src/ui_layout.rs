@@ -34,16 +34,19 @@ mod base {
     pub const HINT_GAP: i32 = 4;
     pub const HINT_HEIGHT: i32 = 30;
     pub const CHECK_HEIGHT: i32 = 22;
-    pub const CHECK_STEP: i32 = 26;
     pub const INSET: i32 = 12;
     pub const GROUP_GAP: i32 = 10;
     pub const AFTER_CAPTION: i32 = 24;
     pub const BUTTON_HEIGHT: i32 = 26;
     pub const BUTTON_GAP: i32 = 8;
+    /// How many check boxes share the destinations group. The group's height
+    /// follows from this rather than being added up by hand, so a fourth one
+    /// cannot be added without the room for it being added with it.
+    pub const CHECK_COUNT: i32 = 3;
     /// Room reserved below a group caption for the shortcut's hint, and for the
     /// folder's, which wraps onto a second line.
-    pub const SHORTCUT_TAIL: i32 = 32;
-    pub const FILE_TAIL: i32 = 32;
+    pub const SHORTCUT_TAIL: i32 = 28;
+    pub const FILE_TAIL: i32 = 28;
 }
 
 /// Convert a value in 96-DPI pixels to the given scale.
@@ -118,7 +121,6 @@ pub struct Layout {
     pub hint_gap: i32,
     pub hint_height: i32,
     pub check_height: i32,
-    pub check_step: i32,
     /// How far the contents of a group sit inside its frame.
     pub inset: i32,
     /// The gap between one group and the next.
@@ -178,7 +180,6 @@ impl Layout {
         let hint_gap = at(base::HINT_GAP);
         let hint_height = at(base::HINT_HEIGHT);
         let check_height = at(base::CHECK_HEIGHT);
-        let check_step = at(base::CHECK_STEP);
         let inset = at(base::INSET);
         let group_gap = at(base::GROUP_GAP);
         let after_caption = at(base::AFTER_CAPTION);
@@ -201,9 +202,13 @@ impl Layout {
         let shortcut_top = pad;
         let shortcut_height = after_caption + hint_top + at(base::SHORTCUT_TAIL);
 
-        // The two destination check boxes, each a full-width row.
+        // The two destination check boxes, each a full-width row. The group's
+        // height is the rows plus the gaps after them, so the last check box is
+        // never the one that falls outside the frame.
         let after_top = shortcut_top + shortcut_height + group_gap;
-        let after_height = after_caption + check_height + check_step + hint_gap;
+        let check_count = base::CHECK_COUNT;
+        let after_content = check_height * check_count + hint_gap * (check_count - 1);
+        let after_height = after_caption + after_content + hint_gap;
 
         // The output folder: the same label-and-field row, with the browse button
         // sharing the field's row and a wrapping hint below.
@@ -234,7 +239,6 @@ impl Layout {
             hint_gap,
             hint_height,
             check_height,
-            check_step,
             inset,
             group_gap,
             after_caption,
@@ -320,15 +324,18 @@ impl Layout {
         )
     }
 
-    /// The two destination check boxes, top first.
-    pub fn checks(&self) -> (Rect, Rect) {
+    /// The destination check boxes, top first.
+    ///
+    /// The list is as long as the group is tall: both come from the same count, so
+    /// a check box cannot be added without the row for it.
+    pub fn checks(&self) -> Vec<Rect> {
         let left = self.label_left;
         let width = self.inner_right() - left;
+        let step = self.check_height + self.hint_gap;
         let first = self.content_top(self.after_top);
-        (
-            (left, first, width, self.check_height),
-            (left, first + self.check_step, width, self.check_height),
-        )
+        (0..base::CHECK_COUNT)
+            .map(|row| (left, first + row * step, width, self.check_height))
+            .collect()
     }
 
     /// The tray click button and its hint.
@@ -493,7 +500,10 @@ mod tests {
                 "at {dpi} dpi the folder field runs into the browse button"
             );
 
-            for (left, _, width, _) in [l.checks().0, l.checks().1, l.tray().0, l.tray().1] {
+            let mut full_width = l.checks();
+            full_width.push(l.tray().0);
+            full_width.push(l.tray().1);
+            for (left, _, width, _) in full_width {
                 assert_eq!(
                     left, l.label_left,
                     "at {dpi} dpi a full-width control leaves the column"
@@ -530,7 +540,7 @@ mod tests {
             let l = layout(dpi);
             let (_, field, _) = l.output();
             assert_eq!(field.1, l.content_top(l.file_top));
-            assert_eq!(l.checks().0.1, l.content_top(l.after_top));
+            assert_eq!(l.checks()[0].1, l.content_top(l.after_top));
             assert_eq!(l.tray().0.1, l.content_top(l.tray_top));
             assert!(
                 l.after_caption > 0,

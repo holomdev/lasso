@@ -213,6 +213,8 @@ Write-Host 'edits before a scale change'
 # the window actually handed on.
 [Drive]::Type($window, 104, $folder)
 [Drive]::SetCheck($window, 102, $false)
+# The pointer check box starts off, so turning it on is a change this can see.
+[Drive]::SetCheck($window, 109, $true)
 [Drive]::SetCheck($window, 103, $true)
 
 if ($Dpi -gt 0) {
@@ -220,6 +222,7 @@ if ($Dpi -gt 0) {
     [Drive]::ChangeDpi($window, [uint32]$Dpi)
     [Drive]::Pump(600)
     Check 'clipboard survived the scale change' $false ([Drive]::GetCheck($window, 102))
+    Check 'the pointer survived the scale change' $true ([Drive]::GetCheck($window, 109))
     Check 'save-to-file survived the scale change' $true ([Drive]::GetCheck($window, 103))
 }
 
@@ -251,6 +254,7 @@ function ValueOf([string]$key) {
 
 Check 'output_dir saved' $folder (ValueOf 'output_dir')
 Check 'clipboard saved' 'no' (ValueOf 'clipboard')
+Check 'cursor saved' 'yes' (ValueOf 'cursor')
 Check 'save_file saved' 'yes' (ValueOf 'save_file')
 Check 'tray_left_click toggled' 'capture' (ValueOf 'tray_left_click')
 Check 'hotkey untouched' 'Ctrl+Shift+X' (ValueOf 'hotkey')

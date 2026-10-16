@@ -505,7 +505,11 @@ fn create_menu() -> Result<HMENU> {
 
 /// Capture the whole virtual desktop and publish it.
 fn capture_screen() -> Result<()> {
-    let frame = capture::capture_virtual_desktop(None)?;
+    let settings = with_state(|state| state.settings.clone()).unwrap_or_default();
+    let mut frame = capture::capture_virtual_desktop(None)?;
+    if settings.cursor {
+        capture::cursor::compose(&mut frame.bgra, frame.width, frame.height, frame.origin);
+    }
     publish(&frame, None)
 }
 
@@ -514,10 +518,19 @@ fn capture_screen() -> Result<()> {
 /// Cancelling the overlay is not a failure: nothing happens and the mode stays
 /// ready for the next request.
 fn select_region() -> Result<()> {
-    let frame = capture::capture_virtual_desktop(None)?;
+    let settings = with_state(|state| state.settings.clone()).unwrap_or_default();
+    // The overlay is given the capture without the pointer: it draws its own
+    // crosshair, and the magnifier has to show the pixels underneath, which is
+    // what placing an edge precisely depends on.
+    let mut frame = capture::capture_virtual_desktop(None)?;
     let Some(selection) = overlay::select_region(&frame)? else {
         return Ok(());
     };
+    // What is published is the pointer as it was when the capture was taken, not
+    // where it is now: by this point it is wherever the drag left it.
+    if settings.cursor {
+        capture::cursor::compose(&mut frame.bgra, frame.width, frame.height, frame.origin);
+    }
     publish(&frame, Some(selection))
 }
 

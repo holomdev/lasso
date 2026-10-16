@@ -130,3 +130,17 @@ Two things about that harness are worth knowing, because both cost time:
 3. **Nothing else is known to be wrong.** The window has not been looked at on a
    real second monitor at a different scale; the scale changes here are synthetic,
    which exercises the same code path but not the display switch itself.
+
+## Adding a control
+
+The destination group grew a third check box when the pointer became something a
+capture could include, and that is the shape of change this layout is built for:
+`base::CHECK_COUNT` went from two to three, and everything else followed. The
+group's height is computed from the count rather than added up by hand, and
+`Layout::checks` returns one rectangle per row, so a check box cannot be added
+without the room for it being added with it. The window grew by the row and the
+button row stayed where it belonged.
+
+The two group tails are what was reduced to pay for it — 32 base pixels to 28 —
+because at 100% the window was already as tall as a 1080-pixel screen with the
+taskbar on it. The hints still fit on one line at that width.
