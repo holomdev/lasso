@@ -29,13 +29,16 @@
 use std::cell::RefCell;
 
 use anyhow::{Context, Result};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
+use windows::Win32::Foundation::{
+    COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     CLIP_DEFAULT_PRECIS, COLOR_BTNFACE, CreateCompatibleDC, CreateFontW, DEFAULT_CHARSET,
-    DEFAULT_GUI_FONT, DEFAULT_PITCH, DEFAULT_QUALITY, DeleteDC, DeleteObject, FF_DONTCARE, GetObjectW,
-    GetStockObject, GetTextExtentPoint32W, HBRUSH, HGDIOBJ, InvalidateRect, LOGFONTW,
+    CreateSolidBrush, DEFAULT_GUI_FONT, DEFAULT_PITCH, DEFAULT_QUALITY, DeleteDC, DeleteObject,
+    FF_DONTCARE, GetObjectW, GetStockObject, GetSysColor, GetTextExtentPoint32W, HBRUSH, HDC, HGDIOBJ,
+    InvalidateRect, LOGFONTW,
     OUT_DEFAULT_PRECIS, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow,
-    SelectObject,
+    SelectObject, SetBkColor, SetBkMode, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
@@ -54,7 +57,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_SHOW, SW_SHOWNA, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
     SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE,
-    WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN, WM_NCDESTROY, WM_SETFONT, WM_SYSKEYDOWN,
+    WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN, WM_NCDESTROY, WM_SETFONT,
+    WM_SYSKEYDOWN,
     WNDCLASSW, WNDPROC, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_DLGMODALFRAME,
     WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
@@ -211,6 +215,17 @@ struct State {
     /// The font every control is drawn with, sized for the display the window is
     /// on. Owned here, so it is released exactly once.
     font: HGDIOBJ,
+    /// The brush the labels and the read-only fields are painted with.
+    ///
+    /// Both are `STATIC`-like controls: a static, and an edit that is read-only,
+    /// which Windows draws with the same message. Left alone they paint themselves
+    /// on `COLOR_WINDOW`, so they come out white while the window around them is
+    /// `COLOR_BTNFACE` grey, and a row of white boxes with grey gaps between them
+    /// reads as an unfinished window. Painting them in the window's own colour is
+    /// what makes the page one surface.
+    ///
+    /// Owned here, so it is released exactly once.
+    field_brush: HBRUSH,
     layout: Layout,
     /// The combination the field holds. Never `None` in practice: the window
     /// refuses to save without one, because the settings model requires it.
@@ -293,13 +308,20 @@ pub fn open(owner: HWND, current: &Settings, dpi: Option<u32>) -> Result<Option<
     let font = create_font(ui_layout::factor(dpi));
     let layout = layout_for(dpi, font);
 
+    // The brush the labels and the read-only fields are painted with. It is built
+    // from the same system colour the window class names as its background, so the
+    // page and the boxes on it are one surface. Built here rather than fetched as a
+    // stock object because the stock brushes are indexed by kind and there is no
+    // stock brush for a system colour.
+    let field_brush = unsafe { CreateSolidBrush(COLORREF(GetSysColor(COLOR_BTNFACE))) };
+
     // The size given to CreateWindowExW covers the whole window, caption and
     // frame included, while the layout is written in client coordinates. Turning
     // one into the other here is what keeps the bottom row of buttons inside the
     // window instead of below its edge.
     let frame = window_frame(layout);
 
-    let window = unsafe {
+    let created = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE_BITS,
             class,
@@ -314,8 +336,19 @@ pub fn open(owner: HWND, current: &Settings, dpi: Option<u32>) -> Result<Option<
             Some(instance),
             None,
         )
-    }
-    .context("could not create the settings window")?;
+    };
+    // No state was installed yet, so this is the one failure that has to release
+    // what was built for the window itself.
+    let window = match created {
+        Ok(window) => window,
+        Err(err) => {
+            unsafe {
+                let _ = DeleteObject(font);
+                let _ = DeleteObject(HGDIOBJ(field_brush.0));
+            }
+            return Err(err).context("could not create the settings window");
+        }
+    };
 
     // The state is installed before anything can go wrong, so a failure below can
     // always tear the window down through the same path.
@@ -326,6 +359,7 @@ pub fn open(owner: HWND, current: &Settings, dpi: Option<u32>) -> Result<Option<
             instance,
             controls: Controls::default(),
             font,
+            field_brush,
             layout,
             hotkey: Some(current.hotkey),
             tray_left_click: current.tray_left_click,
@@ -407,10 +441,16 @@ pub fn open(owner: HWND, current: &Settings, dpi: Option<u32>) -> Result<Option<
 /// window cannot leave a font behind, and a window that closed itself cannot
 /// leave `open` waiting on a message loop that will never end.
 fn abandon(window: HWND) {
-    let font = with_state(|state| state.font).unwrap_or_default();
+    let (font, field_brush) =
+        with_state(|state| (state.font, state.field_brush)).unwrap_or_default();
     if !font.is_invalid() {
         unsafe {
             let _ = DeleteObject(font);
+        }
+    }
+    if !field_brush.is_invalid() {
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(field_brush.0));
         }
     }
     if !window.is_invalid() {
@@ -1275,6 +1315,26 @@ unsafe extern "system" fn window_proc(
         }
 
         WM_NCDESTROY => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+
+        // A static control, and an edit control that is read-only, ask the parent
+        // what to paint themselves on. The answer is the window's own colour, so
+        // the labels sit on the page instead of on a slightly different one, and
+        // the hotkey field and the folder field are boxes drawn on it rather than
+        // white rectangles punched through it.
+        WM_CTLCOLORSTATIC => {
+            let brush = with_state(|state| state.field_brush).unwrap_or_default();
+            if brush.is_invalid() {
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            }
+            let dc = HDC(wparam.0 as *mut core::ffi::c_void);
+            unsafe {
+                // The text is drawn on the window's colour rather than in the box
+                // the control would otherwise clear behind it.
+                let _ = SetBkMode(dc, TRANSPARENT);
+                let _ = SetBkColor(dc, COLORREF(0));
+            }
+            LRESULT(brush.0 as isize)
+        }
 
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }

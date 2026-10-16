@@ -314,6 +314,21 @@ The window pumps a nested message loop and never posts `WM_QUIT`, because that
 would end the resident mode's loop as well. It reports completion through a flag
 instead.
 
+Each row's label is given the **same rectangle height and top as the field beside
+it**, rather than being sized to its own text and centred. Sizing it to the text
+cannot line the two up: when the two heights have different parity there is no
+whole pixel that centres one on the other, and the half pixel it is out by is
+visible on a row that is otherwise all straight lines. A static control centres
+its own text vertically, so the taller rectangle costs nothing.
+
+The labels and the read-only fields are painted in the window's own colour, which
+is what `WM_CTLCOLORSTATIC` is for. Left alone, a static and a read-only edit both
+paint themselves on `COLOR_WINDOW`, so they came out white while the window around
+them was `COLOR_BTNFACE` grey, and a page of white boxes with grey gaps between
+them reads as an unfinished window. The brush is created from the same system
+colour the window class names as its background, so the page and the boxes on it
+are one surface.
+
 A new shortcut is registered **before** the previous one is released, so a
 combination another program already owns leaves the old one working rather than
 leaving the mode with no shortcut at all.

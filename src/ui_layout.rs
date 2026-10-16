@@ -28,7 +28,6 @@ mod base {
     pub const LABEL_WIDTH: i32 = 96;
     pub const LABEL_GAP: i32 = 8;
     pub const LABEL_HEIGHT: i32 = 18;
-    pub const LABEL_DY: i32 = 4;
     pub const FIELD_HEIGHT: i32 = 24;
     pub const ROW: i32 = 24;
     pub const HINT_GAP: i32 = 4;
@@ -113,7 +112,6 @@ pub struct Layout {
     /// The gap between a right-aligned label and the field it belongs to.
     pub label_gap: i32,
     pub label_height: i32,
-    pub label_dy: i32,
     /// Height of a single-line edit.
     pub field_height: i32,
     pub row: i32,
@@ -174,7 +172,6 @@ impl Layout {
         let label_width = at(base::LABEL_WIDTH);
         let label_gap = at(base::LABEL_GAP);
         let label_height = at(base::LABEL_HEIGHT);
-        let label_dy = at(base::LABEL_DY);
         let field_height = at(base::FIELD_HEIGHT);
         let row = at(base::ROW);
         let hint_gap = at(base::HINT_GAP);
@@ -233,7 +230,6 @@ impl Layout {
             label_width,
             label_gap,
             label_height,
-            label_dy,
             field_height,
             row,
             hint_gap,
@@ -282,12 +278,20 @@ impl Layout {
     }
 
     /// The rectangle of a right-aligned label on the row whose top is `top`.
+    ///
+    /// The label is given the row's own height and the same top as the field, so
+    /// the two are level by construction. Sizing it to its text instead and then
+    /// centring it cannot be exact: when the two heights have different parity
+    /// there is no whole pixel that centres one on the other, and the half pixel it
+    /// is out by is visible on a row that is otherwise all straight lines. A static
+    /// control centres its own text vertically, so a taller rectangle costs nothing
+    /// and removes the question.
     pub fn label(&self, top: i32) -> Rect {
         (
             self.label_left,
-            top + self.label_dy,
+            top,
             self.label_width,
-            self.label_height,
+            self.field_height,
         )
     }
 
@@ -546,6 +550,22 @@ mod tests {
                 l.after_caption > 0,
                 "at {dpi} dpi the frame caption has no room of its own"
             );
+        }
+    }
+
+    #[test]
+    fn a_label_is_level_with_the_field_beside_it() {
+        for dpi in dpis() {
+            let l = layout(dpi);
+            for top in [l.content_top(l.shortcut_top), l.content_top(l.file_top)] {
+                let label = l.label(top);
+                let field = l.field(top, l.field_width);
+                assert_eq!(
+                    (label.1, label.3),
+                    (field.1, field.3),
+                    "at {dpi} dpi the label and its field are not the same row"
+                );
+            }
         }
     }
 
