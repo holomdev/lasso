@@ -326,13 +326,35 @@ whole pixel that centres one on the other, and the half pixel it is out by is
 visible on a row that is otherwise all straight lines. A static control centres
 its own text vertically, so the taller rectangle costs nothing.
 
-The labels and the read-only fields are painted in the window's own colour, which
-is what `WM_CTLCOLORSTATIC` is for. Left alone, a static and a read-only edit both
-paint themselves on `COLOR_WINDOW`, so they came out white while the window around
-them was `COLOR_BTNFACE` grey, and a page of white boxes with grey gaps between
-them reads as an unfinished window. The brush is created from the same system
-colour the window class names as its background, so the page and the boxes on it
-are one surface.
+The labels are handed **no brush at all**, and that is the fix rather than an
+omission. A static given a brush fills its whole rectangle, and a label's rectangle
+is wider than its text: the fill lands on whatever is under the parts the words do
+not cover, and the widest thing there is the frame's own border. Returning a null
+brush tells the control to leave its background alone, and the text then sits on
+the page. A field is different — a white box on a grey page is what says "type
+here" — so the two are told apart by their window class, which is the only thing
+`WM_CTLCOLORSTATIC` does not say and the only reliable way to separate a static
+from a read-only edit.
+
+### The manifest
+
+`lasso.manifest` is attached to the executable by `build.rs`, which runs the
+Windows SDK's resource compiler over it.
+
+Without it Windows hands the process the **version 5 common controls**, drawn in
+the classic style from before Windows XP, and scales the program itself. That is
+not only a matter of taste, and it is why the manifest is not optional: the classic
+group box fills the gap it makes for its own caption in `COLOR_WINDOW`, inside its
+own painting code, so the parent's answer to `WM_CTLCOLORSTATIC` cannot change it.
+Every group caption sat on a white patch on a grey page for as long as the
+executable had no manifest, and no amount of colour handling in the window could
+fix it. Version 6 draws the caption on the page's own colour.
+
+The DPI awareness is declared there as well, next to the call the program already
+makes before any window exists.
+
+A build with no resource compiler on the machine still succeeds and says so. The
+program runs; it just looks like Windows 2000 and lets the system scale it.
 
 A new shortcut is registered **before** the previous one is released, so a
 combination another program already owns leaves the old one working rather than

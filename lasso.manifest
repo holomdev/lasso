@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="lasso" version="0.1.0.0" processorArchitecture="*"/>
+
+  <!--
+    The common controls, version 6.
+
+    Without this, the loader gives the process the version 5 controls, and every
+    control in the settings window is drawn in the classic style from before
+    Windows XP. That is not only a matter of taste: the classic group box fills the
+    gap it makes for its own caption in `COLOR_WINDOW`, which is white, and it does
+    so inside its own painting code, so the parent's answer to `WM_CTLCOLORSTATIC`
+    cannot change it. The result is a white patch behind every group caption on a
+    grey page. Version 6 draws the caption on the page's own colour.
+  -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"/>
+    </dependentAssembly>
+  </dependency>
+
+  <!--
+    Per-monitor DPI awareness. The program also asks for this at startup, before
+    any window or device context exists, and that call is what actually decides it;
+    declaring it here means a future entry point that forgets to ask still gets the
+    right answer, instead of being scaled by the system and then scaled again.
+  -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+    </windowsSettings>
+  </application>
+</assembly>
