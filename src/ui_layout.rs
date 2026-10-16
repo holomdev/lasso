@@ -42,10 +42,6 @@ mod base {
     /// follows from this rather than being added up by hand, so a fourth one
     /// cannot be added without the room for it being added with it.
     pub const CHECK_COUNT: i32 = 3;
-    /// Room reserved below a group caption for the shortcut's hint, and for the
-    /// folder's, which wraps onto a second line.
-    pub const SHORTCUT_TAIL: i32 = 28;
-    pub const FILE_TAIL: i32 = 28;
 }
 
 /// Convert a value in 96-DPI pixels to the given scale.
@@ -193,28 +189,37 @@ impl Layout {
         let field_left = label_left + label_width + label_gap;
         let field_width = frame_right - inset - field_left;
 
-        let hint_top = field_height + hint_gap;
+        // Every group is as tall as its own contents plus the frame's bottom edge.
+        //
+        // A group's height being *guessed* rather than derived is what put the
+        // shortcut's hint across the bottom of its own frame: the guess was two
+        // pixels short of the field, the gap and the hint it had to hold, and a
+        // static paints its background across its whole rectangle whatever is
+        // under it, so the overflow was visible as a white band over the frame.
+        // Each height below is its last control's bottom edge plus the edge
+        // allowance, and none of them is a constant that can drift.
+        let group_bottom = inset;
 
         // The shortcut group: a label and a field on one row, its hint below.
         let shortcut_top = pad;
-        let shortcut_height = after_caption + hint_top + at(base::SHORTCUT_TAIL);
+        let shortcut_height = after_caption + field_height + hint_gap + hint_height + group_bottom;
 
-        // The two destination check boxes, each a full-width row. The group's
-        // height is the rows plus the gaps after them, so the last check box is
-        // never the one that falls outside the frame.
+        // The destination check boxes, each a full-width row. The group's height
+        // is the rows plus the gaps after them, so the last check box is never the
+        // one that falls outside the frame.
         let after_top = shortcut_top + shortcut_height + group_gap;
         let check_count = base::CHECK_COUNT;
         let after_content = check_height * check_count + hint_gap * (check_count - 1);
-        let after_height = after_caption + after_content + hint_gap;
+        let after_height = after_caption + after_content + group_bottom;
 
         // The output folder: the same label-and-field row, with the browse button
         // sharing the field's row and a wrapping hint below.
         let file_top = after_top + after_height + group_gap;
-        let file_height = after_caption + hint_top + at(base::FILE_TAIL);
+        let file_height = after_caption + field_height + hint_gap + hint_height + group_bottom;
 
         // The tray group: one full-width button and its hint.
         let tray_top = file_top + file_height + group_gap;
-        let tray_height = after_caption + row + hint_gap + label_height;
+        let tray_height = after_caption + field_height + hint_gap + hint_height + group_bottom;
 
         let button_y = tray_top + tray_height + pad;
         let client_height = button_y + button_height + pad;
@@ -259,6 +264,29 @@ impl Layout {
             button_y,
             save_x,
             cancel_x,
+        }
+    }
+
+    /// The bottom edge of the lowest control in a group, by the group's name.
+    ///
+    /// This is what a group's height has to clear, and stating it here rather than
+    /// adding up the same numbers a second time is what makes the test a check on
+    /// the layout instead of a copy of it.
+    #[cfg(test)]
+    pub fn last_control_bottom(&self, group_top: i32, name: &str) -> i32 {
+        let content = self.content_top(group_top);
+        match name {
+            // The hint below the label and field row.
+            "shortcut" | "file" => self.hint(content).1 + self.hint_height,
+            // The last check box.
+            "after" => {
+                let checks = self.checks();
+                let last = checks.last().copied().unwrap_or_default();
+                last.1 + last.3
+            }
+            // The hint below the tray button.
+            "tray" => self.tray().1.1 + self.hint_height,
+            _ => content,
         }
     }
 
@@ -550,6 +578,39 @@ mod tests {
                 l.after_caption > 0,
                 "at {dpi} dpi the frame caption has no room of its own"
             );
+        }
+    }
+
+    #[test]
+    fn every_group_is_taller_than_the_last_control_in_it() {
+        // A control that reaches past its frame draws over the frame's border, and
+        // a static does it across its whole rectangle. This is the check that was
+        // missing when the shortcut's hint sat on top of its frame's bottom edge:
+        // the group's height was a constant that had stopped matching the contents.
+        for dpi in dpis() {
+            let l = layout(dpi);
+            let groups = [
+                ("shortcut", l.shortcut_top, l.shortcut_height),
+                ("after", l.after_top, l.after_height),
+                ("file", l.file_top, l.file_height),
+                ("tray", l.tray_top, l.tray_height),
+            ];
+            for (name, top, height) in groups {
+                let bottom = top + height;
+                let last = l.last_control_bottom(top, name);
+                assert!(
+                    last < bottom,
+                    "at {dpi} dpi the {name} group ends at {bottom} but its last \
+                     control ends at {last}"
+                );
+                // And the frame has to have an edge below that, not zero room.
+                assert!(
+                    bottom - last >= l.inset,
+                    "at {dpi} dpi the {name} group leaves {} px below its last \
+                     control, less than the frame's own edge",
+                    bottom - last
+                );
+            }
         }
     }
 

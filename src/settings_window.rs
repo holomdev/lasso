@@ -40,7 +40,7 @@ use windows::Win32::Graphics::Gdi::{
     RDW_UPDATENOW, RedrawWindow, SelectObject,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
+use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetKeyState, SetFocus, VK_CONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU,
     VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
@@ -50,9 +50,10 @@ use windows::Win32::UI::Shell::{
     SHGetPathFromIDListW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, BeginDeferWindowPos, CallWindowProcW, CreateWindowExW, DefWindowProcW,
+    BeginDeferWindowPos, CallWindowProcW, CreateWindowExW, DefWindowProcW,
     DeferWindowPos, DestroyWindow, DispatchMessageW, EndDeferWindowPos, GWLP_WNDPROC, GetMessageW,
-    GetClassNameW, GetSystemMetrics, GetWindowRect, GetWindowTextW, HDWP, HMENU, HWND_TOP, IsDialogMessageW, MSG,
+    GetClassNameW, GetClientRect, GetSystemMetrics, GetWindowRect, GetWindowTextW, HDWP, HMENU,
+    HWND_TOP, IsDialogMessageW, MSG,
     RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_SHOW, SW_SHOWNA, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
     SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE,
@@ -370,6 +371,19 @@ pub fn open(owner: HWND, current: &Settings, dpi: Option<u32>) -> Result<Option<
         abandon(window);
         return Err(err);
     }
+
+    // The window is measured and corrected, rather than trusted to match what it
+    // was asked for. The frame around a client area is not this program's to
+    // compute: `AdjustWindowRectExForDpi` returns a window size whose client area
+    // is a few pixels off at some scales, in one direction or the other, and every
+    // control in the layout is placed against a client width that then does not
+    // exist. The visible result is a control sized to the layout's last column
+    // reaching past the frame it is supposed to sit inside.
+    //
+    // Taking the difference from the window itself settles it whatever the frame
+    // is made of, and at 100% the difference is nothing, so this costs one call.
+    match_exact_client(window);
+
     // The layout was built before the window existed, from the DPI the system
     // reported. Asking the window itself settles any difference - the display it
     // actually opened on may not be the one the process default describes - before
@@ -395,6 +409,7 @@ pub fn open(owner: HWND, current: &Settings, dpi: Option<u32>) -> Result<Option<
     // From here on a scale change has to replace the controls rather than move
     // them, so the window has something of its own on screen to keep in step.
     with_state(|state| state.visible = true);
+    trace_layout();
 
     // A nested loop rather than a modal dialog box: the resident mode already runs
     // an ordinary message pump and this runs inside it. `WM_QUIT` is deliberately
@@ -512,6 +527,15 @@ fn measure_text(font: HGDIOBJ, text: &str, factor: f64) -> i32 {
 }
 
 /// The window size that gives the layout its client area.
+///
+/// The frame has to be asked for at the **display's own scale**, not at the
+/// process default's. `AdjustWindowRectEx` is scale-dependent and reads the
+/// thread's awareness: the process is per-monitor aware, so it works in physical
+/// pixels, while the client size it is handed here has already been scaled by the
+/// layout. Asking the scale-free version therefore scales the frame a second time
+/// and returns a window whose client area is a few pixels short of the one the
+/// layout was built for — which is invisible until something sized to the
+/// layout's width reaches past the frame it is supposed to sit inside.
 fn window_frame(layout: Layout) -> RECT {
     let mut frame = RECT {
         left: 0,
@@ -520,7 +544,13 @@ fn window_frame(layout: Layout) -> RECT {
         bottom: layout.client_height,
     };
     unsafe {
-        let _ = AdjustWindowRectEx(&mut frame, window_style(), false, WINDOW_EX_STYLE_BITS);
+        let _ = AdjustWindowRectExForDpi(
+            &mut frame,
+            window_style(),
+            false,
+            WINDOW_EX_STYLE_BITS,
+            layout.dpi,
+        );
     }
     frame
 }
@@ -1379,6 +1409,135 @@ fn is_edit(control: HWND) -> bool {
         && (name[1] | 0x20) == u16::from(b'd')
         && (name[2] | 0x20) == u16::from(b'i')
         && (name[3] | 0x20) == u16::from(b't')
+}
+
+/// The window size that gives a client area of this size, given a frame this thick.
+///
+/// The frame is measured from the window rather than computed: the two dimensions
+/// are independent, and this is only the arithmetic of adding one to the other.
+fn window_size_for_client(
+    client_width: i32,
+    client_height: i32,
+    frame_width: i32,
+    frame_height: i32,
+) -> (i32, i32) {
+    (client_width + frame_width, client_height + frame_height)
+}
+
+/// Resize the window so its client area is exactly what the layout was built for.
+///
+/// The layout is written in client coordinates and every control in it is placed
+/// against the client width it declares. If the window's real client area is a few
+/// pixels narrower, the last column of every row overflows the frame; if it is
+/// wider, the rows stop short of it. Either way the fix is the same and it is not
+/// to guess at the frame: ask the window what it has, take the difference, and give
+/// it back.
+fn match_exact_client(window: HWND) {
+    let Some(layout) = with_state(|state| state.layout) else {
+        return;
+    };
+    let mut outer = RECT::default();
+    let mut client = RECT::default();
+    unsafe {
+        if GetWindowRect(window, &mut outer).is_err() || GetClientRect(window, &mut client).is_err() {
+            return;
+        }
+    }
+    let frame_width = (outer.right - outer.left) - (client.right - client.left);
+    let frame_height = (outer.bottom - outer.top) - (client.bottom - client.top);
+    let (wanted_width, wanted_height) =
+        window_size_for_client(layout.client_width, layout.client_height, frame_width, frame_height);
+    let current_width = outer.right - outer.left;
+    let current_height = outer.bottom - outer.top;
+    if wanted_width == current_width && wanted_height == current_height {
+        return;
+    }
+    unsafe {
+        let _ = SetWindowPos(
+            window,
+            None,
+            0,
+            0,
+            wanted_width,
+            wanted_height,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// Report every control's real rectangle and text, on request.
+///
+/// The layout's arithmetic is checked by tests, but what Windows actually placed
+/// is a separate question, and the difference between the two is what a capture
+/// shows. Set `LASSO_TRACE_LAYOUT` to have the window print both.
+fn trace_layout() {
+    if std::env::var_os("LASSO_TRACE_LAYOUT").is_none() {
+        return;
+    }
+    let Some((window, controls, layout)) =
+        with_state(|state| (state.window, state.controls, state.layout))
+    else {
+        return;
+    };
+    for control in controls.in_order() {
+        if control.is_invalid() {
+            continue;
+        }
+        let mut buf = [0u16; 64];
+        let n = unsafe { GetClassNameW(control, &mut buf) };
+        let class = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
+        let mut rect = RECT::default();
+        if unsafe { GetWindowRect(control, &mut rect) }.is_err() {
+            continue;
+        }
+        let mut origin = Default::default();
+        if unsafe { GetWindowRect(window, &mut origin) }.is_err() {
+            continue;
+        }
+        let mut text = [0u16; 80];
+        let len = unsafe { GetWindowTextW(control, &mut text) };
+        let text = String::from_utf16_lossy(&text[..len.max(0) as usize]);
+        eprintln!(
+            "[layout] {class:8} client ({:4},{:4}) {:4}x{:4}  {text:?}",
+            rect.left - origin.left,
+            rect.top - origin.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+        );
+    }
+    // What the layout asked for against what the window actually has. The two
+    // matching is the property that keeps the last column of a row inside its
+    // frame, so it is worth printing when asked.
+    let mut client = RECT::default();
+    let mut outer = RECT::default();
+    if unsafe { GetClientRect(window, &mut client) }.is_ok()
+        && unsafe { GetWindowRect(window, &mut outer) }.is_ok()
+    {
+        eprintln!(
+            "[layout] dpi {} window {}x{} client {}x{} | the layout was built for {}x{}",
+            layout.dpi,
+            outer.right - outer.left,
+            outer.bottom - outer.top,
+            client.right - client.left,
+            client.bottom - client.top,
+            layout.client_width,
+            layout.client_height,
+        );
+    }
+    eprintln!(
+        "[layout] page: client_width {} pad {} frame {}..{} inset {} label_left {} \
+         label_right {} field_left {} inner_right {} field_width {}",
+        layout.client_width,
+        layout.pad,
+        layout.frame_left,
+        layout.frame_right,
+        layout.inset,
+        layout.label_left,
+        layout.label_left + layout.label_width,
+        layout.field_left,
+        layout.inner_right(),
+        layout.field_width,
+    );
 }
 
 /// Ask for a folder and put it in the field.
