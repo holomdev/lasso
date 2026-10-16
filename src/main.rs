@@ -16,8 +16,9 @@ mod overlay;
 mod settings;
 mod settings_window;
 mod tray;
+mod ui_layout;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use capture::Backend;
 use std::path::Path;
 use std::time::Instant;
@@ -38,6 +39,7 @@ fn usage() {
          USAGE:\n  \
          lasso [tray] [--hotkey COMBO]\n  \
          lasso settings      open the settings window on its own\n  \
+         lasso settings --dpi N   the same window laid out for a display of that scale\n  \
          lasso about         show the version and license\n  \
          lasso monitors\n  \
          lasso capture [--out FILE.png] [--backend dxgi|gdi] [--clipboard]\n  \
@@ -86,7 +88,7 @@ fn main() -> Result<()> {
             }
             tray::run(hotkey)
         }
-        "settings" => cmd_settings(),
+        "settings" => cmd_settings(&args[1..]),
         "about" => {
             // The dialog is the feedback, so the console does not need to show.
             tray::hide_console_if_owned();
@@ -166,14 +168,40 @@ fn ensure_parent(path: &str) -> Result<()> {
 /// The tray menu is the usual way in, but it should not be the only one: a
 /// machine whose notification area is unavailable still has to be configurable,
 /// and this is also what a shortcut or a script would call.
-fn cmd_settings() -> Result<()> {
+///
+/// `--dpi N` builds the layout for a display of that scale instead of the one in
+/// use. The window is per-monitor DPI aware, so its size follows the display; on a
+/// single-monitor machine there is otherwise no way to see what it looks like at
+/// 150%, and a layout that is only ever checked at 100% is a layout that is only
+/// known to work at 100%.
+fn cmd_settings(args: &[String]) -> Result<()> {
     // The window is the feedback, so the console does not need to be on screen.
     tray::hide_console_if_owned();
+
+    let mut dpi = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dpi" => {
+                i += 1;
+                let value = args.get(i).context("--dpi needs a value")?;
+                let value: u32 = value
+                    .parse()
+                    .with_context(|| format!("--dpi wants a number, not {value}"))?;
+                if value == 0 {
+                    bail!("--dpi wants a scale above zero");
+                }
+                dpi = Some(value);
+            }
+            other => bail!("unknown argument: {other}"),
+        }
+        i += 1;
+    }
 
     let current = settings::Settings::load();
 
     // No owner window, because there is no tray window to be modal to here.
-    match settings_window::open(HWND::default(), &current)? {
+    match settings_window::open(HWND::default(), &current, dpi)? {
         Some(updated) => {
             updated.save().context("could not save the settings")?;
             match settings::path() {
@@ -259,12 +287,7 @@ fn cmd_select(out: &str, copy: bool) -> Result<()> {
         return Ok(());
     };
 
-    let bounds = (
-        selection.x,
-        selection.y,
-        selection.width,
-        selection.height,
-    );
+    let bounds = (selection.x, selection.y, selection.width, selection.height);
 
     if copy {
         let region = frame
@@ -287,7 +310,10 @@ fn cmd_select(out: &str, copy: bool) -> Result<()> {
         "region  : {}x{} at ({}, {})",
         selection.width, selection.height, selection.x, selection.y
     );
-    println!("elapsed : {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
+    println!(
+        "elapsed : {:.1} ms",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
     println!("file    : {out}");
     Ok(())
 }

@@ -4,7 +4,7 @@
 //! is disabled while it is up and a nested message loop runs until Save or
 //! Cancel, so the caller receives the new settings or nothing at all.
 //!
-//! Two decisions keep this small.
+//! Four decisions keep this small.
 //!
 //! The controls are created in plain code after the window exists, not in
 //! `WM_CREATE`. `WM_CREATE` runs inside `CreateWindowExW`, before `open` has had
@@ -17,6 +17,11 @@
 //! it the smallest thing that can capture a combination; a control painted from
 //! scratch would be a lot of code for a field that shows one line.
 //!
+//! Every coordinate comes from `ui_layout::Layout`, and the window is built again
+//! whenever the display it sits on changes scale. The process is per-monitor DPI
+//! aware, so Windows does not scale this window: without that it would be drawn at
+//! its 96-DPI size on a 150% display, too small for its own contents.
+//!
 //! Nothing here writes anything. It hands the edited settings back and the
 //! resident mode decides what to do with them, which keeps saving the file and
 //! re-registering the hotkey in one place.
@@ -24,37 +29,49 @@
 use std::cell::RefCell;
 
 use anyhow::{Context, Result};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{DEFAULT_GUI_FONT, GetStockObject};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    CLIP_DEFAULT_PRECIS, COLOR_BTNFACE, CreateCompatibleDC, CreateFontW, DEFAULT_CHARSET,
+    DEFAULT_GUI_FONT, DEFAULT_PITCH, DEFAULT_QUALITY, DeleteDC, DeleteObject, FF_DONTCARE, GetObjectW,
+    GetStockObject, GetTextExtentPoint32W, HBRUSH, HGDIOBJ, InvalidateRect, LOGFONTW,
+    OUT_DEFAULT_PRECIS, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow,
+    SelectObject,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, GetKeyState, SetFocus, VK_CONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_RCONTROL,
-    VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_MENU,
+    EnableWindow, GetKeyState, SetFocus, VK_CONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU,
+    VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::Shell::{
     BIF_EDITBOX, BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS, BROWSEINFOW, ILFree, SHBrowseForFolderW,
     SHGetPathFromIDListW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_WNDPROC,
-    GetMessageW, GetSystemMetrics, GetWindowRect, GetWindowTextW, HMENU, HWND_TOP, MSG,
-    RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SWP_NOZORDER, SW_SHOW, SendMessageW,
-    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
-    TranslateMessage, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_KEYDOWN, WM_NCDESTROY, WM_SETFONT,
-    WM_SYSKEYDOWN, WNDCLASSW, WNDPROC, WS_CAPTION, WS_CHILD, WS_EX_DLGMODALFRAME, WS_OVERLAPPED,
-    WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WINDOW_STYLE,
+    AdjustWindowRectEx, BeginDeferWindowPos, CallWindowProcW, CreateWindowExW, DefWindowProcW,
+    DeferWindowPos, DestroyWindow, DispatchMessageW, EndDeferWindowPos, GWLP_WNDPROC, GetMessageW,
+    GetSystemMetrics, GetWindowRect, GetWindowTextW, HDWP, HMENU, HWND_TOP, IsDialogMessageW, MSG,
+    RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_SHOW, SW_SHOWNA, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+    SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE,
+    WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN, WM_NCDESTROY, WM_SETFONT, WM_SYSKEYDOWN,
+    WNDCLASSW, WNDPROC, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_DLGMODALFRAME,
+    WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
 use crate::hotkey::{Hotkey, Modifiers};
 use crate::settings::{Settings, TrayClick};
+use crate::ui_layout::{self, Layout, Rect};
 
 /// Control styles and messages whose values come from the Win32 headers.
 ///
 /// They are spelled out because the crate models several of them as newtypes over
 /// the same integers while `CreateWindowExW` wants plain style bits, and mixing
-/// the two is noise for six constants. Every value is the one the headers define.
+/// the two is noise for a handful of constants. Every value is the one the
+/// headers define.
 const BS_AUTOCHECKBOX: u32 = 0x0000_0003;
+const BS_GROUPBOX: u32 = 0x0000_0007;
 const BS_PUSHBUTTON: u32 = 0x0000_0000;
 const BS_DEFPUSHBUTTON: u32 = 0x0000_0001;
 const ES_AUTOHSCROLL: u32 = 0x0000_0080;
@@ -66,14 +83,44 @@ const BM_SETCHECK: u32 = 0x00F1;
 const BST_CHECKED: isize = 1;
 const BST_UNCHECKED: isize = 0;
 
-/// Layout, in client coordinates. A fixed size is honest here: the window holds a
-/// known set of controls and nothing in it reflows.
-const PAD: i32 = 16;
-const LABEL_WIDTH: i32 = 104;
-const FIELD_HEIGHT: i32 = 24;
-const CLIENT_WIDTH: i32 = 460;
-const CLIENT_HEIGHT: i32 = 336;
-const BUTTON_WIDTH: i32 = 92;
+/// The window has a caption and a close button, and is not resizable: its size
+/// follows from the layout, so there is nothing for a resize grip to do.
+///
+/// `WS_CLIPCHILDREN` keeps the window from painting over its own controls. A
+/// control is a window in its own right and draws itself, so a parent that paints
+/// the whole client area on every repaint would erase its controls and leave them
+/// to draw themselves again afterwards.
+const WINDOW_STYLE_BITS: u32 = WS_OVERLAPPED.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_CLIPCHILDREN.0;
+const WINDOW_EX_STYLE_BITS: WINDOW_EX_STYLE = WS_EX_DLGMODALFRAME;
+
+fn window_style() -> WINDOW_STYLE {
+    WINDOW_STYLE(WINDOW_STYLE_BITS)
+}
+
+/// What each group frame is called.
+///
+/// The frames are what tell the eye that the shortcut, the destinations and the
+/// tray icon are separate concerns. As one flat column of controls the window
+/// read as a list of unrelated lines.
+const GROUP_SHORTCUT: &str = "Shortcut";
+const GROUP_AFTER: &str = "After each capture";
+const GROUP_FILE: &str = "Saving to a file";
+const GROUP_TRAY: &str = "Tray icon";
+
+/// What the window says.
+const HOTKEY_HINT: &str = "Click the field and press a combination. A modifier is required.";
+const HOTKEY_NEEDS_MODIFIER: &str =
+    "Refused: without a modifier that key would be taken from every other program.";
+const OUTPUT_HINT: &str =
+    "Only used when saving to a file. Names carry the time the capture was taken.";
+const OUTPUT_NEEDS_FOLDER: &str = "Refused: choose an output folder before saving.";
+const TRAY_CLICK_HINT: &str = "The other mouse button always starts a selection.";
+
+/// The labels of the three buttons. The layout sizes a button from its own text,
+/// so these are the strings that decide how wide it is.
+const BROWSE_TEXT: &str = "Browse...";
+const SAVE_TEXT: &str = "Save";
+const CANCEL_TEXT: &str = "Cancel";
 
 /// Identifiers, so a message can say which control it came from.
 const ID_HOTKEY: i32 = 100;
@@ -91,26 +138,77 @@ const ID_TRAY_CLICK_HINT: i32 = 108;
 const ID_SAVE: i32 = 1;
 const ID_CANCEL: i32 = 2;
 
-/// What the window says.
-const HOTKEY_HINT: &str = "Click the field and press a combination. A modifier is required.";
-const HOTKEY_NEEDS_MODIFIER: &str =
-    "Refused: without a modifier that key would be taken from every other program.";
-const OUTPUT_HINT: &str =
-    "Only used when saving to a file. Names carry the time the capture was taken.";
-const OUTPUT_NEEDS_FOLDER: &str = "Refused: choose an output folder before saving.";
-const TRAY_CLICK_HINT: &str = "The other mouse button always starts a selection.";
+/// Every control the layout places.
+///
+/// They are held in one value so a DPI change can move them without rebuilding
+/// the window, and so `in_order` is the single place that knows the order they
+/// have to be created and restacked in.
+#[derive(Default, Clone, Copy)]
+struct Controls {
+    shortcut_group: HWND,
+    hotkey_label: HWND,
+    hotkey_field: HWND,
+    hotkey_hint: HWND,
+
+    after_group: HWND,
+    clipboard: HWND,
+    save_file: HWND,
+
+    file_group: HWND,
+    output_label: HWND,
+    output_dir: HWND,
+    browse: HWND,
+    output_hint: HWND,
+
+    tray_group: HWND,
+    tray_click: HWND,
+    tray_click_hint: HWND,
+
+    save: HWND,
+    cancel: HWND,
+}
+
+impl Controls {
+    /// Every control that exists, group frames first.
+    ///
+    /// The frames come first because a group box is painted as a frame with a gap
+    /// in it for its caption: a frame created after the controls it contains is
+    /// drawn over them, and its caption lands on top of the first row inside it.
+    fn in_order(&self) -> Vec<HWND> {
+        [
+            self.shortcut_group,
+            self.after_group,
+            self.file_group,
+            self.tray_group,
+            self.hotkey_label,
+            self.hotkey_field,
+            self.hotkey_hint,
+            self.clipboard,
+            self.save_file,
+            self.output_label,
+            self.output_dir,
+            self.browse,
+            self.output_hint,
+            self.tray_click,
+            self.tray_click_hint,
+            self.save,
+            self.cancel,
+        ]
+        .into_iter()
+        .filter(|handle| !handle.is_invalid())
+        .collect()
+    }
+}
 
 struct State {
     window: HWND,
     owner: HWND,
-    hotkey_field: HWND,
-    hotkey_hint: HWND,
-    clipboard: HWND,
-    save_file: HWND,
-    output_dir: HWND,
-    output_hint: HWND,
-    tray_click: HWND,
-    tray_click_hint: HWND,
+    instance: HINSTANCE,
+    controls: Controls,
+    /// The font every control is drawn with, sized for the display the window is
+    /// on. Owned here, so it is released exactly once.
+    font: HGDIOBJ,
+    layout: Layout,
     /// The combination the field holds. Never `None` in practice: the window
     /// refuses to save without one, because the settings model requires it.
     hotkey: Option<Hotkey>,
@@ -121,6 +219,10 @@ struct State {
     /// The edit's original window procedure, so every message this module does not
     /// handle still reaches it.
     previous_proc: isize,
+    /// Whether the window has been shown yet. A scale change before that only has
+    /// to move controls; afterwards it has to replace them, because the window is
+    /// already drawn and its old contents are on the screen.
+    visible: bool,
     done: bool,
     result: Option<Settings>,
 }
@@ -145,15 +247,32 @@ fn with_state<T>(f: impl FnOnce(&mut State) -> T) -> Option<T> {
 ///
 /// Returns the edited settings, or `None` when the window was cancelled or closed
 /// without saving.
-pub fn open(owner: HWND, current: &Settings) -> Result<Option<Settings>> {
-    let instance =
-        HINSTANCE(unsafe { GetModuleHandleW(None) }.context("GetModuleHandleW failed")?.0);
+///
+/// `dpi` overrides the scale the layout is built for. Only `lasso settings --dpi`
+/// passes one: the layout scales with the display it opens on, and the override is
+/// how a scale can be checked without a second monitor to check it on.
+pub fn open(owner: HWND, current: &Settings, dpi: Option<u32>) -> Result<Option<Settings>> {
+    let explicit = dpi;
+    let instance = HINSTANCE(
+        unsafe { GetModuleHandleW(None) }
+            .context("GetModuleHandleW failed")?
+            .0,
+    );
 
     let class = w!("LassoSettings");
     let wc = WNDCLASSW {
         lpfnWndProc: Some(window_proc),
         hInstance: instance,
         lpszClassName: class,
+        // The window has no background of its own to draw, so Windows erases it
+        // with the button face its controls are drawn on.
+        //
+        // This is not decoration. With no brush there is nothing to erase with, so
+        // a window that grows keeps whatever was on the screen in the area it grew
+        // into, and every control that moves leaves its old contents behind on a
+        // background that was never repainted. Both are invisible at the size the
+        // window opens at and unmissable after a change of display scale.
+        hbrBackground: HBRUSH((COLOR_BTNFACE.0 as usize + 1) as *mut _),
         ..Default::default()
     };
     // A zero return also means this process already registered the class, which is
@@ -162,31 +281,27 @@ pub fn open(owner: HWND, current: &Settings) -> Result<Option<Settings>> {
         let _ = RegisterClassW(&wc);
     }
 
-    let style = WINDOW_STYLE(WS_OVERLAPPED.0 | WS_CAPTION.0 | WS_SYSMENU.0);
-    let ex_style = WS_EX_DLGMODALFRAME;
+    // There is no window yet, so the display the window will open on is the one
+    // the system reports for the process. `lasso settings` runs without a tray
+    // window, so the owner is not a window to ask either.
+    let dpi = dpi.unwrap_or_else(|| unsafe { GetDpiForSystem() });
+    // The font comes first because the buttons are measured from it: the layout
+    // cannot be built without knowing how wide its own labels are.
+    let font = create_font(ui_layout::factor(dpi));
+    let layout = layout_for(dpi, font);
 
     // The size given to CreateWindowExW covers the whole window, caption and
     // frame included, while the layout is written in client coordinates. Turning
     // one into the other here is what keeps the bottom row of buttons inside the
     // window instead of below its edge.
-    let mut frame = RECT {
-        left: 0,
-        top: 0,
-        right: CLIENT_WIDTH,
-        bottom: CLIENT_HEIGHT,
-    };
-    unsafe {
-        let _ = windows::Win32::UI::WindowsAndMessaging::AdjustWindowRectEx(
-            &mut frame, style, false, ex_style,
-        );
-    }
+    let frame = window_frame(layout);
 
     let window = unsafe {
         CreateWindowExW(
-            ex_style,
+            WINDOW_EX_STYLE_BITS,
             class,
             w!("lasso settings"),
-            style,
+            window_style(),
             0,
             0,
             frame.right - frame.left,
@@ -205,27 +320,34 @@ pub fn open(owner: HWND, current: &Settings) -> Result<Option<Settings>> {
         *slot.borrow_mut() = Some(State {
             window,
             owner,
-            hotkey_field: HWND::default(),
-            hotkey_hint: HWND::default(),
-            clipboard: HWND::default(),
-            save_file: HWND::default(),
-            output_dir: HWND::default(),
-            output_hint: HWND::default(),
-            tray_click: HWND::default(),
-            tray_click_hint: HWND::default(),
+            instance,
+            controls: Controls::default(),
+            font,
+            layout,
             hotkey: Some(current.hotkey),
             tray_left_click: current.tray_left_click,
             current: current.clone(),
             previous_proc: 0,
+            visible: false,
             done: false,
             result: None,
         });
     });
 
-    if let Err(err) = build_controls(window, instance) {
-        unsafe { let _ = DestroyWindow(window); }
-        STATE.with(|slot| *slot.borrow_mut() = None);
+    if let Err(err) = build_controls() {
+        abandon(window);
         return Err(err);
+    }
+    // The layout was built before the window existed, from the DPI the system
+    // reported. Asking the window itself settles any difference - the display it
+    // actually opened on may not be the one the process default describes - before
+    // anything is drawn at the wrong size. An explicit scale is left alone, since
+    // the point of asking for one is to see the layout built at it.
+    if explicit.is_none() {
+        let open_dpi = unsafe { GetDpiForWindow(window) };
+        if open_dpi != dpi {
+            rescale(open_dpi);
+        }
     }
     load_values();
 
@@ -234,10 +356,13 @@ pub fn open(owner: HWND, current: &Settings) -> Result<Option<Settings>> {
         let _ = EnableWindow(owner, false);
         let _ = ShowWindow(window, SW_SHOW);
         let _ = SetForegroundWindow(window);
-        if let Some(field) = with_state(|state| state.hotkey_field) {
+        if let Some(field) = with_state(|state| state.controls.hotkey_field) {
             let _ = SetFocus(Some(field));
         }
     }
+    // From here on a scale change has to replace the controls rather than move
+    // them, so the window has something of its own on screen to keep in step.
+    with_state(|state| state.visible = true);
 
     // A nested loop rather than a modal dialog box: the resident mode already runs
     // an ordinary message pump and this runs inside it. `WM_QUIT` is deliberately
@@ -249,10 +374,7 @@ pub fn open(owner: HWND, current: &Settings) -> Result<Option<Settings>> {
         // close all come from here: a plain window has none of them by itself,
         // and a settings window without them feels wrong to anyone who reaches
         // for the keyboard.
-        let handled = unsafe {
-            windows::Win32::UI::WindowsAndMessaging::IsDialogMessageW(window, &message)
-        }
-        .as_bool();
+        let handled = unsafe { IsDialogMessageW(window, &message) }.as_bool();
         if !handled {
             unsafe {
                 let _ = TranslateMessage(&message);
@@ -266,7 +388,7 @@ pub fn open(owner: HWND, current: &Settings) -> Result<Option<Settings>> {
 
     let result = with_state(|state| state.result.take()).flatten();
     let owner = with_state(|state| state.owner).unwrap_or_default();
-    STATE.with(|slot| *slot.borrow_mut() = None);
+    abandon(window);
 
     if !owner.is_invalid() {
         unsafe {
@@ -276,21 +398,209 @@ pub fn open(owner: HWND, current: &Settings) -> Result<Option<Settings>> {
     Ok(result)
 }
 
-/// Create every control.
-fn build_controls(window: HWND, instance: HINSTANCE) -> Result<()> {
-    let field_width = CLIENT_WIDTH - PAD * 2 - LABEL_WIDTH;
+/// Shut the window down and forget the state.
+///
+/// Every path out of `open` goes through here, so a failure while building the
+/// window cannot leave a font behind, and a window that closed itself cannot
+/// leave `open` waiting on a message loop that will never end.
+fn abandon(window: HWND) {
+    let font = with_state(|state| state.font).unwrap_or_default();
+    if !font.is_invalid() {
+        unsafe {
+            let _ = DeleteObject(font);
+        }
+    }
+    if !window.is_invalid() {
+        unsafe {
+            let _ = DestroyWindow(window);
+        }
+    }
+    STATE.with(|slot| *slot.borrow_mut() = None);
+}
 
-    // Right-aligned and a little shorter than the column, so the label reads as
-    // belonging to the field beside it and leaves a gap before it. A left-aligned
-    // column of labels leaves the eye no edge to run down.
-    let hotkey_label = child(window, w!("STATIC"), "Hotkey", SS_RIGHT, -1, (PAD, PAD + 4, LABEL_WIDTH - 10, 18), instance)?;
+/// The layout for a display, with its buttons measured from the font.
+fn layout_for(dpi: u32, font: HGDIOBJ) -> Layout {
+    let factor = ui_layout::factor(dpi);
+    // Each button is as wide as the widest of the labels it carries, so a
+    // translation cannot be clipped. The pair on the right shares one width, which
+    // is what makes them a pair rather than two buttons that happen to be near
+    // each other.
+    let browse = ui_layout::button_width(measure_text(font, BROWSE_TEXT, factor), factor);
+    let pair = SAVE_TEXT.chars().count().max(CANCEL_TEXT.chars().count()) as i32 * 6;
+    Layout::new(dpi, browse, ui_layout::button_width(pair, factor))
+}
+
+/// How wide a string is in a font, in 96-DPI pixels.
+///
+/// The font is created per display, so it is measured at the scale in use and the
+/// result is brought back to the units `Layout` works in. Measuring at the base
+/// scale instead would mean creating a second font to measure with.
+///
+/// A memory device context is enough to ask a font for its metrics: nothing is
+/// drawn, and the context is released before returning.
+fn measure_text(font: HGDIOBJ, text: &str, factor: f64) -> i32 {
+    // A per-character estimate is what answers when there is no font to measure:
+    // buttons that are roughly right beat buttons collapsed to nothing.
+    let estimate = || (6 * text.chars().count() as i32).max(1);
+    if font.is_invalid() {
+        return estimate();
+    }
+
+    let mut size = SIZE::default();
+    let measured = unsafe {
+        let context = CreateCompatibleDC(None);
+        if context.is_invalid() {
+            return estimate();
+        }
+        let previous = SelectObject(context, font);
+        let text = wide(text);
+        // The terminator is not part of a text extent, so the slice stops short
+        // of it.
+        let width = GetTextExtentPoint32W(context, &text[..text.len() - 1], &mut size);
+        SelectObject(context, previous);
+        let _ = DeleteDC(context);
+        width.as_bool()
+    };
+
+    if !measured || size.cx <= 0 {
+        return estimate();
+    }
+    // `scale` is the inverse of itself for a positive factor, which is what makes
+    // this the way back to base units.
+    ui_layout::scale(size.cx, 1.0 / factor).max(1)
+}
+
+/// The window size that gives the layout its client area.
+fn window_frame(layout: Layout) -> RECT {
+    let mut frame = RECT {
+        left: 0,
+        top: 0,
+        right: layout.client_width,
+        bottom: layout.client_height,
+    };
+    unsafe {
+        let _ = AdjustWindowRectEx(&mut frame, window_style(), false, WINDOW_EX_STYLE_BITS);
+    }
+    frame
+}
+
+/// The description of a font, in the same shape `CreateFontW` takes.
+fn font_metrics(font: HGDIOBJ) -> Option<LOGFONTW> {
+    if font.is_invalid() {
+        return None;
+    }
+    let mut info = LOGFONTW::default();
+    let measured = unsafe {
+        GetObjectW(
+            font,
+            std::mem::size_of::<LOGFONTW>() as i32,
+            Some(&mut info as *mut _ as *mut _),
+        )
+    };
+    if measured <= 0 || info.lfHeight == 0 {
+        return None;
+    }
+    Some(info)
+}
+
+/// Create the font for the current display.
+///
+/// The stock GUI font is one shared object drawn at 96 DPI, so it does not follow
+/// a window to a denser display. A private font built from its face name does,
+/// and that is what keeps the text the same size relative to the controls as the
+/// controls are to each other.
+fn create_font(factor: f64) -> HGDIOBJ {
+    let stock = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
+    let Some(info) = font_metrics(stock) else {
+        // Nothing to copy. Keeping the stock font leaves the window readable,
+        // which is better than refusing to open it.
+        return stock;
+    };
+
+    // The negative height asks for a character height rather than a cell height,
+    // which is what the value measured from the stock font already is.
+    let height = ui_layout::scale(info.lfHeight.abs(), factor).max(1);
+    let font = unsafe {
+        CreateFontW(
+            -height,
+            0,
+            0,
+            0,
+            info.lfWeight,
+            u32::from(info.lfItalic),
+            u32::from(info.lfUnderline),
+            u32::from(info.lfStrikeOut),
+            if info.lfCharSet.0 == 0 {
+                DEFAULT_CHARSET
+            } else {
+                info.lfCharSet
+            },
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            DEFAULT_QUALITY,
+            u32::from(DEFAULT_PITCH.0) | u32::from(FF_DONTCARE.0),
+            PCWSTR::from_raw(info.lfFaceName.as_ptr()),
+        )
+    };
+    if font.is_invalid() {
+        stock
+    } else {
+        HGDIOBJ(font.0)
+    }
+}
+
+/// Create every control for the current layout.
+fn build_controls() -> Result<()> {
+    let Some((window, instance, layout)) =
+        with_state(|state| (state.window, state.instance, state.layout))
+    else {
+        return Ok(());
+    };
+
+    // The frames first: a group box is a frame with a gap for its caption, and one
+    // created after the controls inside it is painted over them.
+    let shortcut_group = group(
+        window,
+        GROUP_SHORTCUT,
+        layout.group(layout.shortcut_top, layout.shortcut_height),
+        instance,
+    )?;
+    let after_group = group(
+        window,
+        GROUP_AFTER,
+        layout.group(layout.after_top, layout.after_height),
+        instance,
+    )?;
+    let file_group = group(
+        window,
+        GROUP_FILE,
+        layout.group(layout.file_top, layout.file_height),
+        instance,
+    )?;
+    let tray_group = group(
+        window,
+        GROUP_TRAY,
+        layout.group(layout.tray_top, layout.tray_height),
+        instance,
+    )?;
+
+    let top = layout.content_top(layout.shortcut_top);
+    let hotkey_label = child(
+        window,
+        w!("STATIC"),
+        "Hotkey",
+        SS_RIGHT,
+        -1,
+        layout.label(top),
+        instance,
+    )?;
     let hotkey_field = child(
         window,
         w!("EDIT"),
         "",
         ES_READONLY | ES_AUTOHSCROLL,
         ID_HOTKEY,
-        (PAD + LABEL_WIDTH, PAD, field_width, FIELD_HEIGHT),
+        layout.field(top, layout.field_width),
         instance,
     )?;
     let hotkey_hint = child(
@@ -299,17 +609,18 @@ fn build_controls(window: HWND, instance: HINSTANCE) -> Result<()> {
         HOTKEY_HINT,
         SS_LEFT,
         ID_HOTKEY_HINT,
-        (PAD + LABEL_WIDTH, PAD + FIELD_HEIGHT + 2, field_width, 30),
+        layout.hint(top),
         instance,
     )?;
 
+    let (clipboard_rect, save_file_rect) = layout.checks();
     let clipboard = child(
         window,
         w!("BUTTON"),
         "Copy each capture to the clipboard",
         BS_AUTOCHECKBOX | WS_TABSTOP.0,
         ID_CLIPBOARD,
-        (PAD, PAD + 62, CLIENT_WIDTH - PAD * 2, 20),
+        clipboard_rect,
         instance,
     )?;
     let save_file = child(
@@ -318,38 +629,36 @@ fn build_controls(window: HWND, instance: HINSTANCE) -> Result<()> {
         "Also save each capture to a file",
         BS_AUTOCHECKBOX | WS_TABSTOP.0,
         ID_SAVE_FILE,
-        (PAD, PAD + 86, CLIENT_WIDTH - PAD * 2, 20),
+        save_file_rect,
         instance,
     )?;
 
-    let output_label = child(window, w!("STATIC"), "Output folder", SS_RIGHT, -1, (PAD, PAD + 118, LABEL_WIDTH - 10, 18), instance)?;
-    let browse_width = 84;
+    let (output_label_rect, output_dir_rect, browse_rect) = layout.output();
+    let output_label = child(
+        window,
+        w!("STATIC"),
+        "Output folder",
+        SS_RIGHT,
+        -1,
+        output_label_rect,
+        instance,
+    )?;
     let output_dir = child(
         window,
         w!("EDIT"),
         "",
         ES_AUTOHSCROLL | WS_TABSTOP.0,
         ID_OUTPUT_DIR,
-        (
-            PAD + LABEL_WIDTH,
-            PAD + 114,
-            CLIENT_WIDTH - PAD * 2 - LABEL_WIDTH - browse_width - 8,
-            FIELD_HEIGHT,
-        ),
+        output_dir_rect,
         instance,
     )?;
     let browse = child(
         window,
         w!("BUTTON"),
-        "Browse...",
+        BROWSE_TEXT,
         BS_PUSHBUTTON | WS_TABSTOP.0,
         ID_BROWSE,
-        (
-            CLIENT_WIDTH - PAD - browse_width,
-            PAD + 114,
-            browse_width,
-            FIELD_HEIGHT,
-        ),
+        browse_rect,
         instance,
     )?;
     let output_hint = child(
@@ -358,17 +667,18 @@ fn build_controls(window: HWND, instance: HINSTANCE) -> Result<()> {
         OUTPUT_HINT,
         SS_LEFT,
         ID_OUTPUT_HINT,
-        (PAD + LABEL_WIDTH, PAD + 138, field_width, 30),
+        layout.hint(layout.content_top(layout.file_top)),
         instance,
     )?;
 
+    let (tray_rect, tray_hint_rect) = layout.tray();
     let tray_click = child(
         window,
         w!("BUTTON"),
         "",
         BS_PUSHBUTTON | WS_TABSTOP.0,
         ID_TRAY_CLICK,
-        (PAD, PAD + 172, CLIENT_WIDTH - PAD * 2, 26),
+        tray_rect,
         instance,
     )?;
     let tray_click_hint = child(
@@ -377,33 +687,36 @@ fn build_controls(window: HWND, instance: HINSTANCE) -> Result<()> {
         TRAY_CLICK_HINT,
         SS_LEFT,
         ID_TRAY_CLICK_HINT,
-        (PAD, PAD + 202, CLIENT_WIDTH - PAD * 2, 18),
+        tray_hint_rect,
         instance,
     )?;
 
+    let (save_rect, cancel_rect) = layout.buttons();
     let save = child(
         window,
         w!("BUTTON"),
-        "Save",
+        SAVE_TEXT,
         BS_DEFPUSHBUTTON | WS_TABSTOP.0,
         ID_SAVE,
-        (CLIENT_WIDTH - PAD - BUTTON_WIDTH * 2 - 8, CLIENT_HEIGHT - PAD - 26, BUTTON_WIDTH, 26),
+        save_rect,
         instance,
     )?;
     let cancel = child(
         window,
         w!("BUTTON"),
-        "Cancel",
+        CANCEL_TEXT,
         BS_PUSHBUTTON | WS_TABSTOP.0,
         ID_CANCEL,
-        (CLIENT_WIDTH - PAD - BUTTON_WIDTH, CLIENT_HEIGHT - PAD - 26, BUTTON_WIDTH, 26),
+        cancel_rect,
         instance,
     )?;
-    let _ = (hotkey_label, output_label, browse, save, cancel);
 
     // Capture keys on the field itself. A read-only edit still receives them.
     // The function is cast through a pointer rather than straight to an integer,
-    // which is what the language requires.
+    // which is what the language requires, and what it replaces is kept: a control
+    // has a window procedure of its own, and one that this module does not forward
+    // to stops being a control. That is what an empty field and a field whose text
+    // never changes both look like from the outside.
     let previous = unsafe {
         SetWindowLongPtrW(
             hotkey_field,
@@ -413,17 +726,41 @@ fn build_controls(window: HWND, instance: HINSTANCE) -> Result<()> {
     };
 
     with_state(|state| {
-        state.hotkey_field = hotkey_field;
-        state.hotkey_hint = hotkey_hint;
-        state.clipboard = clipboard;
-        state.save_file = save_file;
-        state.output_dir = output_dir;
-        state.output_hint = output_hint;
-        state.tray_click = tray_click;
-        state.tray_click_hint = tray_click_hint;
+        state.controls = Controls {
+            shortcut_group,
+            hotkey_label,
+            hotkey_field,
+            hotkey_hint,
+            after_group,
+            clipboard,
+            save_file,
+            file_group,
+            output_label,
+            output_dir,
+            browse,
+            output_hint,
+            tray_group,
+            tray_click,
+            tray_click_hint,
+            save,
+            cancel,
+        };
         state.previous_proc = previous;
     });
     Ok(())
+}
+
+/// Create a group frame.
+fn group(parent: HWND, caption: &str, rect: Rect, instance: HINSTANCE) -> Result<HWND> {
+    child(
+        parent,
+        w!("BUTTON"),
+        caption,
+        BS_GROUPBOX,
+        -1,
+        rect,
+        instance,
+    )
 }
 
 /// Create one child control.
@@ -433,7 +770,7 @@ fn child(
     text: &str,
     style: u32,
     id: i32,
-    rect: (i32, i32, i32, i32),
+    rect: Rect,
     instance: HINSTANCE,
 ) -> Result<HWND> {
     let text = wide(text);
@@ -458,7 +795,16 @@ fn child(
     .with_context(|| format!("could not create control {id}"))?;
 
     // One font for everything, so the window does not mix system and default.
-    let font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
+    let font = with_state(|state| state.font).unwrap_or_default();
+    apply_font(control, font);
+    Ok(control)
+}
+
+/// Put a font on a control, when there is one to put.
+fn apply_font(control: HWND, font: HGDIOBJ) {
+    if control.is_invalid() || font.is_invalid() {
+        return;
+    }
     unsafe {
         SendMessageW(
             control,
@@ -467,7 +813,302 @@ fn child(
             Some(LPARAM(1)),
         );
     }
-    Ok(control)
+}
+
+/// Move and resize every control for a layout.
+///
+/// The whole set goes through one `DeferWindowPos` batch. Moving them one at a
+/// time redraws the window between each of them, so the frames and the controls
+/// inside them are visible apart from each other for as long as the move takes —
+/// and after a DPI change that is every control in the window.
+fn place_controls(layout: Layout, controls: Controls) {
+    let handles = controls.in_order();
+    if handles.is_empty() {
+        return;
+    }
+
+    let Ok(mut batch) = (unsafe { BeginDeferWindowPos(handles.len() as i32) }) else {
+        return;
+    };
+
+    // A failed `DeferWindowPos` leaves the batch usable and the control where it
+    // was, so a failure here is not worth abandoning the rest of the move for.
+    let move_to = |batch: HDWP, control: HWND, rect: Rect| {
+        unsafe {
+            DeferWindowPos(
+                batch,
+                control,
+                None,
+                rect.0,
+                rect.1,
+                rect.2,
+                rect.3,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        }
+        .unwrap_or(batch)
+    };
+
+    batch = move_to(
+        batch,
+        controls.shortcut_group,
+        layout.group(layout.shortcut_top, layout.shortcut_height),
+    );
+    batch = move_to(
+        batch,
+        controls.after_group,
+        layout.group(layout.after_top, layout.after_height),
+    );
+    batch = move_to(
+        batch,
+        controls.file_group,
+        layout.group(layout.file_top, layout.file_height),
+    );
+    batch = move_to(
+        batch,
+        controls.tray_group,
+        layout.group(layout.tray_top, layout.tray_height),
+    );
+
+    let top = layout.content_top(layout.shortcut_top);
+    batch = move_to(batch, controls.hotkey_label, layout.label(top));
+    batch = move_to(
+        batch,
+        controls.hotkey_field,
+        layout.field(top, layout.field_width),
+    );
+    batch = move_to(batch, controls.hotkey_hint, layout.hint(top));
+
+    let (clipboard, save_file) = layout.checks();
+    batch = move_to(batch, controls.clipboard, clipboard);
+    batch = move_to(batch, controls.save_file, save_file);
+
+    let (output_label, output_dir, browse) = layout.output();
+    batch = move_to(batch, controls.output_label, output_label);
+    batch = move_to(batch, controls.output_dir, output_dir);
+    batch = move_to(batch, controls.browse, browse);
+    batch = move_to(
+        batch,
+        controls.output_hint,
+        layout.hint(layout.content_top(layout.file_top)),
+    );
+
+    let (tray, tray_hint) = layout.tray();
+    batch = move_to(batch, controls.tray_click, tray);
+    batch = move_to(batch, controls.tray_click_hint, tray_hint);
+
+    let (save, cancel) = layout.buttons();
+    batch = move_to(batch, controls.save, save);
+    batch = move_to(batch, controls.cancel, cancel);
+
+    unsafe {
+        let _ = EndDeferWindowPos(batch);
+    }
+
+    // Moving a control is not the same as repainting it. `DeferWindowPos` leaves
+    // each control alone until something asks it to redraw, and the window paints
+    // its background around its children rather than over them, so a control that
+    // is moved and not invalidated keeps its old contents on the parent's
+    // background. Invalidating each one after the move is what stops the previous
+    // layout from showing through the new one.
+    for handle in handles {
+        unsafe {
+            let _ = InvalidateRect(Some(handle), None, true);
+        }
+    }
+}
+
+/// What the controls are showing, so a window that is rebuilt keeps it.
+///
+/// A scale change creates the controls again, and a window that dropped what the
+/// user had typed would be worse than one that never scaled. Reading it out first
+/// and writing it back afterwards is what carries unsaved edits across.
+struct Held {
+    hotkey: String,
+    output_dir: String,
+    tray_click: String,
+    clipboard: bool,
+    save_file: bool,
+}
+
+impl Held {
+    /// Read what every control holds.
+    ///
+    /// Every value is read out and written back in a single pass over the state.
+    /// Reading a control sends it a message, and a message can come back into this
+    /// module - which is what `with_state` refuses a second borrow for. A read
+    /// attempted from inside another read therefore returns nothing at all, and an
+    /// empty field is indistinguishable from a field the user cleared.
+    fn read() -> Self {
+        let Some(controls) = with_state(|state| state.controls) else {
+            return Held {
+                hotkey: String::new(),
+                output_dir: String::new(),
+                tray_click: String::new(),
+                clipboard: false,
+                save_file: false,
+            };
+        };
+        Held {
+            hotkey: text_of(controls.hotkey_field),
+            output_dir: text_of(controls.output_dir),
+            tray_click: text_of(controls.tray_click),
+            clipboard: is_checked(controls.clipboard),
+            save_file: is_checked(controls.save_file),
+        }
+    }
+
+    /// Write it back into whatever controls exist now.
+    fn restore(&self) {
+        let Some(controls) = with_state(|state| state.controls) else {
+            return;
+        };
+        if !self.hotkey.is_empty() {
+            let _ = set_text(controls.hotkey_field, &self.hotkey);
+        }
+        if !self.output_dir.is_empty() {
+            let _ = set_text(controls.output_dir, &self.output_dir);
+        }
+        if !self.tray_click.is_empty() {
+            let _ = set_text(controls.tray_click, &self.tray_click);
+        }
+        set_checked(controls.clipboard, self.clipboard);
+        set_checked(controls.save_file, self.save_file);
+    }
+}
+
+/// Rebuild the window for a new display scale.
+///
+/// Does nothing when the scale has not actually changed, so a notification that
+/// repeats the current value does not throw the font away for nothing.
+///
+/// Two paths, because the window can be told about a new scale in two situations.
+/// Before it is shown - which is what happens when it opens on a display whose
+/// scale the process default did not describe - there is nothing on screen to get
+/// wrong, so the controls are simply moved. After it is shown, they are destroyed
+/// and created again: moving a window that is already drawn leaves its new area
+/// unpainted and its old contents on the screen, and rebuilding is both shorter
+/// and the only version that cannot leave the two layouts mixed together. Every
+/// control here is stateless, so nothing is lost by creating it again.
+fn rescale(new_dpi: u32) {
+    let Some(current) = with_state(|state| state.layout.dpi) else {
+        return;
+    };
+    if current == new_dpi {
+        return;
+    }
+
+    let font = create_font(ui_layout::factor(new_dpi));
+    let layout = layout_for(new_dpi, font);
+
+    let Some((window, visible, controls, previous_font)) = with_state(|state| {
+        let previous = std::mem::replace(&mut state.font, font);
+        state.layout = layout;
+        (state.window, state.visible, state.controls, previous)
+    }) else {
+        return;
+    };
+
+
+    // Nothing may be drawn with the old font after it is released.
+    for control in controls.in_order() {
+        apply_font(control, font);
+    }
+
+    let frame = window_frame(layout);
+    unsafe {
+        let _ = SetWindowPos(
+            window,
+            Some(HWND_TOP),
+            0,
+            0,
+            frame.right - frame.left,
+            frame.bottom - frame.top,
+            SWP_NOMOVE | SWP_NOZORDER,
+        );
+    }
+
+    if !visible {
+        // The window has not been shown, so its controls are empty and there is
+        // nothing on screen to get wrong. Moving them is enough, and the caller
+        // fills them from the saved values afterwards.
+        place_controls(layout, controls);
+        release_font(previous_font, font);
+        return;
+    }
+
+    // From here the window is on screen, and its contents are the user's: what the
+    // controls hold is read out first, because a change of display scale is not a
+    // reason to lose an edit that has not been saved yet.
+    let held = Held::read();
+
+    // The window is erased once more with nothing on it, and only then given its
+    // controls back.
+    //
+    // This is what a change of scale needs, and moving the existing controls is
+    // not it. A window paints its own background around its children rather than
+    // over them, so the pixels a control drew are never erased by anything that
+    // happens to the window afterwards: a control that moves leaves its old
+    // contents behind, and a window that grows keeps whatever was on the screen in
+    // the area it grew into. New controls drawn over the old ones look right in a
+    // list of controls and wrong on the screen.
+    unsafe {
+        let _ = ShowWindow(window, SW_HIDE);
+    }
+    for control in controls.in_order() {
+        unsafe {
+            let _ = DestroyWindow(control);
+        }
+    }
+    with_state(|state| state.controls = Controls::default());
+
+    // Nothing is left to clip against, so this erases the whole client area.
+    unsafe {
+        let _ = RedrawWindow(
+            Some(window),
+            None,
+            None,
+            RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW,
+        );
+    }
+
+    if let Err(err) = build_controls() {
+        // The window is unusable without its controls, so it is taken down rather
+        // than shown in a state the user cannot finish.
+        eprintln!("[settings] could not rebuild the window for {new_dpi} dpi: {err:#}");
+        release_font(previous_font, font);
+        finish(None);
+        return;
+    }
+    unsafe {
+        // Shown without taking the focus back: the window is already modal to its
+        // owner and nothing here is a user action.
+        let _ = ShowWindow(window, SW_SHOWNA);
+    }
+    held.restore();
+
+    release_font(previous_font, font);
+    clamp_to_screen(window);
+
+    // The window's own background is painted outside its children, so a full
+    // repaint is what clears the area the previous layout occupied.
+    unsafe {
+        let _ = RedrawWindow(
+            Some(window),
+            None,
+            None,
+            RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+        );
+    }
+}
+
+/// Release the font the window was using, once nothing selects it.
+fn release_font(previous: HGDIOBJ, current: HGDIOBJ) {
+    if !previous.is_invalid() && previous != current {
+        unsafe {
+            let _ = DeleteObject(previous);
+        }
+    }
 }
 
 /// Put the loaded settings into the controls.
@@ -484,13 +1125,13 @@ fn load_values() {
             state.current.clipboard,
             state.current.save_file,
             state.tray_left_click,
-            state.hotkey_field,
-            state.hotkey_hint,
-            state.output_dir,
-            state.output_hint,
-            state.tray_click,
-            state.clipboard,
-            state.save_file,
+            state.controls.hotkey_field,
+            state.controls.hotkey_hint,
+            state.controls.output_dir,
+            state.controls.output_hint,
+            state.controls.tray_click,
+            state.controls.clipboard,
+            state.controls.save_file,
         )
     }) else {
         return;
@@ -538,7 +1179,7 @@ unsafe extern "system" fn hotkey_proc(
             if !modifiers.any() {
                 // Refused, and said so: registered system-wide this would swallow
                 // the key from every other program.
-                if let Some(hint) = with_state(|state| state.hotkey_hint) {
+                if let Some(hint) = with_state(|state| state.controls.hotkey_hint) {
                     let _ = set_text(hint, HOTKEY_NEEDS_MODIFIER);
                 }
                 return LRESULT(0);
@@ -546,17 +1187,25 @@ unsafe extern "system" fn hotkey_proc(
 
             let hotkey = Hotkey { modifiers, key };
             with_state(|state| state.hotkey = Some(hotkey));
-            if let Some(field) = with_state(|state| state.hotkey_field) {
+            if let Some(field) = with_state(|state| state.controls.hotkey_field) {
                 let _ = set_text(field, &hotkey.to_string());
             }
-            if let Some(hint) = with_state(|state| state.hotkey_hint) {
+            if let Some(hint) = with_state(|state| state.controls.hotkey_hint) {
                 let _ = set_text(hint, HOTKEY_HINT);
             }
             LRESULT(0)
         }
 
         _ => {
+            // Every message this module does not handle - which is all of them
+            // except the two key messages above - goes back to the control's own
+            // window procedure. Without it the field is not an edit control any
+            // more: it does not store its text, does not draw it, and does not
+            // take the caret.
             let previous = with_state(|state| state.previous_proc).unwrap_or(0);
+            if previous == 0 {
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            }
             let previous: WNDPROC = unsafe { std::mem::transmute(previous) };
             unsafe { CallWindowProcW(previous, hwnd, msg, wparam, lparam) }
         }
@@ -581,6 +1230,16 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
 
+        WM_DPICHANGED => {
+            // The window is per-monitor DPI aware, so moving it to another display
+            // does not scale it. This notification says the scale changed; the
+            // frame Windows suggests for the new display is not used, because a
+            // window whose size follows from its contents keeps the position it
+            // has and is only brought back on screen.
+            rescale((wparam.0 & 0xFFFF) as u32);
+            LRESULT(0)
+        }
+
         WM_CLOSE => {
             finish(None);
             LRESULT(0)
@@ -599,7 +1258,7 @@ unsafe extern "system" fn window_proc(
 
 /// Ask for a folder and put it in the field.
 fn browse_for_folder() {
-    let Some(field) = with_state(|state| state.output_dir) else {
+    let Some(field) = with_state(|state| state.controls.output_dir) else {
         return;
     };
     let owner = with_state(|state| state.window).unwrap_or_default();
@@ -640,19 +1299,21 @@ fn toggle_tray_click() {
     }) else {
         return;
     };
-    if let Some(button) = with_state(|state| state.tray_click) {
+    if let Some(button) = with_state(|state| state.controls.tray_click) {
         let _ = set_text(button, &tray_click_text(choice));
     }
 }
 
 /// Collect the controls, refuse an incomplete window, and close with a result.
 fn save() {
-    let Some(output_dir) = with_state(|state| text_of(state.output_dir).trim().to_string()) else {
+    let Some(output_dir) =
+        with_state(|state| text_of(state.controls.output_dir).trim().to_string())
+    else {
         return;
     };
 
     if output_dir.is_empty() {
-        if let Some(hint) = with_state(|state| state.output_hint) {
+        if let Some(hint) = with_state(|state| state.controls.output_hint) {
             let _ = set_text(hint, OUTPUT_NEEDS_FOLDER);
         }
         return;
@@ -669,7 +1330,7 @@ fn save() {
     };
 
     let Some(hotkey) = hotkey else {
-        if let Some(hint) = with_state(|state| state.hotkey_hint) {
+        if let Some(hint) = with_state(|state| state.controls.hotkey_hint) {
             let _ = set_text(hint, HOTKEY_NEEDS_MODIFIER);
         }
         return;
@@ -678,8 +1339,8 @@ fn save() {
     updated.hotkey = hotkey;
     updated.output_dir = output_dir;
     updated.tray_left_click = tray_left_click;
-    updated.clipboard = with_state(|state| is_checked(state.clipboard)).unwrap_or(false);
-    updated.save_file = with_state(|state| is_checked(state.save_file)).unwrap_or(false);
+    updated.clipboard = with_state(|state| is_checked(state.controls.clipboard)).unwrap_or(false);
+    updated.save_file = with_state(|state| is_checked(state.controls.save_file)).unwrap_or(false);
 
     finish(Some(updated));
 }
@@ -698,6 +1359,40 @@ fn finish(result: Option<Settings>) {
         }
     }
     with_state(|state| state.done = true);
+}
+
+/// Move a window back onto the screen, changing as little as possible.
+///
+/// A window can be widened past the display it is on — 200% is nearly twice the
+/// pixels — and Windows will happily place it so that its right edge, and with it
+/// the button row, is off the screen. Only the overflow is taken back, so a window
+/// the user has positioned keeps that position.
+fn clamp_to_screen(window: HWND) {
+    unsafe {
+        let mut rect = Default::default();
+        if GetWindowRect(window, &mut rect).is_err() {
+            return;
+        }
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        let screen_width = GetSystemMetrics(SM_CXSCREEN);
+        let screen_height = GetSystemMetrics(SM_CYSCREEN);
+
+        let x = if width >= screen_width {
+            0
+        } else {
+            rect.left.min(screen_width - width).max(0)
+        };
+        let y = if height >= screen_height {
+            0
+        } else {
+            rect.top.min(screen_height - height).max(0)
+        };
+
+        if x != rect.left || y != rect.top {
+            let _ = SetWindowPos(window, Some(HWND_TOP), x, y, width, height, SWP_NOZORDER);
+        }
+    }
 }
 
 /// Centre the window on the screen, or over the owner when it has a size.
@@ -721,15 +1416,7 @@ fn center(window: HWND, owner: HWND) {
             }
         }
 
-        let _ = SetWindowPos(
-            window,
-            Some(HWND_TOP),
-            x,
-            y,
-            width,
-            height,
-            SWP_NOZORDER,
-        );
+        let _ = SetWindowPos(window, Some(HWND_TOP), x, y, width, height, SWP_NOZORDER);
     }
 }
 
@@ -743,7 +1430,12 @@ fn is_checked(control: HWND) -> bool {
 fn set_checked(control: HWND, checked: bool) {
     let value = if checked { BST_CHECKED } else { BST_UNCHECKED };
     unsafe {
-        SendMessageW(control, BM_SETCHECK, Some(WPARAM(value as usize)), Some(LPARAM(0)));
+        SendMessageW(
+            control,
+            BM_SETCHECK,
+            Some(WPARAM(value as usize)),
+            Some(LPARAM(0)),
+        );
     }
 }
 
@@ -795,8 +1487,16 @@ fn held_modifiers() -> Modifiers {
 /// Whether a virtual key is a modifier rather than the key of the combination.
 fn is_modifier_key(key: u16) -> bool {
     [
-        VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN, VK_LSHIFT, VK_RSHIFT, VK_RCONTROL,
-        VK_LMENU, VK_RMENU,
+        VK_SHIFT,
+        VK_CONTROL,
+        VK_MENU,
+        VK_LWIN,
+        VK_RWIN,
+        VK_LSHIFT,
+        VK_RSHIFT,
+        VK_RCONTROL,
+        VK_LMENU,
+        VK_RMENU,
     ]
     .iter()
     .any(|modifier| modifier.0 == key)

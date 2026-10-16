@@ -691,7 +691,9 @@ fn apply_settings() -> Result<()> {
         return Ok(());
     };
 
-    let Some(updated) = settings_window::open(owner, &current)? else {
+    // No explicit scale: the window opens on whatever display the tray icon is
+    // on, and its layout follows that display.
+    let Some(updated) = settings_window::open(owner, &current, None)? else {
         // Cancelled: nothing to do and nothing to report.
         return Ok(());
     };
