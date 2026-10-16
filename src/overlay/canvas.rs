@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Gdi::{
     BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BitBlt, COLORONCOLOR, CreateCompatibleDC,
-    CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, HDC, HGDIOBJ, HBITMAP,
+    CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GdiFlush, HDC, HGDIOBJ, HBITMAP,
     IntersectClipRect, RestoreDC, SRCCOPY, SaveDC, SelectObject, SetStretchBltMode, StretchDIBits,
 };
 
@@ -113,6 +113,29 @@ impl Canvas {
     /// the label and the magnifier here, never on the window DC.
     pub fn dc(&self) -> HDC {
         self.mem
+    }
+
+    /// The back buffer's pixels, as BGRA.
+    ///
+    /// The overlay draws the annotations into the back buffer, so this is the only way to
+    /// get at what was drawn: the `base` and `dim` layers are the capture as it arrived
+    /// and have never seen a stroke. Reading the capture instead of this is a mistake
+    /// that leaves the annotations on screen and out of the saved file, which is exactly
+    /// what it did until this was added.
+    pub fn composed_bgra(&self) -> Vec<u8> {
+        // GDI batches drawing, so the bits may still be empty without this.
+        unsafe {
+            let _ = GdiFlush();
+        }
+        let length = self.width as usize * self.height as usize * 4;
+        let mut out = vec![0u8; length];
+        if self.bits.is_null() {
+            return out;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.bits as *const u8, out.as_mut_ptr(), length);
+        }
+        out
     }
 
     fn stretch(&self, pixels: &[u8]) {

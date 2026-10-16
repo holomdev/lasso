@@ -281,7 +281,7 @@ fn cmd_select(out: &str, copy: bool, with_cursor: bool) -> Result<()> {
     // The overlay is given the capture without the pointer: it draws its own
     // crosshair, and the magnifier has to show the pixels underneath, which is
     // what placing an edge precisely depends on.
-    let mut frame = capture::capture_virtual_desktop(None)?;
+    let frame = capture::capture_virtual_desktop(None)?;
     eprintln!(
         "[capture] {} {}x{} in {:.1} ms",
         frame.backend.as_str(),
@@ -290,9 +290,21 @@ fn cmd_select(out: &str, copy: bool, with_cursor: bool) -> Result<()> {
         started.elapsed().as_secs_f64() * 1000.0
     );
 
-    let Some(selection) = overlay::select_region(&frame)? else {
+    let Some(composed) = overlay::select_region(&frame)? else {
         println!("cancelled");
         return Ok(());
+    };
+    let selection = composed.selection;
+
+    // The capture with the annotations already drawn on it. The frame the overlay was
+    // given has never seen a stroke, so cropping that would save the region and silently
+    // drop the drawing — which is exactly what it did before this was wired up.
+    let mut frame = capture::Frame {
+        bgra: composed.bgra,
+        width: composed.width,
+        height: composed.height,
+        origin: frame.origin,
+        backend: frame.backend,
     };
 
     // What is saved and copied is the pointer as it was when the capture was
@@ -304,12 +316,23 @@ fn cmd_select(out: &str, copy: bool, with_cursor: bool) -> Result<()> {
 
     let bounds = (selection.x, selection.y, selection.width, selection.height);
 
-    if copy {
+    // The strip's buttons choose what happens, and they are taken as a choice rather than
+    // as an addition to the command: picking the clipboard button in a run that was asked
+    // for a file means the person changed their mind, and writing a file anyway would
+    // ignore what they just clicked.
+    let clipboard_only = selection.action == overlay::Action::Copy;
+    let to_clipboard = copy || clipboard_only;
+
+    if to_clipboard {
         let region = frame
             .to_bgra_sub(bounds.0, bounds.1, bounds.2, bounds.3)
             .context("the selected region falls outside the capture")?;
         clipboard::copy_bgra(&region, selection.width, selection.height)?;
         println!("clipboard: copied {}x{}", selection.width, selection.height);
+    }
+
+    if clipboard_only {
+        return Ok(());
     }
 
     let image = frame

@@ -44,7 +44,9 @@ pub enum Tool {
 }
 
 impl Tool {
-    /// Every tool, in the order the strip shows them.
+    /// Every tool. The strip lists buttons rather than tools, so this is only walked by
+    /// the test that checks each tool agrees about whether it draws.
+    #[cfg(test)]
     pub const ALL: [Tool; 5] = [
         Tool::Move,
         Tool::Arrow,
@@ -56,17 +58,6 @@ impl Tool {
     /// Whether a drag with this tool produces a stroke.
     pub fn draws(self) -> bool {
         !matches!(self, Tool::Move)
-    }
-
-    /// The tool's name, for the hint and for a test failure to be readable.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Tool::Move => "move",
-            Tool::Arrow => "arrow",
-            Tool::Rectangle => "rectangle",
-            Tool::Ellipse => "ellipse",
-            Tool::Pencil => "pencil",
-        }
     }
 }
 
@@ -292,10 +283,6 @@ impl Annotations {
         &self.strokes
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.strokes.is_empty() && self.undone.is_empty()
-    }
-
     /// Whether there is anything for undo to take back.
     pub fn can_undo(&self) -> bool {
         !self.strokes.is_empty()
@@ -426,11 +413,18 @@ impl Frame {
     }
 
     /// A point in the selection, back on the desktop.
+    ///
+    /// Only the round-trip test uses this: the program converts one way, from screen to
+    /// relative, and a second implementation of the other direction would be one more
+    /// thing to keep in step.
+    #[cfg(test)]
     pub fn to_screen(&self, point: Point) -> (i32, i32) {
         (point.x + self.x, point.y + self.y)
     }
 
-    /// Whether a point on the desktop is inside the selection.
+    /// Whether a point on the desktop is inside the selection. Test-only, for the same
+    /// reason as `to_screen`: the overlay has its own test of the same thing.
+    #[cfg(test)]
     pub fn contains(&self, x: i32, y: i32) -> bool {
         x >= self.x
             && y >= self.y

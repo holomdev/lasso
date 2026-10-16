@@ -32,19 +32,10 @@
 //! held by [`canvas::Canvas`] and the result reaches the window with a single
 //! blit, so a drag never shows half-drawn frames.
 
-// Both of these are complete and tested on their own, and neither is wired into the
-// overlay yet: the drawing and the input handling that use them are the next step.
-//
-// The allowance is here rather than inside each module so that it is one line to delete
-// and one place to look, and so that deleting it is what reports the job as finished.
-// Nothing else in the program is allowed to go unused like this.
-#[allow(dead_code)]
 pub mod annotation;
 mod canvas;
-#[allow(dead_code)]
 mod draw;
 mod geometry;
-#[allow(dead_code)]
 pub mod toolbar;
 
 use std::cell::RefCell;
@@ -54,13 +45,13 @@ use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DEFAULT_GUI_FONT, DeleteObject, EndPaint, FillRect, FrameRect,
-    GetStockObject, HBRUSH, HDC, HGDIOBJ, InvalidateRect, PAINTSTRUCT, RestoreDC, SaveDC,
-    SelectObject, SetBkMode, SetTextColor, TRANSPARENT, TextOutW,
+    GetStockObject, HBRUSH, HDC, HGDIOBJ, IntersectClipRect, InvalidateRect, PAINTSTRUCT, RestoreDC,
+    SaveDC, SelectObject, SetBkMode, SetTextColor, TRANSPARENT, TextOutW,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN,
-    VK_RIGHT, VK_SHIFT, VK_UP,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VIRTUAL_KEY, VK_CONTROL, VK_DOWN,
+    VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, HCURSOR,
@@ -72,15 +63,46 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::capture::Frame;
+use annotation::{Annotations, Colour, Frame as SelectionFrame, Point, Shape, Stroke, Tool};
 use geometry::{Edges, Zone};
+use toolbar::{Button, Metrics, Placement, Region};
 
 /// A region of the capture, in frame pixels.
+///
+/// The annotations are already drawn onto the captured pixels by the time this is
+/// returned, so the region can be cropped and saved directly: there is nothing else to
+/// apply afterwards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Selection {
     pub x: i32,
     pub y: i32,
     pub width: u32,
     pub height: u32,
+    /// Which of the strip's ways out the person took.
+    pub action: Action,
+}
+
+/// What the person asked for when they finished.
+///
+/// `Save` is what `Enter` and the window closing both mean, so it is the default:
+/// somebody who has just chosen a region almost always wants the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Action {
+    #[default]
+    Save,
+    /// Keep the region on the clipboard and do not write a file.
+    Copy,
+}
+
+/// Which of the strip's action buttons was pressed, if either.
+///
+/// Kept apart from [`Action`] because the two are read at different moments: this is what
+/// happened, and `Action` is what is handed back once the window has closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pressed {
+    Save,
+    Copy,
+    Cancel,
 }
 
 /// Smallest accepted selection, in pixels. Anything smaller is treated as a
@@ -95,9 +117,72 @@ const WHITE: COLORREF = COLORREF(0x00FF_FFFF);
 const BLACK: COLORREF = COLORREF(0x0000_0000);
 const LABEL_BG: COLORREF = COLORREF(0x0020_2020);
 
+/// The strip's plate, its border and its pressed button.
+///
+/// A dark plate with a lighter border, so the strip reads as a card laid on the capture
+/// rather than as a hole in it. Deliberately not the system's `COLOR_BTNFACE`: this
+/// floats over arbitrary content, where a system-grey panel would look like a piece of
+/// some other window.
+const PLATE_BG: COLORREF = COLORREF(0x002A_2A2A);
+const PLATE_EDGE: COLORREF = COLORREF(0x0055_5555);
+const BUTTON_FACE: COLORREF = COLORREF(0x0048_4848);
+
+/// The stroke width a new stroke starts at, in 96-DPI pixels.
+const DEFAULT_THICKNESS: u32 = 2;
+
+/// How thick a stroke may be made, so that the key that changes it cannot run away and
+/// leave a stroke wider than the selection.
+const MAX_THICKNESS: u32 = 24;
+
+/// Where the strip goes for the current selection.
+///
+/// `None` before there is a region worth annotating: the strip is there to act on a
+/// selection, and showing it before one exists would put buttons over the capture that
+/// do nothing yet.
+fn strip_for(canvas: &canvas::Canvas, current: Option<RECT>, metrics: &Metrics) -> Option<Placement> {
+    let rect = current.filter(|rect| validate(*rect).is_some())?;
+    let region = Region {
+        x: rect.left,
+        y: rect.top,
+        width: (rect.right - rect.left) as u32,
+        height: (rect.bottom - rect.top) as u32,
+    };
+    Some(toolbar::place(
+        region,
+        canvas.width(),
+        canvas.height(),
+        metrics,
+    ))
+}
+
+/// The rectangle a placement covers, for invalidating.
+fn rect_of(placement: Placement) -> RECT {
+    RECT {
+        left: placement.x,
+        top: placement.y,
+        right: placement.x + placement.width as i32,
+        bottom: placement.y + placement.height as i32,
+    }
+}
+
+/// The rectangle a selection covers, as the annotation model wants it.
+fn selection_frame(rect: &RECT) -> SelectionFrame {
+    SelectionFrame::new(
+        rect.left,
+        rect.top,
+        (rect.right - rect.left).max(0) as u32,
+        (rect.bottom - rect.top).max(0) as u32,
+    )
+}
+
 /// What the active drag is doing.
 ///
 /// `RECT` only implements `PartialEq`, so this type cannot derive `Eq` either.
+///
+/// `Annotate` carries only the anchor. The stroke being drawn lives in
+/// [`State::drawing`], because a `Pencil` holds a `Vec` and this type is `Copy`, which
+/// the rest of the input handling relies on — reading it by value from behind the state
+/// borrow is what keeps that code readable.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Drag {
     Idle,
@@ -108,6 +193,8 @@ enum Drag {
     Move { grab: (i32, i32), start: RECT },
     /// Resizing; only these sides follow the pointer.
     Resize { edges: Edges, start: RECT },
+    /// Drawing on the selection, in selection-relative coordinates.
+    Annotate { anchor: Point },
 }
 
 /// The cursors the overlay switches between. All are shared system cursors, so
@@ -167,6 +254,10 @@ struct State {
     white: HBRUSH,
     black: HBRUSH,
     label_bg: HBRUSH,
+    /// The strip's plate, its separator, its pressed button and its unavailable glyphs.
+    plate: HBRUSH,
+    edge: HBRUSH,
+    face: HBRUSH,
     drag: Drag,
     /// Last known pointer position, in client coordinates. `None` until the
     /// pointer first moves over the window, which is also when the marker and
@@ -174,14 +265,42 @@ struct State {
     pointer: Option<(i32, i32)>,
     current: Option<RECT>,
     result: Option<Selection>,
+
+    // --- annotation ---
+    /// The tool a drag inside the selection uses. `Move` until another is chosen, so
+    /// that dragging inside still adjusts the region.
+    tool: Tool,
+    colour: Colour,
+    thickness: u32,
+    /// Everything drawn on the selection, in coordinates relative to it.
+    annotations: Annotations,
+    /// The stroke under the pointer, complete except for its last point.
+    drawing: Option<Stroke>,
+    /// Where the strip was put for the current selection, recomputed whenever the
+    /// selection or the scale changes.
+    strip: Option<Placement>,
+    /// The button under the pointer, for the highlight. Also suppressed while drawing,
+    /// when the strip is hidden.
+    hovered: Option<Button>,
+    /// An action button of the strip that was pressed, which closes the window.
+    pressed: Option<Pressed>,
+    /// The strip's metrics for this display's scale.
+    metrics: Metrics,
 }
 
 impl Drop for State {
     fn drop(&mut self) {
         unsafe {
-            let _ = DeleteObject(HGDIOBJ(self.white.0));
-            let _ = DeleteObject(HGDIOBJ(self.black.0));
-            let _ = DeleteObject(HGDIOBJ(self.label_bg.0));
+            for brush in [
+                self.white,
+                self.black,
+                self.label_bg,
+                self.plate,
+                self.edge,
+                self.face,
+            ] {
+                let _ = DeleteObject(HGDIOBJ(brush.0));
+            }
         }
     }
 }
@@ -193,7 +312,7 @@ thread_local! {
 /// Show the overlay for `frame` and return the chosen region.
 ///
 /// `Ok(None)` means the user cancelled.
-pub fn select_region(frame: &Frame) -> Result<Option<Selection>> {
+pub fn select_region(frame: &Frame) -> Result<Option<Composed>> {
     let width = frame.width;
     let height = frame.height;
     let (vx, vy) = frame.origin;
@@ -245,10 +364,24 @@ pub fn select_region(frame: &Frame) -> Result<Option<Selection>> {
             white: unsafe { CreateSolidBrush(WHITE) },
             black: unsafe { CreateSolidBrush(BLACK) },
             label_bg: unsafe { CreateSolidBrush(LABEL_BG) },
+            plate: unsafe { CreateSolidBrush(PLATE_BG) },
+            edge: unsafe { CreateSolidBrush(PLATE_EDGE) },
+            face: unsafe { CreateSolidBrush(BUTTON_FACE) },
             drag: Drag::Idle,
             pointer: None,
             current: None,
             result: None,
+            tool: Tool::default(),
+            colour: Colour::default(),
+            thickness: DEFAULT_THICKNESS,
+            annotations: Annotations::new(),
+            drawing: None,
+            strip: None,
+            hovered: None,
+            pressed: None,
+            metrics: toolbar::metrics_for(crate::ui_layout::factor(unsafe {
+                windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd)
+            })),
         });
     });
 
@@ -273,8 +406,64 @@ pub fn select_region(frame: &Frame) -> Result<Option<Selection>> {
         }
     }
 
-    let selection = STATE.with(|slot| slot.borrow_mut().take().and_then(|st| st.result));
-    Ok(selection)
+    // The annotations are re-drawn onto a fresh copy of the capture here rather than read
+    // back from the window's buffer.
+    //
+    // The window's buffer has them, but it also has the dimmed area, the border, the
+    // handles, the pointer marker and the magnifier, and none of those belong in the
+    // saved image. Re-drawing the strokes is the only way to keep them and leave the rest
+    // behind, and it costs one pass over the strokes — which the drawing code already
+    // does every frame.
+    let composed = STATE.with(|slot| {
+        let mut binding = slot.borrow_mut();
+        match binding.take() {
+            // The annotations are cloned rather than moved: `State` owns brushes and a
+            // device context and is dropped here, so a field cannot be taken out of it.
+            // One clone per finished capture is nothing next to the capture itself.
+            Some(st) => st
+                .result
+                .map(|selection| (selection, st.annotations.clone())),
+            None => None,
+        }
+    });
+
+    let Some((selection, annotations)) = composed else {
+        return Ok(None);
+    };
+
+    // A second canvas rather than the window's buffer: this one has the annotations and
+    // nothing else, where the window's also carries the dimmed area, the border, the
+    // handles, the pointer marker and the magnifier — none of which belong in the file.
+    let composed = canvas::Canvas::new(&frame.bgra, width, height)?;
+    let bounds = draw::Bounds::from_selection(
+        selection.x,
+        selection.y,
+        selection.width,
+        selection.height,
+    );
+    let origin = (selection.x, selection.y);
+    for stroke in annotations.strokes() {
+        draw::draw_stroke(composed.dc(), stroke, &bounds, origin);
+    }
+    let bgra = composed.composed_bgra();
+
+    Ok(Some(Composed {
+        selection,
+        bgra,
+        width,
+        height,
+    }))
+}
+
+/// A finished selection, with the annotations already drawn onto the pixels.
+///
+/// `bgra` covers the whole capture, not the region: the caller crops with the same
+/// `to_bgra_sub` and `to_rgba_sub` it already uses, so nothing about cropping changes.
+pub struct Composed {
+    pub selection: Selection,
+    pub bgra: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// Screen point encoded in a mouse message's `lParam`.
@@ -298,6 +487,104 @@ fn panel_for(st: &State, pointer: (i32, i32)) -> RECT {
     geometry::magnifier_panel_biased(pointer, st.canvas.width(), st.canvas.height(), bias)
 }
 
+impl State {
+    /// The whole canvas as a rectangle, for invalidating all of it.
+    fn canvas_bounds(&self) -> RECT {
+        RECT {
+            left: 0,
+            top: 0,
+            right: self.canvas.width() as i32,
+            bottom: self.canvas.height() as i32,
+        }
+    }
+}
+
+/// Whether a point is inside the current selection.
+fn inside_selection(st: &State, point: (i32, i32)) -> bool {
+    st.current.is_some_and(|rect| {
+        point.0 >= rect.left
+            && point.1 >= rect.top
+            && point.0 < rect.right
+            && point.1 < rect.bottom
+    })
+}
+
+/// Add a point to a freehand stroke being drawn.
+///
+/// Consecutive duplicates are dropped: a mouse move that lands on the same pixel says
+/// nothing new, and keeping it would grow the stroke without changing what it looks like.
+fn append_point(stroke: &mut Stroke, point: Point) {
+    if let Shape::Pencil { points } = &mut stroke.shape {
+        if points.last() == Some(&point) {
+            return;
+        }
+        points.push(point);
+    }
+}
+
+/// Whether a stroke is worth keeping.
+///
+/// A press with no movement on the two-corner tools is a stray click, not a mark: a
+/// rectangle with no size draws nothing anyway, and keeping it would put something in
+/// the undo stack that cannot be seen.
+fn stroke_worth_keeping(stroke: &Stroke) -> bool {
+    match &stroke.shape {
+        Shape::Pencil { .. } => true,
+        _ => {
+            let points = match &stroke.shape {
+                Shape::Arrow { from, to }
+                | Shape::Rectangle { from, to }
+                | Shape::Ellipse { from, to } => [*from, *to],
+                Shape::Pencil { .. } => return true,
+            };
+            points[0] != points[1]
+        }
+    }
+}
+
+/// Handle a click on the strip. Returns whether the click was the strip's.
+///
+/// Returns `true` even when the button did nothing, because a click on the plate must
+/// never fall through to the selection: otherwise aiming at a button that does not apply
+/// would move the region instead.
+fn strip_clicked(st: &mut State, point: (i32, i32)) -> bool {
+    let Some(placement) = st.strip else {
+        return false;
+    };
+    let Some(button) = toolbar::hit(&placement, &st.metrics, point.0, point.1) else {
+        return false;
+    };
+
+    match button {
+        Button::Tool(tool) => {
+            st.tool = tool;
+            // Drawing and adjusting the region want different cursors, and the cursor
+            // is also what tells the person which tool is armed.
+            st.active_cursor = if tool.draws() { st.cursors.cross } else { st.cursors.size_all };
+        }
+        Button::Colour => st.colour = st.colour.next(),
+        Button::Thickness => {
+            st.thickness = if st.thickness >= MAX_THICKNESS {
+                DEFAULT_THICKNESS
+            } else {
+                st.thickness + 2
+            };
+        }
+        Button::Undo => {
+            st.annotations.undo();
+        }
+        Button::Redo => {
+            st.annotations.redo();
+        }
+        // The ways out do not close the window here: they record what was pressed, and
+        // the caller that already knows how to close it does so carrying the answer.
+        Button::Save => st.pressed = Some(Pressed::Save),
+        Button::Copy => st.pressed = Some(Pressed::Copy),
+        Button::Cancel => st.pressed = Some(Pressed::Cancel),
+    }
+    true
+}
+
 /// Invalidate the union of several rectangles, padded. `None` entries are
 /// skipped, and nothing is invalidated when every entry is `None`.
 fn invalidate_rects(hwnd: HWND, rects: &[Option<RECT>], pad: i32) {
@@ -317,8 +604,15 @@ fn invalidate_rects(hwnd: HWND, rects: &[Option<RECT>], pad: i32) {
 }
 
 fn shifted() -> bool {
-    // The high bit of the key state means "currently down".
-    (unsafe { GetKeyState(VK_SHIFT.0 as i32) } as u16 & 0x8000) != 0
+    key_down(VK_SHIFT)
+}
+
+/// Whether a key is currently held down.
+///
+/// The high bit of the key state means "down", which is what separates a held modifier
+/// from a key that was merely pressed at some point.
+fn key_down(key: VIRTUAL_KEY) -> bool {
+    (unsafe { GetKeyState(key.0 as i32) } as u16 & 0x8000) != 0
 }
 
 /// Pixel delta for an arrow key, larger while Shift is held.
@@ -371,23 +665,75 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 };
                 let previous_selection = st.current;
                 let previous_magnifier = st.pointer.map(|p| panel_for(st, p));
+                let previous_strip = st.strip;
                 st.pointer = Some(point);
 
-                match st.current.map(|rect| (rect, geometry::zone_of(&rect, point))) {
-                    Some((rect, Zone::Resize(edges))) => {
+                // The strip is asked first. A click on it must never become a
+                // selection gesture, or aiming at a button would move the region.
+                if strip_clicked(st, point) {
+                    // Undo and redo change what is drawn, and the drawing is composed
+                    // into the back buffer, so the selection has to be repainted rather
+                    // than merely re-presented.
+                    let repaint = st.current;
+                    let current_strip = st.strip;
+                    invalidate_rects(
+                        hwnd,
+                        &[
+                            repaint,
+                            previous_strip.map(rect_of),
+                            current_strip.map(rect_of),
+                        ],
+                        DIRTY_PAD,
+                    );
+                    return;
+                }
+
+                // What is under the pointer decides what a press means: an edge resizes,
+                // inside draws or moves depending on the armed tool, and anywhere else
+                // starts a new region.
+                let zone = st
+                    .current
+                    .map(|rect| geometry::zone_of(&rect, point))
+                    .unwrap_or(Zone::Outside);
+
+                match zone {
+                    Zone::Resize(edges) => {
+                        let rect = st.current.expect("a zone implies a selection");
                         st.drag = Drag::Resize { edges, start: rect };
                         st.active_cursor = st.cursors.for_edges(edges);
                     }
-                    Some((rect, Zone::Move)) => {
+                    Zone::Move if st.tool.draws() => {
+                        let rect = st.current.expect("a zone implies a selection");
+                        let frame = selection_frame(&rect);
+                        let anchor = frame.to_relative(point.0, point.1);
+                        let shape = match st.tool {
+                            Tool::Arrow => Shape::Arrow { from: anchor, to: anchor },
+                            Tool::Rectangle => Shape::Rectangle {
+                                from: anchor,
+                                to: anchor,
+                            },
+                            Tool::Ellipse => Shape::Ellipse { from: anchor, to: anchor },
+                            Tool::Pencil => Shape::Pencil {
+                                points: vec![anchor],
+                            },
+                            Tool::Move => unreachable!("Move is not a drawing tool"),
+                        };
+                        st.drawing = Some(Stroke::new(shape, st.colour, st.thickness));
+                        st.drag = Drag::Annotate { anchor };
+                        st.active_cursor = st.cursors.cross;
+                    }
+                    Zone::Move => {
+                        let rect = st.current.expect("a zone implies a selection");
                         st.drag = Drag::Move {
                             grab: (point.0 - rect.left, point.1 - rect.top),
                             start: rect,
                         };
                         st.active_cursor = st.cursors.size_all;
                     }
-                    _ => {
+                    Zone::Outside => {
                         st.drag = Drag::Create { anchor: point };
                         st.current = None;
+                        st.strip = None;
                         st.active_cursor = st.cursors.cross;
                     }
                 }
@@ -400,6 +746,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         st.current,
                         previous_magnifier,
                         Some(current_magnifier),
+                        previous_strip.map(rect_of),
                     ],
                     DIRTY_PAD,
                 );
@@ -421,31 +768,84 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let previous_pointer = st.pointer;
                 let previous_selection = st.current;
                 let previous_magnifier = previous_pointer.map(|p| panel_for(st, p));
+                let previous_strip = st.strip;
 
                 st.pointer = Some(point);
+                let mut drew = false;
                 match st.drag {
                     Drag::Idle => {
-                        // Keep the cursor in step with the zone under the
-                        // pointer, which is what makes the handles discoverable.
-                        st.active_cursor = match st.current {
-                            Some(rect) => st.cursors.for_zone(geometry::zone_of(&rect, point)),
-                            None => st.cursors.cross,
+                        // The strip is asked before the selection, so that hovering a
+                        // button highlights it and the cursor does not claim the pixel
+                        // is part of the region.
+                        st.hovered = st
+                            .strip
+                            .as_ref()
+                            .and_then(|placement| {
+                                toolbar::hit(placement, &st.metrics, point.0, point.1)
+                            });
+                        st.active_cursor = if st.hovered.is_some() {
+                            st.cursors.cross
+                        } else if st.tool.draws() && inside_selection(st, point) {
+                            // A drawing tool over the region: the crosshair says the
+                            // press will draw rather than move.
+                            st.cursors.cross
+                        } else {
+                            match st.current {
+                                Some(rect) => st.cursors.for_zone(geometry::zone_of(&rect, point)),
+                                None => st.cursors.cross,
+                            }
                         };
                     }
                     Drag::Create { anchor } => {
                         st.current = Some(geometry::rectangle(anchor, point));
+                        st.strip = strip_for(&st.canvas, st.current, &st.metrics);
                     }
                     Drag::Move { grab, start } => {
-                        st.current = Some(geometry::moved(&start, grab, point));
+                        let moved = geometry::moved(&start, grab, point);
+                        let delta = (moved.left - start.left, moved.top - start.top);
+                        st.current = Some(moved);
+                        // The drawing belongs to the selection, so it travels with it.
+                        st.annotations = st.annotations.moved(delta.0, delta.1);
+                        st.strip = strip_for(&st.canvas, st.current, &st.metrics);
                     }
                     Drag::Resize { edges, start } => {
-                        st.current = Some(geometry::resized(&start, edges, point));
+                        let resized = geometry::resized(&start, edges, point);
+                        // Resizing from the top or the left moves the origin as well as
+                        // the size, so the drawing has to be shifted by that much before
+                        // it is clipped — otherwise everything drawn would slide.
+                        let delta = (resized.left - start.left, resized.top - start.top);
+                        st.current = Some(resized);
+                        if delta != (0, 0) {
+                            st.annotations = st.annotations.moved(delta.0, delta.1);
+                        }
+                        let frame = selection_frame(&resized);
+                        st.annotations = st.annotations.clip_to(frame.width, frame.height);
+                        st.strip = strip_for(&st.canvas, st.current, &st.metrics);
+                    }
+                    Drag::Annotate { anchor } => {
+                        drew = true;
+                        let Some(stroke) = st.drawing.as_mut() else {
+                            return;
+                        };
+                        let Some(rect) = st.current else {
+                            return;
+                        };
+                        let frame = selection_frame(&rect);
+                        let point = frame.to_relative(point.0, point.1);
+                        match &mut stroke.shape {
+                            Shape::Pencil { .. } => append_point(stroke, point),
+                            Shape::Arrow { to, .. }
+                            | Shape::Rectangle { to, .. }
+                            | Shape::Ellipse { to, .. } => *to = point,
+                        }
+                        let _ = anchor;
                     }
                 }
 
                 // A mouse move that lands on the same pixel and leaves the
-                // selection alone has nothing to show.
-                if previous_pointer == Some(point) && previous_selection == st.current {
+                // selection alone has nothing to show, unless something is being
+                // drawn — in which case the stroke has just changed.
+                if !drew && previous_pointer == Some(point) && previous_selection == st.current {
                     return;
                 }
 
@@ -457,6 +857,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         st.current,
                         previous_magnifier,
                         Some(current_magnifier),
+                        previous_strip.map(rect_of),
                     ],
                     DIRTY_PAD,
                 );
@@ -466,18 +867,54 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
         WM_LBUTTONUP => {
             let point = point_from(lparam);
-            STATE.with(|slot| {
+            let close = STATE.with(|slot| {
                 let mut binding = slot.borrow_mut();
                 let Some(st) = binding.as_mut() else {
-                    return;
+                    return false;
                 };
                 let previous_magnifier = st.pointer.map(|p| panel_for(st, p));
                 st.pointer = Some(point);
+
+                // An action button of the strip finishes the window. Pressing it and
+                // releasing somewhere else would be a drag away from the button, but the
+                // button is not a control and a person aiming at it has already decided,
+                // so the press is enough — which is also why this is read here, where the
+                // press is known to have happened on the strip.
+                if let Some(pressed) = st.pressed.take() {
+                    let width = st.canvas.width();
+                    let height = st.canvas.height();
+                    st.result = match pressed {
+                        Pressed::Cancel => None,
+                        Pressed::Save | Pressed::Copy => st
+                            .current
+                            .map(|rect| geometry::intersect(&rect, width, height))
+                            .and_then(validate)
+                            .map(|mut selection| {
+                                selection.action = match pressed {
+                                    Pressed::Copy => Action::Copy,
+                                    _ => Action::Save,
+                                };
+                                selection
+                            }),
+                    };
+                    return true;
+                }
+
+                // The stroke is finished before the drag is cleared, because the drag
+                // is what says a stroke was in progress.
+                if let Drag::Annotate { .. } = st.drag {
+                    if let Some(stroke) = st.drawing.take() {
+                        if stroke_worth_keeping(&stroke) {
+                            st.annotations.add(stroke);
+                        }
+                    }
+                }
                 st.drag = Drag::Idle;
                 st.active_cursor = match st.current {
                     Some(rect) => st.cursors.for_zone(geometry::zone_of(&rect, point)),
                     None => st.cursors.cross,
                 };
+                st.strip = strip_for(&st.canvas, st.current, &st.metrics);
 
                 let current_magnifier = panel_for(st, point);
                 invalidate_rects(
@@ -485,9 +922,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     &[st.current, previous_magnifier, Some(current_magnifier)],
                     DIRTY_PAD,
                 );
+                false
             });
             unsafe {
                 let _ = ReleaseCapture();
+            }
+            if close {
+                unsafe {
+                    let _ = DestroyWindow(hwnd);
+                }
             }
             LRESULT(0)
         }
@@ -506,16 +949,61 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
         WM_KEYDOWN => {
             let key = wparam.0 as u16;
-            if key == VK_ESCAPE.0 {
+            let control = key_down(VK_CONTROL);
+
+            if control && (key == b'Z' as u16 || key == b'Y' as u16) {
+                // `Ctrl+Y` as well as `Ctrl+Z`, because both are in use across Windows
+                // and there is no reason to make somebody guess which one this is.
+                let redo = key == b'Y' as u16 || shifted();
                 STATE.with(|slot| {
-                    if let Some(st) = slot.borrow_mut().as_mut() {
-                        st.result = None;
+                    let mut binding = slot.borrow_mut();
+                    let Some(st) = binding.as_mut() else {
+                        return;
+                    };
+                    if redo {
+                        st.annotations.redo();
+                    } else {
+                        st.annotations.undo();
                     }
+                    // The drawing is composed into the buffer, so the whole selection has
+                    // to be recomposed: there is no record of which pixels a removed
+                    // stroke touched.
+                    let selection = st.current;
+                    invalidate_rects(hwnd, &[selection], DIRTY_PAD);
                 });
-                unsafe {
-                    let _ = DestroyWindow(hwnd);
+                return LRESULT(0);
+            }
+
+            // Escape gives up the tool rather than the window while one is armed, so that
+            // the common case of "I did not mean to draw" does not throw away the region.
+            if key == VK_ESCAPE.0 {
+                let disarmed = STATE.with(|slot| {
+                    let mut binding = slot.borrow_mut();
+                    let Some(st) = binding.as_mut() else {
+                        return false;
+                    };
+                    st.drawing = None;
+                    if st.tool.draws() {
+                        st.tool = Tool::Move;
+                        st.active_cursor = st.cursors.size_all;
+                        return true;
+                    }
+                    st.result = None;
+                    false
+                });
+                if disarmed {
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                } else {
+                    unsafe {
+                        let _ = DestroyWindow(hwnd);
+                    }
                 }
-            } else if key == VK_RETURN.0 {
+                return LRESULT(0);
+            }
+
+            if key == VK_RETURN.0 {
                 let close = STATE.with(|slot| {
                     let mut binding = slot.borrow_mut();
                     let Some(st) = binding.as_mut() else {
@@ -537,16 +1025,83 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         let _ = DestroyWindow(hwnd);
                     }
                 }
-            } else if let Some(delta) = arrow_delta(key, if shifted() { 10 } else { 1 }) {
+                return LRESULT(0);
+            }
+
+            // The tools, by their first letter. Choosing one does not disturb the region
+            // or the drawing: only what the next press means.
+            let chosen = match key as u8 as char {
+                'S' | 's' => Some(Tool::Move),
+                'A' | 'a' => Some(Tool::Arrow),
+                'R' | 'r' => Some(Tool::Rectangle),
+                'E' | 'e' => Some(Tool::Ellipse),
+                'P' | 'p' => Some(Tool::Pencil),
+                _ => None,
+            };
+            if let Some(tool) = chosen {
                 STATE.with(|slot| {
                     let mut binding = slot.borrow_mut();
                     let Some(st) = binding.as_mut() else {
                         return;
                     };
+                    st.tool = tool;
+                    st.drawing = None;
+                    st.active_cursor = if tool.draws() {
+                        st.cursors.cross
+                    } else {
+                        st.cursors.size_all
+                    };
+                    // The strip draws the armed tool, so it has to be redrawn.
+                    let whole = st.canvas_bounds();
+                    invalidate_rects(hwnd, &[Some(whole)], 0);
+                });
+                return LRESULT(0);
+            }
+
+            if key as u8 as char == 'c' || key as u8 as char == 'C' {
+                STATE.with(|slot| {
+                    if let Some(st) = slot.borrow_mut().as_mut() {
+                        st.colour = st.colour.next();
+                        let whole = st.canvas_bounds();
+                        invalidate_rects(hwnd, &[Some(whole)], 0);
+                    }
+                });
+                return LRESULT(0);
+            }
+
+            if key == b'+' as u16 || key == b'=' as u16 || key == b'-' as u16 {
+                STATE.with(|slot| {
+                    if let Some(st) = slot.borrow_mut().as_mut() {
+                        st.thickness = if key == b'-' as u16 {
+                            st.thickness.saturating_sub(2).max(1)
+                        } else {
+                            (st.thickness + 2).min(MAX_THICKNESS)
+                        };
+                        let whole = st.canvas_bounds();
+                        invalidate_rects(hwnd, &[Some(whole)], 0);
+                    }
+                });
+                return LRESULT(0);
+            }
+
+            // The arrows nudge the region only while the region is what is being
+            // adjusted: with a drawing tool armed they would move the frame out from
+            // under the stroke that is about to be drawn on it.
+            if let Some(delta) = arrow_delta(key, if shifted() { 10 } else { 1 }) {
+                STATE.with(|slot| {
+                    let mut binding = slot.borrow_mut();
+                    let Some(st) = binding.as_mut() else {
+                        return;
+                    };
+                    if st.tool.draws() {
+                        return;
+                    }
                     let Some(nudged) = st.current.map(|rect| translate(&rect, delta)) else {
                         return;
                     };
                     let previous = st.current.replace(nudged);
+                    st.annotations = st.annotations.moved(delta.0, delta.1);
+                    st.strip = strip_for(&st.canvas, st.current, &st.metrics);
                     let magnifier = st.pointer.map(|p| panel_for(st, p));
                     invalidate_rects(hwnd, &[previous, Some(nudged), magnifier], DIRTY_PAD);
                 });
@@ -590,6 +1145,7 @@ fn validate(rect: RECT) -> Option<Selection> {
         y: rect.top,
         width: width as u32,
         height: height as u32,
+        action: Action::default(),
     })
 }
 
@@ -599,6 +1155,7 @@ fn full_screen(canvas: &canvas::Canvas) -> Selection {
         y: 0,
         width: canvas.width(),
         height: canvas.height(),
+        action: Action::default(),
     }
 }
 
@@ -616,19 +1173,65 @@ fn paint(window_dc: HDC, st: &State, invalid: &RECT) {
             SelectObject(mem, font);
         }
 
-        if let Some(rect) = st.current {
-            draw_border(mem, &rect, st.white, st.black);
-            if selection.is_some() {
-                draw_size_label(mem, &rect, st.label_bg);
-                // Handles are noise while the region is still being dragged out.
-                if !matches!(st.drag, Drag::Create { .. }) {
-                    draw_handles(mem, &rect, st.white, st.black);
+        // The drawing goes on after the bright copy of the capture and before the
+        // border, so a stroke can run right up to the edge without being cut by it. It
+        // is clipped to the selection first: a stroke that escaped would be drawn over
+        // the dimmed area outside, where nothing belongs.
+        if let Some(rect) = selection {
+            let bounds = draw::Bounds::from_selection(
+                rect.left,
+                rect.top,
+                (rect.right - rect.left) as u32,
+                (rect.bottom - rect.top) as u32,
+            );
+            let origin = (rect.left, rect.top);
+            let clip = unsafe { SaveDC(mem) };
+            if clip != 0 {
+                unsafe {
+                    IntersectClipRect(mem, rect.left, rect.top, rect.right, rect.bottom);
+                }
+                for stroke in st.annotations.strokes() {
+                    draw::draw_stroke(mem, stroke, &bounds, origin);
+                }
+                if let Some(stroke) = st.drawing.as_ref() {
+                    draw::draw_stroke(mem, stroke, &bounds, origin);
+                }
+                unsafe {
+                    let _ = RestoreDC(mem, clip);
                 }
             }
         }
+
+        if let Some(rect) = st.current {
+            draw_border(mem, &rect, st.white, st.black);
+            // The size lives on the strip now, so a separate floating label would say
+            // the same thing twice and cover the capture to do it.
+            if selection.is_some() && st.strip.is_none() {
+                draw_size_label(mem, &rect, st.label_bg);
+            }
+            // Handles are noise while the region is still being dragged out, and while a
+            // drawing tool is armed they would invite a resize that the next press would
+            // not do.
+            if !matches!(st.drag, Drag::Create { .. }) && !st.tool.draws() {
+                draw_handles(mem, &rect, st.white, st.black);
+            }
+        }
+
+        // The strip is drawn last so nothing lands on top of it, and only while the
+        // pointer is not drawing: it sits beside the region and would otherwise be
+        // repainted hundreds of times a second for nothing.
+        if let Some(placement) = st.strip {
+            if !matches!(st.drag, Drag::Annotate { .. }) {
+                draw_strip(mem, st, &placement);
+            }
+        }
+
         draw_pointer_marker(mem, st);
         draw_magnifier(mem, st);
-        draw_hint(mem, &st.canvas);
+        match st.strip {
+            Some(placement) => draw_keys_hint(mem, &placement, &st.canvas),
+            None => draw_hint(mem, &st.canvas),
+        }
 
         unsafe {
             let _ = RestoreDC(mem, saved);
@@ -636,6 +1239,24 @@ fn paint(window_dc: HDC, st: &State, invalid: &RECT) {
     }
 
     st.canvas.present(window_dc, invalid);
+}
+
+/// The strip, with the armed tool, the hovered button and the unavailable ones showing.
+fn draw_strip(hdc: HDC, st: &State, placement: &Placement) {
+    // The armed tool is highlighted, unless the pointer is over another button, in which
+    // case that one is: the highlight follows the pointer because that is what a press
+    // would act on.
+    let active = match st.hovered {
+        Some(button) => Some(button),
+        None if st.tool.draws() => Some(Button::Tool(st.tool)),
+        None => None,
+    };
+    let state = draw::StripState {
+        active,
+        can_undo: st.annotations.can_undo(),
+        can_redo: st.annotations.can_redo(),
+    };
+    draw::draw_strip(hdc, placement, &st.metrics, &state, st.plate, st.edge, st.face);
 }
 
 fn draw_border(hdc: HDC, rect: &RECT, white: HBRUSH, black: HBRUSH) {
@@ -820,6 +1441,24 @@ fn draw_hint(hdc: HDC, canvas: &canvas::Canvas) {
     let x = ((canvas.width() as i32 - width) / 2).max(0);
     let y = (canvas.height() as i32 - 40).max(0);
     draw_text(hdc, x, y, text);
+}
+
+/// A line under the strip listing the keys the strip cannot show.
+///
+/// The buttons carry the tools, so this only has to say what a button cannot: how to put
+/// the region back to being movable, and how to reach undo — the two things a person
+/// looks for first and would otherwise have to guess.
+fn draw_keys_hint(hdc: HDC, placement: &Placement, canvas: &canvas::Canvas) {
+    let text = "Esc: move again   -   Ctrl+Z: undo   -   Ctrl+Y: redo   -   C: colour   -   + -: width";
+    // Under the strip when there is room, above it otherwise, so it never lands on the
+    // selection it is describing.
+    let below = placement.y + placement.height as i32 + 4;
+    let y = if below + 18 <= canvas.height() as i32 {
+        below
+    } else {
+        (placement.y - 20).max(0)
+    };
+    draw_text(hdc, placement.x, y, text);
 }
 
 fn draw_text(hdc: HDC, x: i32, y: i32, text: &str) {

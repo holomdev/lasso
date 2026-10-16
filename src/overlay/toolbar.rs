@@ -58,24 +58,7 @@ impl Button {
 
     /// Whether a separator line goes above this button.
     pub fn starts_a_group(self) -> bool {
-        matches!(
-            self,
-            Button::Colour | Button::Undo | Button::Save
-        )
-    }
-
-    /// A short name, for a test failure to say which button it was about.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Button::Tool(tool) => tool.as_str(),
-            Button::Colour => "colour",
-            Button::Thickness => "thickness",
-            Button::Undo => "undo",
-            Button::Redo => "redo",
-            Button::Save => "save",
-            Button::Copy => "copy",
-            Button::Cancel => "cancel",
-        }
+        matches!(self, Button::Colour | Button::Undo | Button::Save)
     }
 }
 
@@ -618,10 +601,7 @@ mod tests {
     }
 
     #[test]
-    fn every_button_has_a_name_and_the_groups_start_where_they_should() {
-        for button in Button::ALL {
-            assert!(!button.as_str().is_empty(), "{button:?} has no name");
-        }
+    fn the_groups_start_where_they_should() {
         // The first button does not need a separator: it is already against the strip's
         // own top edge, and a line there would read as a border.
         assert!(

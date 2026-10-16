@@ -26,6 +26,11 @@ use windows::Win32::Graphics::Gdi::{
 use super::annotation::{Point, Shape, Stroke};
 use super::toolbar::{Button, Metrics, Placement};
 
+/// The colour a usable button's glyph is drawn in.
+const BUTTON_INK: COLORREF = COLORREF(0x00E0_E0E0);
+/// The colour of one that cannot be used: close to the plate, so it reads as unavailable.
+const DIM_INK: COLORREF = COLORREF(0x0070_7070);
+
 /// The narrowest a stroke is allowed to be drawn, so a set thickness of zero cannot
 /// produce a shape that is invisible and looks like nothing happened.
 const MIN_THICKNESS: i32 = 1;
@@ -219,19 +224,15 @@ fn draw_arrow(hdc: HDC, from: (i32, i32), to: (i32, i32), thickness: i32) {
 }
 
 /// Draw the strip: its plate, its separators, and every button.
-///
-/// `active` is the button that is currently doing something — the chosen tool, or a
-/// pressed action — and is drawn standing out so that the state is visible rather than
-/// remembered.
+/// Draw the strip: its plate, its separators, and every button.
 pub fn draw_strip(
     hdc: HDC,
     placement: &Placement,
     metrics: &Metrics,
-    active: Option<Button>,
+    state: &StripState,
     plate: windows::Win32::Graphics::Gdi::HBRUSH,
     edge: windows::Win32::Graphics::Gdi::HBRUSH,
     face: windows::Win32::Graphics::Gdi::HBRUSH,
-    _disabled: windows::Win32::Graphics::Gdi::HBRUSH,
 ) {
     let body = RECT {
         left: placement.x,
@@ -270,34 +271,70 @@ pub fn draw_strip(
             }
         }
 
-        if active == Some(button) {
+        if state.active == Some(button) {
             unsafe {
                 windows::Win32::Graphics::Gdi::FillRect(hdc, &rect, face);
                 windows::Win32::Graphics::Gdi::FrameRect(hdc, &rect, edge);
             }
         }
 
-        draw_button_glyph(hdc, button, &rect, edge);
+        // An unavailable button keeps its glyph, drawn in a colour close to the plate: it
+        // reads as present but not available, which is what it is. Hiding it would move
+        // every button below it and make the strip a different shape from one moment to
+        // the next.
+        let ink = if state.is_disabled(button) { DIM_INK } else { BUTTON_INK };
+        draw_button_glyph(hdc, button, &rect, ink);
+    }
+}
+
+/// What the strip should show as being in a particular state.
+///
+/// Passed as one value rather than as separate arguments because the drawing needs to
+/// know which button is armed, which is under the pointer, and which two are unavailable —
+/// and three positional arguments of which two are booleans is how they end up swapped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StripState {
+    /// The button to draw standing out: the armed tool, or whatever the pointer is over.
+    pub active: Option<Button>,
+    /// Whether there is anything for undo to take back.
+    pub can_undo: bool,
+    /// Whether there is anything for redo to put back.
+    pub can_redo: bool,
+}
+
+impl StripState {
+    /// Whether a button is drawn as unavailable.
+    ///
+    /// Undo and redo are the only two that can be, and they are worth showing: a person
+    /// who has just drawn something looks for undo, and seeing it greyed out before
+    /// anything is drawn says where it will be.
+    pub fn is_disabled(&self, button: Button) -> bool {
+        match button {
+            Button::Undo => !self.can_undo,
+            Button::Redo => !self.can_redo,
+            _ => false,
+        }
     }
 }
 
 /// A button's icon, drawn from lines so that it stays crisp at any scale.
-fn draw_button_glyph(
-    hdc: HDC,
-    button: Button,
-    rect: &RECT,
-    ink: windows::Win32::Graphics::Gdi::HBRUSH,
-) {
+///
+/// `ink` colours both the lines and, where a shape needs it, the fill. A button that
+/// cannot be used is drawn in a colour close to the plate: present, and visibly not
+/// available.
+fn draw_button_glyph(hdc: HDC, button: Button, rect: &RECT, ink: COLORREF) {
     let width = rect.right - rect.left;
     let height = rect.bottom - rect.top;
     let centre = (rect.left + width / 2, rect.top + height / 2);
     // A quarter of the button's side: big enough to read, small enough to leave the
     // padding that makes the strip look uncrowded.
     let arm = (width.min(height) / 4).max(2);
-    let pen = unsafe { CreatePen(PS_SOLID, 2, COLORREF(0x00E0_E0E0)) };
+    let pen = unsafe { CreatePen(PS_SOLID, 2, ink) };
     if pen.is_invalid() {
         return;
     }
+    // The same colour as a brush, for the two glyphs that are framed rather than stroked.
+    let brush = unsafe { CreateSolidBrush(ink) };
     let saved = unsafe { SelectObject(hdc, HGDIOBJ(pen.0)) };
 
     let line = |from: (i32, i32), to: (i32, i32)| unsafe {
@@ -416,7 +453,7 @@ fn draw_button_glyph(
                 bottom: centre.1 + arm + 1,
             };
             unsafe {
-                windows::Win32::Graphics::Gdi::FrameRect(hdc, &box_rect, ink);
+                windows::Win32::Graphics::Gdi::FrameRect(hdc, &box_rect, brush);
             }
             line((centre.0 - arm, centre.1 + arm), (centre.0 + arm, centre.1 - arm));
             line((centre.0 + arm, centre.1 - arm), (centre.0 + arm, centre.1));
@@ -430,7 +467,7 @@ fn draw_button_glyph(
                 bottom: centre.1 + arm + 1,
             };
             unsafe {
-                windows::Win32::Graphics::Gdi::FrameRect(hdc, &front, ink);
+                windows::Win32::Graphics::Gdi::FrameRect(hdc, &front, brush);
             }
             line((centre.0 - arm, centre.1 - arm), (centre.0 + arm - 2, centre.1 - arm));
             line((centre.0 - arm, centre.1 - arm), (centre.0 - arm, centre.1 + arm - 2));
@@ -876,16 +913,12 @@ mod tests {
         let plate = unsafe { CreateSolidBrush(COLORREF(0x0020_2020)) };
         let edge = unsafe { CreateSolidBrush(COLORREF(0x0060_6060)) };
         let face = unsafe { CreateSolidBrush(COLORREF(0x0040_4040)) };
-        draw_strip(
-            canvas.dc(),
-            &placement,
-            &metrics,
-            Some(Button::Tool(Tool::Arrow)),
-            plate,
-            edge,
-            face,
-            plate,
-        );
+        let state = StripState {
+            active: Some(Button::Tool(Tool::Arrow)),
+            can_undo: true,
+            can_redo: false,
+        };
+        draw_strip(canvas.dc(), &placement, &metrics, &state, plate, edge, face);
         unsafe {
             let _ = GdiFlush();
         }
@@ -919,7 +952,100 @@ mod tests {
             let _ = DeleteObject(HGDIOBJ(plate.0));
             let _ = DeleteObject(HGDIOBJ(edge.0));
             let _ = DeleteObject(HGDIOBJ(face.0));
-            let _ = GetStockObject(NULL_BRUSH);
         }
+    }
+
+    #[test]
+    fn an_unavailable_button_still_draws_something() {
+        // Undo starts unavailable, and it has to look like a button rather than a hole:
+        // hiding it would move every button below it, and the strip's shape would change
+        // from one moment to the next.
+        use crate::overlay::toolbar::{self, Button, Region};
+
+        let mut counts = Vec::new();
+        for (can_undo, can_redo) in [(false, false), (true, true)] {
+            let canvas = blank(300, 400);
+            let metrics = toolbar::Metrics::BASE;
+            let placement = toolbar::place(
+                Region {
+                    x: 150,
+                    y: 40,
+                    width: 120,
+                    height: 120,
+                },
+                300,
+                400,
+                &metrics,
+            );
+            let plate = unsafe { CreateSolidBrush(COLORREF(0x0020_2020)) };
+            let edge = unsafe { CreateSolidBrush(COLORREF(0x0060_6060)) };
+            let face = unsafe { CreateSolidBrush(COLORREF(0x0040_4040)) };
+            draw_strip(
+                canvas.dc(),
+                &placement,
+                &metrics,
+                &StripState {
+                    active: None,
+                    can_undo,
+                    can_redo,
+                },
+                plate,
+                edge,
+                face,
+            );
+            unsafe {
+                let _ = GdiFlush();
+            }
+
+            // Counted by the ink's own colour. Counting "anything other than the plate"
+            // was the first version of this, and it proved nothing: both inks differ from
+            // the plate, so both states came out with the same number and the test passed
+            // without telling them apart.
+            let (button, x, y, w, h) = metrics
+                .button_rects()
+                .into_iter()
+                .find(|(b, _, _, _, _)| *b == Button::Undo)
+                .expect("undo is always in the strip");
+            let rect = RECT {
+                left: placement.x + x,
+                top: placement.y + y,
+                right: placement.x + x + w as i32,
+                bottom: placement.y + y + h as i32,
+            };
+            let wanted = if can_undo { BUTTON_INK } else { DIM_INK };
+            // `COLORREF` is 0x00BBGGRR, and the DIB holds BGRA.
+            let want = (
+                (wanted.0 & 0xFF) as u8,
+                ((wanted.0 >> 8) & 0xFF) as u8,
+                ((wanted.0 >> 16) & 0xFF) as u8,
+            );
+            let mut matching = 0;
+            for py in rect.top..rect.bottom {
+                for px in rect.left..rect.right {
+                    if pixel(&canvas, px, py) == want {
+                        matching += 1;
+                    }
+                }
+            }
+            counts.push((button, matching));
+
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(plate.0));
+                let _ = DeleteObject(HGDIOBJ(edge.0));
+                let _ = DeleteObject(HGDIOBJ(face.0));
+            }
+        }
+
+        let (button, unavailable) = counts[0];
+        let (_, available) = counts[1];
+        assert!(
+            unavailable > 0,
+            "{button:?} drew nothing in the dim ink, so it looks like a hole rather than \
+             a button that cannot be used"
+        );
+        assert!(
+            available > 0,
+            "{button:?} drew nothing in the bright ink while it could be used"
+        );
     }
 }

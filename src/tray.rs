@@ -522,16 +522,31 @@ fn select_region() -> Result<()> {
     // The overlay is given the capture without the pointer: it draws its own
     // crosshair, and the magnifier has to show the pixels underneath, which is
     // what placing an edge precisely depends on.
-    let mut frame = capture::capture_virtual_desktop(None)?;
-    let Some(selection) = overlay::select_region(&frame)? else {
+    let frame = capture::capture_virtual_desktop(None)?;
+    let Some(composed) = overlay::select_region(&frame)? else {
         return Ok(());
     };
-    // What is published is the pointer as it was when the capture was taken, not
-    // where it is now: by this point it is wherever the drag left it.
+
+    // The capture with the annotations already drawn on it. The frame the overlay was
+    // given has never seen a stroke, so publishing that would quietly drop the drawing.
+    let selection = composed.selection;
+    let mut pixels = composed.bgra;
+
+    // What is published is the pointer as it was when the capture was taken, not where it
+    // is now: by this point it is wherever the drag left it. It goes on the composed
+    // pixels, which already carry the annotations.
     if settings.cursor {
-        capture::cursor::compose(&mut frame.bgra, frame.width, frame.height, frame.origin);
+        capture::cursor::compose(&mut pixels, composed.width, composed.height, frame.origin);
     }
-    publish(&frame, Some(selection))
+
+    let composed_frame = capture::Frame {
+        bgra: pixels,
+        width: composed.width,
+        height: composed.height,
+        origin: frame.origin,
+        backend: frame.backend,
+    };
+    publish(&composed_frame, Some(selection))
 }
 
 /// Send a capture wherever the settings ask for.
