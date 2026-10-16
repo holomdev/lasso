@@ -32,8 +32,18 @@
 //! held by [`canvas::Canvas`] and the result reaches the window with a single
 //! blit, so a drag never shows half-drawn frames.
 
+// Both of these are complete and tested on their own, and neither is wired into the
+// overlay yet: the drawing and the input handling that use them are the next step.
+//
+// The allowance is here rather than inside each module so that it is one line to delete
+// and one place to look, and so that deleting it is what reports the job as finished.
+// Nothing else in the program is allowed to go unused like this.
+#[allow(dead_code)]
+pub mod annotation;
 mod canvas;
 mod geometry;
+#[allow(dead_code)]
+pub mod toolbar;
 
 use std::cell::RefCell;
 
