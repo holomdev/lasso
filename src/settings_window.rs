@@ -56,6 +56,7 @@ use crate::settings::{Settings, TrayClick};
 /// the two is noise for six constants. Every value is the one the headers define.
 const BS_AUTOCHECKBOX: u32 = 0x0000_0003;
 const BS_PUSHBUTTON: u32 = 0x0000_0000;
+const BS_DEFPUSHBUTTON: u32 = 0x0000_0001;
 const ES_AUTOHSCROLL: u32 = 0x0000_0080;
 const ES_READONLY: u32 = 0x0000_0800;
 const SS_LEFT: u32 = 0x0000_0000;
@@ -83,8 +84,11 @@ const ID_BROWSE: i32 = 105;
 const ID_OUTPUT_HINT: i32 = 106;
 const ID_TRAY_CLICK: i32 = 107;
 const ID_TRAY_CLICK_HINT: i32 = 108;
-const ID_SAVE: i32 = 109;
-const ID_CANCEL: i32 = 110;
+/// The two buttons use the identifiers Windows treats as OK and Cancel, so the
+/// standard dialog keyboard handling — Enter on the default button, Escape to
+/// close — produces the messages this window already understands.
+const ID_SAVE: i32 = 1;
+const ID_CANCEL: i32 = 2;
 
 /// What the window says.
 const HOTKEY_HINT: &str = "Click the field and press a combination. A modifier is required.";
@@ -240,9 +244,19 @@ pub fn open(owner: HWND, current: &Settings) -> Result<Option<Settings>> {
     // ends on the flag the window sets when it is destroyed.
     let mut message = MSG::default();
     while unsafe { GetMessageW(&mut message, None, 0, 0) }.as_bool() {
-        unsafe {
-            let _ = TranslateMessage(&message);
-            DispatchMessageW(&message);
+        // Tab between the controls, Enter on the default button and Escape to
+        // close all come from here: a plain window has none of them by itself,
+        // and a settings window without them feels wrong to anyone who reaches
+        // for the keyboard.
+        let handled = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::IsDialogMessageW(window, &message)
+        }
+        .as_bool();
+        if !handled {
+            unsafe {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
         }
         if with_state(|state| state.done).unwrap_or(true) {
             break;
@@ -367,7 +381,7 @@ fn build_controls(window: HWND, instance: HINSTANCE) -> Result<()> {
         window,
         w!("BUTTON"),
         "Save",
-        BS_PUSHBUTTON | WS_TABSTOP.0,
+        BS_DEFPUSHBUTTON | WS_TABSTOP.0,
         ID_SAVE,
         (CLIENT_WIDTH - PAD - BUTTON_WIDTH * 2 - 8, CLIENT_HEIGHT - PAD - 26, BUTTON_WIDTH, 26),
         instance,
