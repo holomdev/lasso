@@ -57,7 +57,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_SHOW, SW_SHOWNA, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
     SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE,
-    WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN, WM_NCDESTROY, WM_SETFONT,
+    WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN, WM_NCDESTROY, WM_SETFONT,
     WM_SYSKEYDOWN,
     WNDCLASSW, WNDPROC, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE,
     WS_EX_DLGMODALFRAME, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
@@ -215,10 +215,11 @@ struct State {
     /// The font every control is drawn with, sized for the display the window is
     /// on. Owned here, so it is released exactly once.
     font: HGDIOBJ,
-    /// The brush the labels are painted with, built from the same system colour
-    /// the window class names as its background. Owned here, so a label repainting
-    /// does not create a brush every time and the whole lot is released once.
-    label_brush: HBRUSH,
+    /// The brush the group frames are given, built from the same system colour the
+    /// window class names as its background. A frame is a button, and this is what
+    /// it fills the gap behind its caption with. Owned here, so a frame repainting
+    /// does not create a brush every time.
+    page_brush: HBRUSH,
     /// The brush the fields are painted with: `COLOR_WINDOW`, which is white, so a
     /// field reads as somewhere to type rather than as part of the page.
     window_brush: HBRUSH,
@@ -304,19 +305,12 @@ pub fn open(owner: HWND, current: &Settings, dpi: Option<u32>) -> Result<Option<
     let font = create_font(ui_layout::factor(dpi));
     let layout = layout_for(dpi, font);
 
-    // The brush the labels ask for, from the same system colour the window class
-    // names as its background.
-    let label_brush = unsafe { CreateSolidBrush(COLORREF(GetSysColor(COLOR_BTNFACE))) };
+    // The brush a group frame fills the gap behind its caption with, from the same
+    // system colour the window class names as its background. Labels are handed no
+    // brush at all, which is a decision rather than an omission: see
+    // `WM_CTLCOLORSTATIC`.
+    let page_brush = unsafe { CreateSolidBrush(COLORREF(GetSysColor(COLOR_BTNFACE))) };
     let window_brush = unsafe { CreateSolidBrush(COLORREF(GetSysColor(COLOR_WINDOW))) };
-    if std::env::var_os("LASSO_TRACE_LAYOUT").is_some() {
-        eprintln!(
-            "[brush] label={:p} from COLOR_BTNFACE={:#010x}  window={:p} from COLOR_WINDOW={:#010x}",
-            label_brush.0,
-            unsafe { GetSysColor(COLOR_BTNFACE) },
-            window_brush.0,
-            unsafe { GetSysColor(COLOR_WINDOW) },
-        );
-    }
 
     // The size given to CreateWindowExW covers the whole window, caption and
     // frame included, while the layout is written in client coordinates. Turning
@@ -347,7 +341,7 @@ pub fn open(owner: HWND, current: &Settings, dpi: Option<u32>) -> Result<Option<
         Err(err) => {
             unsafe {
                 let _ = DeleteObject(font);
-                let _ = DeleteObject(HGDIOBJ(label_brush.0));
+                let _ = DeleteObject(HGDIOBJ(page_brush.0));
                 let _ = DeleteObject(HGDIOBJ(window_brush.0));
             }
             return Err(err).context("could not create the settings window");
@@ -363,7 +357,7 @@ pub fn open(owner: HWND, current: &Settings, dpi: Option<u32>) -> Result<Option<
             instance,
             controls: Controls::default(),
             font,
-            label_brush,
+            page_brush,
             window_brush,
             layout,
             hotkey: Some(current.hotkey),
@@ -460,15 +454,14 @@ pub fn open(owner: HWND, current: &Settings, dpi: Option<u32>) -> Result<Option<
 /// window cannot leave a font behind, and a window that closed itself cannot
 /// leave `open` waiting on a message loop that will never end.
 fn abandon(window: HWND) {
-    let (font, label_brush, window_brush) =
-        with_state(|state| (state.font, state.label_brush, state.window_brush))
-            .unwrap_or_default();
+    let (font, page_brush, window_brush) =
+        with_state(|state| (state.font, state.page_brush, state.window_brush)).unwrap_or_default();
     if !font.is_invalid() {
         unsafe {
             let _ = DeleteObject(font);
         }
     }
-    for brush in [label_brush, window_brush] {
+    for brush in [page_brush, window_brush] {
         if !brush.is_invalid() {
             unsafe {
                 let _ = DeleteObject(HGDIOBJ(brush.0));
@@ -1371,6 +1364,22 @@ unsafe extern "system" fn window_proc(
         }
 
         WM_NCDESTROY => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+
+        // A group frame is a button, and a button is supposed to ask for its colour
+        // here rather than through `WM_CTLCOLORSTATIC`. It is answered with the
+        // page's own colour, and **the answer does not take**: measured against a
+        // capture, the caption's background is `COLOR_WINDOW` white whether this
+        // message is handled or falls through to `DefWindowProcW`. The themed group
+        // box paints its caption itself. It is handled anyway, because it is the
+        // documented answer and costs nothing, but it is not what fixes the
+        // caption - nothing in this window does.
+        WM_CTLCOLORBTN => {
+            let page_brush = with_state(|state| state.page_brush).unwrap_or_default();
+            if page_brush.is_invalid() {
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            }
+            LRESULT(page_brush.0 as isize)
+        }
 
         // A label and a field ask the same question through the same message, and
         // they want opposite answers. A label belongs to the page and is painted

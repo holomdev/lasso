@@ -343,12 +343,33 @@ Windows SDK's resource compiler over it.
 
 Without it Windows hands the process the **version 5 common controls**, drawn in
 the classic style from before Windows XP, and scales the program itself. That is
-not only a matter of taste, and it is why the manifest is not optional: the classic
-group box fills the gap it makes for its own caption in `COLOR_WINDOW`, inside its
-own painting code, so the parent's answer to `WM_CTLCOLORSTATIC` cannot change it.
-Every group caption sat on a white patch on a grey page for as long as the
-executable had no manifest, and no amount of colour handling in the window could
-fix it. Version 6 draws the caption on the page's own colour.
+not only a matter of taste: the classic group box fills the gap it makes for its
+own caption in `COLOR_WINDOW`, inside its own painting code, so the parent's answer
+to `WM_CTLCOLORSTATIC` cannot change it. Version 6 draws the caption on the page's
+own colour, which is what the manifest is for.
+
+The version 6 common controls are also what gives the window its check boxes, its
+themed field and its default button. The layout is unaffected.
+
+### Known shortcoming: the group frames' background
+
+The four group frames still stand on a `COLOR_WINDOW` white background instead of
+the page's `COLOR_BTNFACE` grey, so each is a white panel on a grey page. The
+captions themselves are drawn correctly by the version 6 group box, on the page's
+colour; it is the panel around them that is white.
+
+This is not a colour this window can choose. It has been answered with
+`WM_CTLCOLORSTATIC` returning the page's brush, with a null brush, and with
+`WM_CTLCOLORBTN` returning the page's brush, and a capture measures the caption's
+background as white in every case. A deliberately wrong colour in the same place
+reaches the frame and not the caption, which is what established that the painting
+happens where no message of ours arrives.
+
+What remains is to stop using `BS_GROUPBOX` and draw the frames as this window's
+own controls — an etched frame with a caption of its own laid over its top edge —
+which puts the colour entirely in this window's hands. An attempt at that is not in
+the tree: it was reverted rather than committed, because the captions were
+positioned wrongly and the result was worse than the white it would have fixed.
 
 The DPI awareness is declared there as well, next to the call the program already
 makes before any window exists.
