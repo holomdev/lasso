@@ -200,6 +200,12 @@ tools/
 
 ## Implementation notes
 
+Most of what is below was learned by getting it wrong first. The parts of it that
+are true of any Windows application rather than of this one are collected in
+[`docs/windows-app-checklist.md`](docs/windows-app-checklist.md), which is written to
+be carried to another project: the manifest, DPI, layout arithmetic, colour handling,
+and the verification process that found the defects in all four.
+
 ### Desktop Duplication pitfalls
 
 Two behaviours cost real debugging time and are handled explicitly in
