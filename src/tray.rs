@@ -231,6 +231,20 @@ pub fn run(hotkey_override: Option<hotkey::Hotkey>) -> Result<()> {
     Ok(())
 }
 
+/// Hide the console when this process owns it.
+///
+/// For the commands that put a window on screen: a console left behind a window
+/// looks unfinished, and the commands themselves are the feedback.
+///
+/// A console shared with a shell belongs to that shell, so hiding it would make
+/// the user's own terminal window disappear, and running the program from a
+/// terminal is an ordinary thing to do.
+pub(crate) fn hide_console_if_owned() {
+    if owns_console() {
+        hide_console();
+    }
+}
+
 /// Hide the console window the executable was started with.
 ///
 /// A process without its own console, which is what a build with the windows

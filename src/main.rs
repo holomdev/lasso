@@ -88,6 +88,8 @@ fn main() -> Result<()> {
         }
         "settings" => cmd_settings(),
         "about" => {
+            // The dialog is the feedback, so the console does not need to show.
+            tray::hide_console_if_owned();
             tray::show_about(HWND::default());
             Ok(())
         }
@@ -165,6 +167,9 @@ fn ensure_parent(path: &str) -> Result<()> {
 /// machine whose notification area is unavailable still has to be configurable,
 /// and this is also what a shortcut or a script would call.
 fn cmd_settings() -> Result<()> {
+    // The window is the feedback, so the console does not need to be on screen.
+    tray::hide_console_if_owned();
+
     let current = settings::Settings::load();
 
     // No owner window, because there is no tray window to be modal to here.
