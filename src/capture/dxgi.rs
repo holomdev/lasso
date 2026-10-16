@@ -31,12 +31,16 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
     D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION_ROTATE180, DXGI_MODE_ROTATION_ROTATE270,
+    DXGI_MODE_ROTATION_ROTATE90,
+};
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIAdapter, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
-    IDXGIResource, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+    CreateDXGIFactory1, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, IDXGIAdapter,
+    IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIResource,
 };
 
+use super::rotation::{self, Rotation};
 use super::{Backend, Frame};
 
 /// How many times `AcquireNextFrame` is retried before giving up.
@@ -125,7 +129,8 @@ unsafe fn duplicate_into(
                 .context("IDXGIOutput1::DuplicateOutput failed")?
         };
 
-        let mode = duplication.GetDesc().ModeDesc;
+        let duplicated = duplication.GetDesc();
+        let mode = duplicated.ModeDesc;
         if mode.Width == 0 || mode.Height == 0 {
             bail!("the output reports a zero size");
         }
@@ -139,6 +144,28 @@ unsafe fn duplicate_into(
 
         let src_w = mode.Width;
         let src_h = mode.Height;
+
+        // How this output is turned. Duplication reports it beside the mode, which is
+        // the one place it is available without matching display device names.
+        //
+        // `LASSO_FORCE_ROTATION` overrides it, because a development machine has no
+        // turned display to exercise this on. It is an environment variable rather than
+        // a flag for that reason: forcing a rotation on a display that is not turned
+        // gives a wrong capture, which is not something to offer as a feature.
+        let reported = match duplicated.Rotation {
+            DXGI_MODE_ROTATION_ROTATE90 => Rotation::Rotate90,
+            DXGI_MODE_ROTATION_ROTATE180 => Rotation::Rotate180,
+            DXGI_MODE_ROTATION_ROTATE270 => Rotation::Rotate270,
+            _ => Rotation::Identity,
+        };
+        let rotation = rotation::forced_by_environment().unwrap_or(reported);
+        if rotation != reported {
+            eprintln!(
+                "[capture] DXGI: pretending the output is turned {} instead of {}",
+                describe(rotation),
+                describe(reported)
+            );
+        }
 
         // Build the staging texture once per output.
         let mut desc = D3D11_TEXTURE2D_DESC::default();
@@ -228,6 +255,7 @@ unsafe fn duplicate_into(
             pitch,
             src_w,
             src_h,
+            rotation,
             output_desc.DesktopCoordinates.left,
             output_desc.DesktopCoordinates.top,
             vx,
@@ -236,6 +264,19 @@ unsafe fn duplicate_into(
             vh,
             canvas,
         )
+    }
+}
+
+/// A rotation's name, for the message the override prints.
+fn describe(rotation: Rotation) -> &'static str {
+    match rotation {
+        Rotation::Identity => "no turn",
+        Rotation::Rotate90 => "90",
+        Rotation::Rotate180 => "180",
+        Rotation::Rotate270 => "270",
+        Rotation::Rotate90Mirrored => "90 mirrored",
+        Rotation::Rotate180Mirrored => "180 mirrored",
+        Rotation::Rotate270Mirrored => "270 mirrored",
     }
 }
 
@@ -323,14 +364,25 @@ unsafe fn read_back(
     }
 }
 
-/// Copy one monitor's frame onto the virtual-desktop canvas, clipping whatever
-/// falls outside and never overflowing the buffer.
+/// Copy one monitor's frame onto the virtual-desktop canvas, clipping whatever falls
+/// outside and never overflowing the buffer.
+///
+/// When the monitor is turned, the frame is not in the canvas's orientation: output
+/// duplication hands back the mode's own shape, and the monitor's rectangle on the
+/// desktop is its transpose. The pixels are therefore taken through
+/// [`rotation::source_for`] rather than straight across.
+///
+/// The mapping is a rearrangement — every image pixel is used exactly once — which is
+/// what makes it safe to write into the canvas pixel by pixel without a scratch copy.
+/// When the monitor is not turned the mapping is the identity, and the straight row
+/// copy is used instead, because that is the common case and it is much faster.
 #[allow(clippy::too_many_arguments)]
 fn composite(
     pixels: &[u8],
     pitch: u32,
-    src_w: u32,
-    src_h: u32,
+    image_w: u32,
+    image_h: u32,
+    rotation: rotation::Rotation,
     left: i32,
     top: i32,
     vx: i32,
@@ -339,35 +391,70 @@ fn composite(
     vh: u32,
     canvas: &mut [u8],
 ) -> Result<()> {
+    // What the monitor occupies on the desktop: the image's shape, transposed when the
+    // monitor is on its side.
+    let (rect_w, rect_h) = if rotation.swaps_axes() {
+        (image_h, image_w)
+    } else {
+        (image_w, image_h)
+    };
+
     // Destination in canvas coordinates.
     let dx = left - vx;
     let dy = top - vy;
 
-    // Range of source rows/columns that lands inside the canvas.
+    // Range of the rectangle that lands inside the canvas.
     let x0 = dx.max(0);
     let y0 = dy.max(0);
-    let x1 = (dx + src_w as i32).min(vw as i32);
-    let y1 = (dy + src_h as i32).min(vh as i32);
+    let x1 = (dx + rect_w as i32).min(vw as i32);
+    let y1 = (dy + rect_h as i32).min(vh as i32);
     if x1 <= x0 || y1 <= y0 {
         return Ok(()); // monitor entirely outside the canvas
     }
 
-    let rows = (y1 - y0) as usize;
-    let cols_bytes = ((x1 - x0) as usize) * 4;
     let dst_stride = (vw as usize) * 4;
     let src_stride = if pitch == 0 {
-        (src_w as usize) * 4
+        (image_w as usize) * 4
     } else {
         pitch as usize
     };
 
-    for row in 0..rows {
-        let sy = (y0 - dy) as usize + row;
-        let sx = (x0 - dx) as usize;
-        let src_off = sy * src_stride + sx * 4;
-        let dst_off = ((y0 as usize) + row) * dst_stride + (x0 as usize) * 4;
-        canvas[dst_off..dst_off + cols_bytes]
-            .copy_from_slice(&pixels[src_off..src_off + cols_bytes]);
+    if rotation == rotation::Rotation::Identity {
+        let rows = (y1 - y0) as usize;
+        let cols_bytes = ((x1 - x0) as usize) * 4;
+        for row in 0..rows {
+            let sy = (y0 - dy) as usize + row;
+            let sx = (x0 - dx) as usize;
+            let src_off = sy * src_stride + sx * 4;
+            let dst_off = ((y0 as usize) + row) * dst_stride + (x0 as usize) * 4;
+            canvas[dst_off..dst_off + cols_bytes]
+                .copy_from_slice(&pixels[src_off..src_off + cols_bytes]);
+        }
+        return Ok(());
+    }
+
+    // Turned: ask the mapping where each canvas pixel comes from. `source_for` is
+    // given the image's dimensions and the position **within the rectangle**, which is
+    // what the canvas walk gives once the rectangle's origin is taken off.
+    let limit = pixels.len();
+    for canvas_y in y0..y1 {
+        let row_in_rectangle = canvas_y - dy;
+        let dst_row = (canvas_y as usize) * dst_stride;
+        for canvas_x in x0..x1 {
+            let column_in_rectangle = canvas_x - dx;
+            let (sx, sy) = rotation::source_for(
+                rotation,
+                column_in_rectangle,
+                row_in_rectangle,
+                image_w,
+                image_h,
+            );
+            let src_off = sy as usize * src_stride + sx as usize * 4;
+            let dst_off = dst_row + canvas_x as usize * 4;
+            if src_off + 4 <= limit && dst_off + 4 <= canvas.len() {
+                canvas[dst_off..dst_off + 4].copy_from_slice(&pixels[src_off..src_off + 4]);
+            }
+        }
     }
     Ok(())
 }

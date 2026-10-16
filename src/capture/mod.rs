@@ -18,6 +18,7 @@
 
 pub mod cursor;
 pub mod dxgi;
+pub mod rotation;
 pub mod gdi;
 
 use anyhow::{bail, Result};
