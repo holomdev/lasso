@@ -305,6 +305,23 @@ sampling described above.
   separately.
 - The tray icon needs a working notification area. Without one the resident mode
   falls back to the hotkey alone.
+- A binary carrying a `Low` mandatory integrity label can never show a tray icon.
+  Windows applies the label of a file to the process started from it, and a
+  low-integrity process cannot send messages to the higher-integrity window that
+  owns the notification area, so `Shell_NotifyIcon` fails with
+  `ERROR_ACCESS_DENIED` (5) however the program is started and by whomever — the
+  program runs, the hotkey works, and no icon ever appears. This is not
+  hypothetical: it is how it was found, after every launch context had been ruled
+  out, because the directory the code was built in carried that label.
+  `tools/build.ps1` keeps the output out of any labelled directory and reports
+  whether the binary it produced carries a label. To check one by hand:
+
+  ```powershell
+  icacls lasso.exe | findstr Mandatory
+  ```
+
+  An installation should place the binary somewhere ordinary, such as
+  `%LOCALAPPDATA%\Programs\lasso\`, for the same reason.
 - Screen rotation is not handled.
 - Only `DXGI_FORMAT_B8G8R8A8_UNORM` is accepted; any other format fails
   explicitly and the caller falls back to GDI rather than returning a black
