@@ -51,8 +51,20 @@ cursor happens to be drawn.
 
 ## Build and run
 
+Build through the script, which keeps the output out of any directory carrying an
+integrity label and reports whether the binary it produced carries one:
+
 ```powershell
-cargo build
+.\tools\build.ps1                 # -Release to optimise, -Run to start it
+```
+
+Plain `cargo build` works as well, but the binary then lands inside this project
+directory — and if that directory carries a `Low` integrity label, so does the
+binary. The command-line commands below behave normally either way, while the
+resident mode would never show an icon. The last item under Known limitations
+explains why, and what the script does about it.
+
+```powershell
 cargo run -- monitors
 cargo run -- capture
 cargo run -- select
