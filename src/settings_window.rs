@@ -33,12 +33,11 @@ use windows::Win32::Foundation::{
     COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    CLIP_DEFAULT_PRECIS, COLOR_BTNFACE, CreateCompatibleDC, CreateFontW, DEFAULT_CHARSET,
-    CreateSolidBrush, DEFAULT_GUI_FONT, DEFAULT_PITCH, DEFAULT_QUALITY, DeleteDC, DeleteObject,
-    FF_DONTCARE, GetObjectW, GetStockObject, GetSysColor, GetTextExtentPoint32W, HBRUSH, HDC, HGDIOBJ,
-    InvalidateRect, LOGFONTW,
-    OUT_DEFAULT_PRECIS, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow,
-    SelectObject, SetBkColor, SetBkMode, TRANSPARENT,
+    CLIP_DEFAULT_PRECIS, COLOR_BTNFACE, COLOR_WINDOW, CreateCompatibleDC, CreateFontW, CreateSolidBrush,
+    DEFAULT_CHARSET, DEFAULT_GUI_FONT, DEFAULT_PITCH, DEFAULT_QUALITY, DeleteDC, DeleteObject,
+    FF_DONTCARE, GetObjectW, GetStockObject, GetSysColor, GetTextExtentPoint32W, HBRUSH, HGDIOBJ,
+    InvalidateRect, LOGFONTW, OUT_DEFAULT_PRECIS, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE,
+    RDW_UPDATENOW, RedrawWindow, SelectObject,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
@@ -53,14 +52,14 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, BeginDeferWindowPos, CallWindowProcW, CreateWindowExW, DefWindowProcW,
     DeferWindowPos, DestroyWindow, DispatchMessageW, EndDeferWindowPos, GWLP_WNDPROC, GetMessageW,
-    GetSystemMetrics, GetWindowRect, GetWindowTextW, HDWP, HMENU, HWND_TOP, IsDialogMessageW, MSG,
+    GetClassNameW, GetSystemMetrics, GetWindowRect, GetWindowTextW, HDWP, HMENU, HWND_TOP, IsDialogMessageW, MSG,
     RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_SHOW, SW_SHOWNA, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
     SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE,
     WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN, WM_NCDESTROY, WM_SETFONT,
     WM_SYSKEYDOWN,
-    WNDCLASSW, WNDPROC, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_DLGMODALFRAME,
-    WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    WNDCLASSW, WNDPROC, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CLIENTEDGE,
+    WS_EX_DLGMODALFRAME, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -215,17 +214,13 @@ struct State {
     /// The font every control is drawn with, sized for the display the window is
     /// on. Owned here, so it is released exactly once.
     font: HGDIOBJ,
-    /// The brush the labels and the read-only fields are painted with.
-    ///
-    /// Both are `STATIC`-like controls: a static, and an edit that is read-only,
-    /// which Windows draws with the same message. Left alone they paint themselves
-    /// on `COLOR_WINDOW`, so they come out white while the window around them is
-    /// `COLOR_BTNFACE` grey, and a row of white boxes with grey gaps between them
-    /// reads as an unfinished window. Painting them in the window's own colour is
-    /// what makes the page one surface.
-    ///
-    /// Owned here, so it is released exactly once.
-    field_brush: HBRUSH,
+    /// The brush the labels are painted with, built from the same system colour
+    /// the window class names as its background. Owned here, so a label repainting
+    /// does not create a brush every time and the whole lot is released once.
+    label_brush: HBRUSH,
+    /// The brush the fields are painted with: `COLOR_WINDOW`, which is white, so a
+    /// field reads as somewhere to type rather than as part of the page.
+    window_brush: HBRUSH,
     layout: Layout,
     /// The combination the field holds. Never `None` in practice: the window
     /// refuses to save without one, because the settings model requires it.
@@ -308,12 +303,10 @@ pub fn open(owner: HWND, current: &Settings, dpi: Option<u32>) -> Result<Option<
     let font = create_font(ui_layout::factor(dpi));
     let layout = layout_for(dpi, font);
 
-    // The brush the labels and the read-only fields are painted with. It is built
-    // from the same system colour the window class names as its background, so the
-    // page and the boxes on it are one surface. Built here rather than fetched as a
-    // stock object because the stock brushes are indexed by kind and there is no
-    // stock brush for a system colour.
-    let field_brush = unsafe { CreateSolidBrush(COLORREF(GetSysColor(COLOR_BTNFACE))) };
+    // The brush the labels ask for, from the same system colour the window class
+    // names as its background.
+    let label_brush = unsafe { CreateSolidBrush(COLORREF(GetSysColor(COLOR_BTNFACE))) };
+    let window_brush = unsafe { CreateSolidBrush(COLORREF(GetSysColor(COLOR_WINDOW))) };
 
     // The size given to CreateWindowExW covers the whole window, caption and
     // frame included, while the layout is written in client coordinates. Turning
@@ -344,7 +337,8 @@ pub fn open(owner: HWND, current: &Settings, dpi: Option<u32>) -> Result<Option<
         Err(err) => {
             unsafe {
                 let _ = DeleteObject(font);
-                let _ = DeleteObject(HGDIOBJ(field_brush.0));
+                let _ = DeleteObject(HGDIOBJ(label_brush.0));
+                let _ = DeleteObject(HGDIOBJ(window_brush.0));
             }
             return Err(err).context("could not create the settings window");
         }
@@ -359,7 +353,8 @@ pub fn open(owner: HWND, current: &Settings, dpi: Option<u32>) -> Result<Option<
             instance,
             controls: Controls::default(),
             font,
-            field_brush,
+            label_brush,
+            window_brush,
             layout,
             hotkey: Some(current.hotkey),
             tray_left_click: current.tray_left_click,
@@ -441,16 +436,19 @@ pub fn open(owner: HWND, current: &Settings, dpi: Option<u32>) -> Result<Option<
 /// window cannot leave a font behind, and a window that closed itself cannot
 /// leave `open` waiting on a message loop that will never end.
 fn abandon(window: HWND) {
-    let (font, field_brush) =
-        with_state(|state| (state.font, state.field_brush)).unwrap_or_default();
+    let (font, label_brush, window_brush) =
+        with_state(|state| (state.font, state.label_brush, state.window_brush))
+            .unwrap_or_default();
     if !font.is_invalid() {
         unsafe {
             let _ = DeleteObject(font);
         }
     }
-    if !field_brush.is_invalid() {
-        unsafe {
-            let _ = DeleteObject(HGDIOBJ(field_brush.0));
+    for brush in [label_brush, window_brush] {
+        if !brush.is_invalid() {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(brush.0));
+            }
         }
     }
     if !window.is_invalid() {
@@ -633,6 +631,7 @@ fn build_controls() -> Result<()> {
         w!("STATIC"),
         "Hotkey",
         SS_RIGHT,
+        Default::default(),
         -1,
         layout.label(top),
         instance,
@@ -642,6 +641,7 @@ fn build_controls() -> Result<()> {
         w!("EDIT"),
         "",
         ES_READONLY | ES_AUTOHSCROLL,
+        WS_EX_CLIENTEDGE,
         ID_HOTKEY,
         layout.field(top, layout.field_width),
         instance,
@@ -651,6 +651,7 @@ fn build_controls() -> Result<()> {
         w!("STATIC"),
         HOTKEY_HINT,
         SS_LEFT,
+        Default::default(),
         ID_HOTKEY_HINT,
         layout.hint(top),
         instance,
@@ -663,6 +664,7 @@ fn build_controls() -> Result<()> {
         w!("BUTTON"),
         "Copy each capture to the clipboard",
         BS_AUTOCHECKBOX | WS_TABSTOP.0,
+        Default::default(),
         ID_CLIPBOARD,
         clipboard_rect,
         instance,
@@ -672,6 +674,7 @@ fn build_controls() -> Result<()> {
         w!("BUTTON"),
         "Draw the mouse pointer into the capture",
         BS_AUTOCHECKBOX | WS_TABSTOP.0,
+        Default::default(),
         ID_CURSOR,
         cursor_rect,
         instance,
@@ -681,6 +684,7 @@ fn build_controls() -> Result<()> {
         w!("BUTTON"),
         "Also save each capture to a file",
         BS_AUTOCHECKBOX | WS_TABSTOP.0,
+        Default::default(),
         ID_SAVE_FILE,
         save_file_rect,
         instance,
@@ -692,6 +696,7 @@ fn build_controls() -> Result<()> {
         w!("STATIC"),
         "Output folder",
         SS_RIGHT,
+        Default::default(),
         -1,
         output_label_rect,
         instance,
@@ -701,6 +706,7 @@ fn build_controls() -> Result<()> {
         w!("EDIT"),
         "",
         ES_AUTOHSCROLL | WS_TABSTOP.0,
+        WS_EX_CLIENTEDGE,
         ID_OUTPUT_DIR,
         output_dir_rect,
         instance,
@@ -710,6 +716,7 @@ fn build_controls() -> Result<()> {
         w!("BUTTON"),
         BROWSE_TEXT,
         BS_PUSHBUTTON | WS_TABSTOP.0,
+        Default::default(),
         ID_BROWSE,
         browse_rect,
         instance,
@@ -719,6 +726,7 @@ fn build_controls() -> Result<()> {
         w!("STATIC"),
         OUTPUT_HINT,
         SS_LEFT,
+        Default::default(),
         ID_OUTPUT_HINT,
         layout.hint(layout.content_top(layout.file_top)),
         instance,
@@ -730,6 +738,7 @@ fn build_controls() -> Result<()> {
         w!("BUTTON"),
         "",
         BS_PUSHBUTTON | WS_TABSTOP.0,
+        Default::default(),
         ID_TRAY_CLICK,
         tray_rect,
         instance,
@@ -739,6 +748,7 @@ fn build_controls() -> Result<()> {
         w!("STATIC"),
         TRAY_CLICK_HINT,
         SS_LEFT,
+        Default::default(),
         ID_TRAY_CLICK_HINT,
         tray_hint_rect,
         instance,
@@ -750,6 +760,7 @@ fn build_controls() -> Result<()> {
         w!("BUTTON"),
         SAVE_TEXT,
         BS_DEFPUSHBUTTON | WS_TABSTOP.0,
+        Default::default(),
         ID_SAVE,
         save_rect,
         instance,
@@ -759,6 +770,7 @@ fn build_controls() -> Result<()> {
         w!("BUTTON"),
         CANCEL_TEXT,
         BS_PUSHBUTTON | WS_TABSTOP.0,
+        Default::default(),
         ID_CANCEL,
         cancel_rect,
         instance,
@@ -805,12 +817,16 @@ fn build_controls() -> Result<()> {
 }
 
 /// Create a group frame.
+///
+/// A frame wants no extended style of its own, which is what it says here rather
+/// than a second factory function for the one caller.
 fn group(parent: HWND, caption: &str, rect: Rect, instance: HINSTANCE) -> Result<HWND> {
     child(
         parent,
         w!("BUTTON"),
         caption,
         BS_GROUPBOX,
+        Default::default(),
         -1,
         rect,
         instance,
@@ -823,6 +839,7 @@ fn child(
     class: PCWSTR,
     text: &str,
     style: u32,
+    ex_style: WINDOW_EX_STYLE,
     id: i32,
     rect: Rect,
     instance: HINSTANCE,
@@ -830,7 +847,7 @@ fn child(
     let text = wide(text);
     let control = unsafe {
         CreateWindowExW(
-            Default::default(),
+            ex_style,
             class,
             PCWSTR::from_raw(text.as_ptr()),
             WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | style),
@@ -1316,28 +1333,52 @@ unsafe extern "system" fn window_proc(
 
         WM_NCDESTROY => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
 
-        // A static control, and an edit control that is read-only, ask the parent
-        // what to paint themselves on. The answer is the window's own colour, so
-        // the labels sit on the page instead of on a slightly different one, and
-        // the hotkey field and the folder field are boxes drawn on it rather than
-        // white rectangles punched through it.
+        // A label and a field ask the same question through the same message, and
+        // they want opposite answers. A label belongs to the page and is painted
+        // in the window's own colour; a field is a box on the page and is painted
+        // on `COLOR_WINDOW`, which is what makes it read as somewhere to type.
+        //
+        // The two are told apart by their window class, which is the only thing
+        // that distinguishes them: Windows sends this message for a static, for a
+        // read-only edit - which is what the hotkey field is - and for a disabled
+        // one. An edit is the only one of those that should come out white.
         WM_CTLCOLORSTATIC => {
-            let brush = with_state(|state| state.field_brush).unwrap_or_default();
+            let (label_brush, window_brush) =
+                with_state(|state| (state.label_brush, state.window_brush)).unwrap_or_default();
+            let control = HWND(lparam.0 as *mut core::ffi::c_void);
+            let brush = if is_edit(control) {
+                window_brush
+            } else {
+                label_brush
+            };
             if brush.is_invalid() {
                 return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
-            }
-            let dc = HDC(wparam.0 as *mut core::ffi::c_void);
-            unsafe {
-                // The text is drawn on the window's colour rather than in the box
-                // the control would otherwise clear behind it.
-                let _ = SetBkMode(dc, TRANSPARENT);
-                let _ = SetBkColor(dc, COLORREF(0));
             }
             LRESULT(brush.0 as isize)
         }
 
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
+}
+
+/// Whether a control is an edit field.
+///
+/// `WM_CTLCOLORSTATIC` arrives for a static, for a read-only edit and for a
+/// disabled one, and there is nothing in the message that says which. The class
+/// name does.
+fn is_edit(control: HWND) -> bool {
+    let mut name = [0u16; 16];
+    let written = unsafe { GetClassNameW(control, &mut name) };
+    if written <= 0 {
+        return false;
+    }
+    let name = &name[..written as usize];
+    // "Edit", case-insensitively, without allocating.
+    name.len() == 4
+        && (name[0] | 0x20) == u16::from(b'e')
+        && (name[1] | 0x20) == u16::from(b'd')
+        && (name[2] | 0x20) == u16::from(b'i')
+        && (name[3] | 0x20) == u16::from(b't')
 }
 
 /// Ask for a folder and put it in the field.
