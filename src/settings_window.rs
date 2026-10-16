@@ -60,6 +60,7 @@ const BS_DEFPUSHBUTTON: u32 = 0x0000_0001;
 const ES_AUTOHSCROLL: u32 = 0x0000_0080;
 const ES_READONLY: u32 = 0x0000_0800;
 const SS_LEFT: u32 = 0x0000_0000;
+const SS_RIGHT: u32 = 0x0000_0002;
 const BM_GETCHECK: u32 = 0x00F0;
 const BM_SETCHECK: u32 = 0x00F1;
 const BST_CHECKED: isize = 1;
@@ -279,7 +280,10 @@ pub fn open(owner: HWND, current: &Settings) -> Result<Option<Settings>> {
 fn build_controls(window: HWND, instance: HINSTANCE) -> Result<()> {
     let field_width = CLIENT_WIDTH - PAD * 2 - LABEL_WIDTH;
 
-    let hotkey_label = child(window, w!("STATIC"), "Hotkey", SS_LEFT, -1, (PAD, PAD + 4, LABEL_WIDTH, 18), instance)?;
+    // Right-aligned and a little shorter than the column, so the label reads as
+    // belonging to the field beside it and leaves a gap before it. A left-aligned
+    // column of labels leaves the eye no edge to run down.
+    let hotkey_label = child(window, w!("STATIC"), "Hotkey", SS_RIGHT, -1, (PAD, PAD + 4, LABEL_WIDTH - 10, 18), instance)?;
     let hotkey_field = child(
         window,
         w!("EDIT"),
@@ -318,7 +322,7 @@ fn build_controls(window: HWND, instance: HINSTANCE) -> Result<()> {
         instance,
     )?;
 
-    let output_label = child(window, w!("STATIC"), "Output folder", SS_LEFT, -1, (PAD, PAD + 118, LABEL_WIDTH, 18), instance)?;
+    let output_label = child(window, w!("STATIC"), "Output folder", SS_RIGHT, -1, (PAD, PAD + 118, LABEL_WIDTH - 10, 18), instance)?;
     let browse_width = 84;
     let output_dir = child(
         window,
