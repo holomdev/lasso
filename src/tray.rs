@@ -519,9 +519,9 @@ fn capture_screen() -> Result<()> {
 /// ready for the next request.
 fn select_region() -> Result<()> {
     let settings = with_state(|state| state.settings.clone()).unwrap_or_default();
-    // The overlay is given the capture without the pointer: it draws its own
-    // crosshair, and the magnifier has to show the pixels underneath, which is
-    // what placing an edge precisely depends on.
+    // The overlay is given the capture without the pointer. It marks the pointer with
+    // the system crosshair cursor, and drawing the pointer into the capture as well
+    // would leave a second arrow in the saved image at wherever the drag ended.
     let frame = capture::capture_virtual_desktop(None)?;
     let Some(composed) = overlay::select_region(&frame)? else {
         return Ok(());

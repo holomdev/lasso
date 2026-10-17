@@ -3,7 +3,7 @@
 A screenshot tool for Windows, written in Rust.
 
 > **Status:** early development. The capture engine, the interactive region
-> selection, the magnifier, the clipboard, the resident tray mode and the
+> selection, the annotation strip, the clipboard, the resident tray mode and the
 > settings window work end to end; annotations and sharing are next.
 
 ## Overview
@@ -38,10 +38,9 @@ Selecting a region freezes the screen and dims everything outside the
 selection, so the area you are about to keep is the only part at full
 brightness.
 
-A magnifier follows the pointer and shows the surrounding pixels scaled up, with
-the pixel under the pointer marked. The overlay also draws its own crosshair at
-the pointer, so which pixel is being marked never depends on how the system
-cursor happens to be drawn.
+A strip of buttons appears beside the selection — never over it — with the
+annotation tools, a colour and width, undo and redo, and the three ways out. The
+size is shown on the strip rather than in a label floating over the capture.
 
 ## Requirements
 
@@ -136,7 +135,6 @@ back, which is what makes it usable from a shortcut.
 | Enter | saves the region, or the whole screen when nothing is selected |
 | Esc or right click | cancels |
 
-The magnifier steps outside the selection while an edge is dragged, so it never
 covers the handles on the far side, and it stays out of the way entirely while
 the whole region is being moved.
 
@@ -192,7 +190,6 @@ tools/
 - [x] Selection overlay: topmost borderless window, dimmed outside the region,
       crosshair cursor, live size label
 - [x] Move, resize handles and arrow-key nudging of the region
-- [x] Magnifier and a pointer crosshair, for placing an edge precisely
 - [x] Cursor compositing, opt-in, on both backends and in the resident mode
 - [x] A turned monitor captured the right way up
 - [x] Clipboard copy
@@ -275,7 +272,7 @@ came out partly transparent rather than fully replaced.
 
 With `select`, the overlay is handed the frame **without** the pointer and the
 pointer is drawn afterwards, just before the region is published. Two reasons: the
-magnifier has to show the pixels underneath, which is what placing an edge
+crosshair cursor marks the pointer, and an edge is placed against it
 precisely depends on, and a cancelled selection must not have drawn anything.
 
 ### Overlay rendering
@@ -289,23 +286,6 @@ Repaints are limited to the union of the previous and the new selection
 rectangle. Rebuilding the whole window on every mouse move is what makes naive
 implementations flicker. Border and label are drawn with GDI on top of the
 blits, with a transparent text background so the label reads over any content.
-
-### Magnifier
-
-The magnifier samples a small square around the pointer and scales it up by an
-integer factor, with the pixel under the pointer landing exactly on the centre of
-the panel. That property is asserted in the tests, because it silently broke
-once: the panel and the marked square were placed correctly, yet the image
-inside showed a different part of the screen.
-
-The cause is a GDI quirk worth remembering. `StretchDIBits` measures `ysrc` from
-the **bottom** of the DIB even when the header declares it top-down with a
-negative `biHeight`, so a sub-rectangle has to be requested at its mirrored
-offset. Whole-image blits are unaffected, because `height - 0 - height` is still
-zero, which is why only the magnifier ever looked wrong.
-
-The magnifier is drawn with nearest-neighbour stretching, since a magnifier wants
-blocky pixels rather than a smoothed average of them.
 
 ### Settings window
 
@@ -459,7 +439,7 @@ cargo test
 
 Pixels encode their own coordinates, so a wrong offset or a flipped channel order
 fails a test instead of producing a plausible-looking image. The crop used by the
-selection is covered this way, and so is the magnifier: that test composes through
+selection is covered this way: that test composes through
 GDI and reads the back buffer's pixels back, which is what caught the mirrored
 sampling described above.
 

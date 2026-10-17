@@ -278,9 +278,9 @@ fn cmd_capture(out: &str, backend: Option<Backend>, copy: bool, with_cursor: boo
 
 fn cmd_select(out: &str, copy: bool, with_cursor: bool) -> Result<()> {
     let started = Instant::now();
-    // The overlay is given the capture without the pointer: it draws its own
-    // crosshair, and the magnifier has to show the pixels underneath, which is
-    // what placing an edge precisely depends on.
+    // The overlay is given the capture without the pointer. It marks the pointer with
+    // the system crosshair cursor, and drawing the pointer into the capture as well
+    // would leave a second arrow in the saved image at wherever the drag ended.
     let frame = capture::capture_virtual_desktop(None)?;
     eprintln!(
         "[capture] {} {}x{} in {:.1} ms",

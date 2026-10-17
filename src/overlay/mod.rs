@@ -9,11 +9,9 @@
 //! moves it, dragging one of the eight handles resizes it, and the arrow keys
 //! nudge it one pixel at a time (ten with Shift).
 //!
-//! A small crosshair is drawn at the pointer, and a magnifier beside it shows
-//! the surrounding pixels scaled up with the pixel under the pointer marked.
-//! Both mark the same pixel, so an edge can be placed exactly. The magnifier
-//! steps aside while the whole region is being dragged, where it would only be
-//! in the way.
+//! The system crosshair cursor marks the pointer, and the selection's own edges are
+//! drawn with a white line against a black one so an edge can be placed against any
+//! content.
 //!
 //! Keys and buttons:
 //!
@@ -109,8 +107,8 @@ enum Pressed {
 /// stray click rather than a region.
 const MIN_SIDE: i32 = 4;
 
-/// Padding added when invalidating, so the border, the handles, the pointer
-/// marker, the magnifier and the label are all repainted.
+/// Padding added when invalidating, so the border, the handles and the label are
+/// all repainted rather than left as a fringe of the previous frame.
 const DIRTY_PAD: i32 = 40;
 
 const WHITE: COLORREF = COLORREF(0x00FF_FFFF);
@@ -261,7 +259,7 @@ struct State {
     drag: Drag,
     /// Last known pointer position, in client coordinates. `None` until the
     /// pointer first moves over the window, which is also when the marker and
-    /// the magnifier appear.
+    /// the pointer marker appears.
     pointer: Option<(i32, i32)>,
     current: Option<RECT>,
     result: Option<Selection>,
@@ -410,7 +408,7 @@ pub fn select_region(frame: &Frame) -> Result<Option<Composed>> {
     // back from the window's buffer.
     //
     // The window's buffer has them, but it also has the dimmed area, the border, the
-    // handles, the pointer marker and the magnifier, and none of those belong in the
+    // handles and the pointer marker, and none of those belong in the
     // saved image. Re-drawing the strokes is the only way to keep them and leave the rest
     // behind, and it costs one pass over the strokes — which the drawing code already
     // does every frame.
@@ -433,7 +431,7 @@ pub fn select_region(frame: &Frame) -> Result<Option<Composed>> {
 
     // A second canvas rather than the window's buffer: this one has the annotations and
     // nothing else, where the window's also carries the dimmed area, the border, the
-    // handles, the pointer marker and the magnifier — none of which belong in the file.
+    // handles — none of which belong in the file.
     let composed = canvas::Canvas::new(&frame.bgra, width, height)?;
     let bounds = draw::Bounds::from_selection(
         selection.x,
@@ -472,19 +470,6 @@ fn point_from(lparam: LPARAM) -> (i32, i32) {
     let x = (raw & 0xFFFF) as u16 as i16 as i32;
     let y = ((raw >> 16) & 0xFFFF) as u16 as i16 as i32;
     (x, y)
-}
-
-/// Panel placement for a pointer position.
-///
-/// The panel always steps away from the selection centre, so while an edge is
-/// being dragged it sits outside the region instead of over the handles on the
-/// opposite side.
-fn panel_for(st: &State, pointer: (i32, i32)) -> RECT {
-    let bias = st
-        .current
-        .map(|rect| geometry::outward(&rect, pointer))
-        .unwrap_or_default();
-    geometry::magnifier_panel_biased(pointer, st.canvas.width(), st.canvas.height(), bias)
 }
 
 /// Whether a point is inside the current selection.
@@ -671,7 +656,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     return;
                 };
                 let previous_selection = st.current;
-                let previous_magnifier = st.pointer.map(|p| panel_for(st, p));
                 let previous_strip = st.strip;
                 st.pointer = Some(point);
 
@@ -734,15 +718,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         st.active_cursor = st.cursors.cross;
                     }
                 }
-
-                let current_magnifier = panel_for(st, point);
                 relayout(
                     hwnd,
                     st,
                     &[
                         previous_selection,
-                        previous_magnifier,
-                        Some(current_magnifier),
                         previous_strip.map(rect_of),
                     ],
                 );
@@ -763,7 +743,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
                 let previous_pointer = st.pointer;
                 let previous_selection = st.current;
-                let previous_magnifier = previous_pointer.map(|p| panel_for(st, p));
                 let previous_strip = st.strip;
 
                 st.pointer = Some(point);
@@ -844,15 +823,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if !drew && previous_pointer == Some(point) && previous_selection == st.current {
                     return;
                 }
-
-                let current_magnifier = panel_for(st, point);
                 relayout(
                     hwnd,
                     st,
                     &[
                         previous_selection,
-                        previous_magnifier,
-                        Some(current_magnifier),
                         previous_strip.map(rect_of),
                     ],
                 );
@@ -867,7 +842,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let Some(st) = binding.as_mut() else {
                     return false;
                 };
-                let previous_magnifier = st.pointer.map(|p| panel_for(st, p));
                 st.pointer = Some(point);
 
                 // An action button of the strip finishes the window. Pressing it and
@@ -910,13 +884,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     None => st.cursors.cross,
                 };
                 st.strip = strip_for(&st.canvas, st.current, &st.metrics);
-
-                let current_magnifier = panel_for(st, point);
-                invalidate_rects(
-                    hwnd,
-                    &[st.current, previous_magnifier, Some(current_magnifier)],
-                    DIRTY_PAD,
-                );
+                // The stroke has just been added or the region adjusted, so both what is
+                // drawn and the strip go through the one place that invalidates them.
+                relayout(hwnd, st, &[]);
                 false
             });
             unsafe {
@@ -1093,8 +1063,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     st.annotations = st.annotations.moved(delta.0, delta.1);
                     let previous_strip = st.strip;
                     st.strip = strip_for(&st.canvas, st.current, &st.metrics);
-                    let magnifier = st.pointer.map(|p| panel_for(st, p));
-                    relayout(hwnd, st, &[previous, magnifier, previous_strip.map(rect_of)]);
+                    relayout(hwnd, st, &[previous, previous_strip.map(rect_of)]);
                 });
             }
             LRESULT(0)
@@ -1216,9 +1185,6 @@ fn paint(window_dc: HDC, st: &State, invalid: &RECT) {
                 draw_strip(mem, st, &placement);
             }
         }
-
-        draw_pointer_marker(mem, st);
-        draw_magnifier(mem, st);
         match st.strip {
             Some(placement) => draw_keys_hint(mem, &placement, &st.canvas),
             None => draw_hint(mem, &st.canvas),
@@ -1324,153 +1290,6 @@ fn draw_handles(hdc: HDC, rect: &RECT, white: HBRUSH, black: HBRUSH) {
             FillRect(hdc, &square, white);
             FrameRect(hdc, &square, black);
         }
-    }
-}
-
-/// A crosshair drawn by the overlay itself, centred on the exact pixel the
-/// magnifier marks.
-///
-/// Relying on the system cursor alone leaves the marked pixel ambiguous, since
-/// what the cursor draws and where its hotspot sits are not guaranteed to
-/// coincide. Drawing our own removes the doubt.
-fn draw_pointer_marker(hdc: HDC, st: &State) {
-    let Some(pointer) = st.pointer else {
-        return;
-    };
-    let arm = geometry::MARKER_ARM;
-    let gap = geometry::MARKER_GAP;
-
-    let arms = [
-        RECT {
-            left: pointer.0 - arm,
-            top: pointer.1,
-            right: pointer.0 - gap,
-            bottom: pointer.1 + 1,
-        },
-        RECT {
-            left: pointer.0 + gap + 1,
-            top: pointer.1,
-            right: pointer.0 + arm + 1,
-            bottom: pointer.1 + 1,
-        },
-        RECT {
-            left: pointer.0,
-            top: pointer.1 - arm,
-            right: pointer.0 + 1,
-            bottom: pointer.1 - gap,
-        },
-        RECT {
-            left: pointer.0,
-            top: pointer.1 + gap + 1,
-            right: pointer.0 + 1,
-            bottom: pointer.1 + arm + 1,
-        },
-    ];
-
-    // A dark halo first, so the crosshair reads over light and dark content.
-    for arm_rect in arms {
-        let halo = geometry::inflated(&arm_rect, 1);
-        unsafe {
-            FillRect(hdc, &halo, st.black);
-        }
-    }
-    for arm_rect in arms {
-        unsafe {
-            FillRect(hdc, &arm_rect, st.white);
-        }
-    }
-}
-
-/// The zoomed view around the pointer, with the exact pixel under it marked.
-fn draw_magnifier(hdc: HDC, st: &State) {
-    let Some(pointer) = st.pointer else {
-        return;
-    };
-    // Moving the whole region is not a precision task, and here the panel only
-    // gets in the way.
-    if matches!(st.drag, Drag::Move { .. }) {
-        return;
-    }
-
-    let canvas = &st.canvas;
-    let panel = panel_for(st, pointer);
-    let content = geometry::magnifier_content(&panel);
-    let source = geometry::magnifier_source(pointer);
-
-    // Black outline, white frame, dark backdrop for whatever falls off the
-    // capture.
-    let frame = geometry::inflated(&panel, -1);
-    unsafe {
-        FillRect(hdc, &panel, st.black);
-        FillRect(hdc, &frame, st.white);
-        FillRect(hdc, &content, st.label_bg);
-    }
-
-    // Only the part of the source that exists is drawn, mapped onto the
-    // matching part of the panel, so a corner still lines up correctly.
-    let visible = geometry::intersect(&source, canvas.width(), canvas.height());
-    if visible.right > visible.left && visible.bottom > visible.top {
-        let dest = geometry::magnifier_dest(&content, &source, &visible);
-        canvas.magnify(&dest, &visible);
-        // The panel came out solid white on screen while this code looked right, and the
-        // arithmetic is checked by tests that pass. So the numbers themselves are printed,
-        // because what is left is a value that is not what the test used.
-        if std::env::var("LASSO_TRACE_MAGNIFIER").is_ok() {
-            eprintln!(
-                "[magnifier] pointer {pointer:?} panel ({},{})-({},{}) source ({},{})-({},{}) \
-                 visible ({},{})-({},{}) dest ({},{})-({},{}), canvas {}x{}",
-                panel.left,
-                panel.top,
-                panel.right,
-                panel.bottom,
-                source.left,
-                source.top,
-                source.right,
-                source.bottom,
-                visible.left,
-                visible.top,
-                visible.right,
-                visible.bottom,
-                dest.left,
-                dest.top,
-                dest.right,
-                dest.bottom,
-                canvas.width(),
-                canvas.height()
-            );
-        }
-    } else if std::env::var("LASSO_TRACE_MAGNIFIER").is_ok() {
-        eprintln!(
-            "[magnifier] pointer {pointer:?}: nothing visible; source ({},{})-({},{}) canvas {}x{}",
-            source.left,
-            source.top,
-            source.right,
-            source.bottom,
-            canvas.width(),
-            canvas.height()
-        );
-    }
-
-    let marked = geometry::magnifier_marked(&content);
-    let (cross_x, cross_y) = geometry::magnifier_crosshair(&content);
-    let horizontal = RECT {
-        left: content.left,
-        top: cross_y,
-        right: content.right,
-        bottom: cross_y + 1,
-    };
-    let vertical = RECT {
-        left: cross_x,
-        top: content.top,
-        right: cross_x + 1,
-        bottom: content.bottom,
-    };
-    unsafe {
-        FillRect(hdc, &horizontal, st.white);
-        FillRect(hdc, &vertical, st.white);
-        FrameRect(hdc, &marked, st.black);
-        let inner = geometry::inflated(&marked, -1);
-        FrameRect(hdc, &inner, st.white);
     }
 }
 
