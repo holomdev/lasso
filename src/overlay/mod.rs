@@ -536,7 +536,43 @@ fn stroke_worth_keeping(stroke: &Stroke) -> bool {
 /// Returns `true` even when the button did nothing, because a click on the plate must
 /// never fall through to the selection: otherwise aiming at a button that does not apply
 /// would move the region instead.
+/// The palette, when it should be showing.
+///
+/// Showing means there is a strip, no stroke is being drawn, and the pointer is either over
+/// the colour button or already inside the palette. That second condition is what lets the
+/// pointer travel from the button to a swatch without the panel disappearing under it — the
+/// classic way a hover menu becomes unusable.
+fn palette_shown(st: &State) -> Option<toolbar::Palette> {
+    let strip = st.strip?;
+    if matches!(st.drag, Drag::Annotate { .. }) {
+        return None;
+    }
+    let palette = toolbar::palette_for(
+        &strip,
+        st.canvas.width(),
+        st.canvas.height(),
+        &st.metrics,
+    );
+    let pointer = st.pointer?;
+    let over_colour = toolbar::hit(&strip, &st.metrics, pointer.0, pointer.1)
+        == Some(Button::Colour);
+    if over_colour || palette.contains(pointer.0, pointer.1) {
+        Some(palette)
+    } else {
+        None
+    }
+}
+
 fn strip_clicked(st: &mut State, point: (i32, i32)) -> bool {
+    // The palette is asked first: it opens beside the strip, and a press that lands on it is
+    // a colour chosen, not a button pressed.
+    if let Some(palette) = palette_shown(st) {
+        if let Some(colour) = palette.hit(&st.metrics, point.0, point.1) {
+            st.colour = colour;
+            return true;
+        }
+    }
+
     let Some(placement) = st.strip else {
         return false;
     };
@@ -608,6 +644,23 @@ fn relayout(hwnd: HWND, st: &State, previous: &[Option<RECT>]) {
     let mut rects: Vec<Option<RECT>> = previous.to_vec();
     rects.push(st.current);
     rects.push(st.strip.map(rect_of));
+    // The palette opens and closes by the pointer moving, with no other state change, so its
+    // area is invalidated every time: otherwise the panel would be painted and never cleared,
+    // or cleared and never painted.
+    if let Some(strip) = st.strip {
+        let palette = toolbar::palette_for(
+            &strip,
+            st.canvas.width(),
+            st.canvas.height(),
+            &st.metrics,
+        );
+        rects.push(Some(RECT {
+            left: palette.x,
+            top: palette.y,
+            right: palette.x + palette.width as i32,
+            bottom: palette.y + palette.height as i32,
+        }));
+    }
     invalidate_rects(hwnd, &rects, DIRTY_PAD);
 }
 
@@ -1205,6 +1258,11 @@ fn paint(window_dc: HDC, st: &State, invalid: &RECT) {
             Some(placement) => {
                 draw_strip(mem, st, &placement);
                 draw_keys_hint(mem, &placement, &st.canvas);
+                // The palette goes after the strip, so it is over it where the two meet, and
+                // after the hint, so the hint is never drawn on top of a swatch.
+                if let Some(palette) = palette_shown(st) {
+                    draw::draw_palette(mem, &palette, &st.metrics, st.colour, st.plate, st.edge);
+                }
             }
             None => draw_hint(mem, &st.canvas),
         }

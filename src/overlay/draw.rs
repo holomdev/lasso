@@ -30,6 +30,12 @@ use super::toolbar::{Button, Metrics, Placement};
 const BUTTON_INK: COLORREF = COLORREF(0x00E0_E0E0);
 /// The colour of one that cannot be used: close to the plate, so it reads as unavailable.
 const DIM_INK: COLORREF = COLORREF(0x0070_7070);
+/// The rim around the colour swatch.
+///
+/// Near black, because the swatch has to be visible whatever colour it holds: white and
+/// yellow on a light plate need an edge of their own, and a dark one reads against every
+/// colour in the set.
+const PLATE_SHADOW: COLORREF = COLORREF(0x0010_1010);
 
 /// The narrowest a stroke is allowed to be drawn, so a set thickness of zero cannot
 /// produce a shape that is invisible and looks like nothing happened.
@@ -226,7 +232,73 @@ fn draw_arrow(hdc: HDC, from: (i32, i32), to: (i32, i32), thickness: i32) {
     }
 }
 
-/// Draw the strip: its plate, its separators, and every button.
+/// Draw the colour palette, and the ring that says which colour is in force.
+///
+/// The swatches come from `Palette::swatches`, the same function the hit test reads, so a
+/// colour cannot be drawn in one place and picked up in another. Written without early
+/// returns, for the reason the strip's glyphs are: this runs on every repaint, and anything
+/// created here has to be released.
+pub fn draw_palette(
+    hdc: HDC,
+    palette: &super::toolbar::Palette,
+    metrics: &Metrics,
+    selected: super::annotation::Colour,
+    plate: windows::Win32::Graphics::Gdi::HBRUSH,
+    edge: windows::Win32::Graphics::Gdi::HBRUSH,
+) {
+    let body = RECT {
+        left: palette.x,
+        top: palette.y,
+        right: palette.x + palette.width as i32,
+        bottom: palette.y + palette.height as i32,
+    };
+    unsafe {
+        windows::Win32::Graphics::Gdi::FillRect(hdc, &body, plate);
+        FrameRect(hdc, &body, edge);
+    }
+
+    let rim = unsafe { CreateSolidBrush(PLATE_SHADOW) };
+    for (colour, square) in palette.swatches(metrics) {
+        let paint = unsafe { CreateSolidBrush(colour.to_colorref()) };
+        if !paint.is_invalid() {
+            unsafe {
+                windows::Win32::Graphics::Gdi::FillRect(hdc, &square, paint);
+            }
+            // Inside the swatch, so the colour keeps its full size and the rim is what
+            // separates it from the plate — which is what makes white visible at all.
+            if !rim.is_invalid() {
+                unsafe {
+                    FrameRect(hdc, &square, rim);
+                }
+            }
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(paint.0));
+            }
+        }
+        // The colour in force is outlined, so the palette answers "which one am I using".
+        if colour == selected {
+            let ring = unsafe { CreateSolidBrush(BUTTON_INK) };
+            if !ring.is_invalid() {
+                let marker = RECT {
+                    left: square.left - 1,
+                    top: square.top - 1,
+                    right: square.right + 1,
+                    bottom: square.bottom + 1,
+                };
+                unsafe {
+                    FrameRect(hdc, &marker, ring);
+                    let _ = DeleteObject(HGDIOBJ(ring.0));
+                }
+            }
+        }
+    }
+    unsafe {
+        if !rim.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(rim.0));
+        }
+    }
+}
+
 /// Draw the strip: its plate, its separators, and every button.
 pub fn draw_strip(
     hdc: HDC,
@@ -449,32 +521,61 @@ fn draw_button_glyph(hdc: HDC, button: Button, rect: &RECT, ink: COLORREF, fill:
             );
         }
         Button::Colour => {
-            // A disc filled with the colour in force, then outlined. Filling it is the
-            // whole point: a swatch that is not the colour is a button with no answer.
+            // The button is a swatch of the colour itself: a filled square with a dark rim,
+            // so white and yellow read against the light plate instead of vanishing into it.
+            // This is the only place the colour appears, and a swatch that is not the colour
+            // is a button with no answer.
+            //
+            // Written without an early `return`, deliberately: returning here would skip the
+            // pen and brush this function selects into the context at its top, and those two
+            // objects would leak on every repaint. The leak test said so — "every ten
+            // repaints of the strip add 20 GDI objects" — which is exactly what a return
+            // placed above the cleanup costs.
+            let mut painted = false;
             if let Some(colour) = fill {
-                let disc = RECT {
-                    left: centre.0 - arm,
-                    top: centre.1 - arm,
-                    right: centre.0 + arm + 1,
-                    bottom: centre.1 + arm + 1,
+                // Inset by the padding the other glyphs keep, so the colour is a pill inside
+                // the button rather than a block that fills it edge to edge.
+                let pill = RECT {
+                    left: rect.left + 3,
+                    top: rect.top + 3,
+                    right: rect.right - 3,
+                    bottom: rect.bottom - 3,
                 };
-                let swatch = unsafe { CreateSolidBrush(colour) };
-                if !swatch.is_invalid() {
-                    unsafe {
-                        let _ = Ellipse(hdc, disc.left, disc.top, disc.right, disc.bottom);
-                        windows::Win32::Graphics::Gdi::FillRect(hdc, &disc, swatch);
-                        let _ = DeleteObject(HGDIOBJ(swatch.0));
+                if pill.right > pill.left && pill.bottom > pill.top {
+                    let paint = unsafe { CreateSolidBrush(colour) };
+                    let rim = unsafe { CreateSolidBrush(PLATE_SHADOW) };
+                    if !paint.is_invalid() {
+                        unsafe {
+                            windows::Win32::Graphics::Gdi::FillRect(hdc, &pill, paint);
+                        }
                     }
+                    if !rim.is_invalid() {
+                        // Inside the swatch, so the colour keeps its full size and the rim is
+                        // what separates it from the plate.
+                        unsafe {
+                            FrameRect(hdc, &pill, rim);
+                        }
+                    }
+                    unsafe {
+                        if !paint.is_invalid() {
+                            let _ = DeleteObject(HGDIOBJ(paint.0));
+                        }
+                        if !rim.is_invalid() {
+                            let _ = DeleteObject(HGDIOBJ(rim.0));
+                        }
+                    }
+                    painted = true;
                 }
             }
-            unsafe {
-                let _ = Ellipse(
-                    hdc,
-                    centre.0 - arm,
-                    centre.1 - arm,
-                    centre.0 + arm + 1,
-                    centre.1 + arm + 1,
-                );
+            if !painted {
+                // Nothing to show: an empty square says "a colour goes here".
+                let empty = unsafe { CreateSolidBrush(ink) };
+                if !empty.is_invalid() {
+                    unsafe {
+                        FrameRect(hdc, rect, empty);
+                        let _ = DeleteObject(HGDIOBJ(empty.0));
+                    }
+                }
             }
         }
         Button::Thickness => {
@@ -1311,11 +1412,18 @@ mod tests {
                     right: placement.x + x + w as i32,
                     bottom: placement.y + y + h as i32,
                 };
+                // The colour button does not draw a glyph in ink: it is a swatch of the
+                // colour itself, so it is counted by that colour instead. Every other button
+                // is counted by the ink, which is what "the icons went" was about.
+                let wanted = match button {
+                    // The state this test draws with is red.
+                    Button::Colour => (0u8, 0u8, 255u8),
+                    _ => (0xE0, 0xE0, 0xE0),
+                };
                 let mut ink = 0;
                 for py in rect.top..rect.bottom {
                     for px in rect.left..rect.right {
-                        let (b, g, r) = pixel(&canvas, px, py);
-                        if (b, g, r) == (0xE0, 0xE0, 0xE0) {
+                        if pixel(&canvas, px, py) == wanted {
                             ink += 1;
                         }
                     }
@@ -1324,8 +1432,9 @@ mod tests {
                 // fails if nothing at all was drawn.
                 assert!(
                     ink >= 4,
-                    "at {factor}x, {} drew {ink} pixels of ink in a {}x{} button",
+                    "at {factor}x, {} drew {ink} pixels of {:?} in a {}x{} button",
                     button.as_str_for_test(),
+                    wanted,
                     w,
                     h
                 );

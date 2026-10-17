@@ -19,7 +19,8 @@
 //! never underneath it, and the strip follows the region as it is adjusted instead of
 //! having to be chased.
 
-use super::annotation::Tool;
+use super::annotation::{Colour, Tool};
+use windows::Win32::Foundation::RECT;
 
 /// One button of the strip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,6 +330,121 @@ pub fn hit(placement: &Placement, metrics: &Metrics, x: i32, y: i32) -> Option<B
         .map(|(button, _, _, _, _)| button)
 }
 
+/// The palette that opens beside the colour button.
+///
+/// It is drawn into the overlay's own buffer like everything else, so it has no window of
+/// its own and no behaviour of its own: its rectangle and its swatches are worked out from
+/// the strip's placement, which means the drawing and the hit test cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Palette {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Palette {
+    /// Whether a point on the desktop is over the palette.
+    pub fn contains(&self, x: i32, y: i32) -> bool {
+        x >= self.x
+            && y >= self.y
+            && x < self.x + self.width as i32
+            && y < self.y + self.height as i32
+    }
+
+    /// Every swatch's square, in `Colour::ALL` order, in desktop coordinates.
+    ///
+    /// One function rather than two: the drawing fills these and the hit test reads them, so
+    /// a swatch cannot be drawn in one place and picked up in another.
+    pub fn swatches(&self, metrics: &Metrics) -> Vec<(Colour, RECT)> {
+        let mut swatches = Vec::with_capacity(Colour::ALL.len());
+        let mut x = self.x + metrics.padding;
+        let y = self.y + metrics.padding;
+        for colour in Colour::ALL {
+            swatches.push((
+                colour,
+                RECT {
+                    left: x,
+                    top: y,
+                    right: x + metrics.button,
+                    bottom: y + metrics.button,
+                },
+            ));
+            x += metrics.button + metrics.gap;
+        }
+        swatches
+    }
+
+    /// The colour under a point, if any.
+    pub fn hit(&self, metrics: &Metrics, x: i32, y: i32) -> Option<Colour> {
+        if !self.contains(x, y) {
+            return None;
+        }
+        self.swatches(metrics)
+            .into_iter()
+            .find(|(_, rect)| {
+                x >= rect.left && y >= rect.top && x < rect.right && y < rect.bottom
+            })
+            .map(|(colour, _)| colour)
+    }
+}
+
+impl Metrics {
+    /// The palette's size: one row of swatches with the strip's own padding around it.
+    pub fn palette_size(&self) -> (u32, u32) {
+        let count = Colour::ALL.len() as i32;
+        let width = count * self.button + (count - 1) * self.gap + self.padding * 2;
+        let height = self.button + self.padding * 2;
+        (width.max(1) as u32, height.max(1) as u32)
+    }
+}
+
+/// Where the palette goes, given where the strip went.
+///
+/// Beside the strip on the side with room, centred on the colour button it belongs to, and
+/// pulled back into the space so a strip near an edge does not push it off the screen.
+/// Beside the strip rather than over it: the palette is opened by pointing at a button, and
+/// a panel that covered the buttons would make the pointer leave the button that opened it.
+pub fn palette_for(
+    strip: &Placement,
+    space_width: u32,
+    space_height: u32,
+    metrics: &Metrics,
+) -> Palette {
+    let (width, height) = metrics.palette_size();
+    let (width_i, height_i) = (width as i32, height as i32);
+
+    // The colour button's own row, so the palette lines up with the button that opened it.
+    let row = metrics
+        .button_rects()
+        .into_iter()
+        .find(|(button, ..)| *button == Button::Colour);
+    let centre_y = match row {
+        Some((_, _, by, _, bh)) => strip.y + by + bh as i32 / 2,
+        None => strip.y + strip.height as i32 / 2,
+    };
+
+    let right_of = strip.x + strip.width as i32 + metrics.standoff;
+    let left_of = strip.x - metrics.standoff - width_i;
+    let fits = |x: i32| x >= 0 && x + width_i <= space_width as i32;
+    let x = if fits(right_of) {
+        right_of
+    } else if fits(left_of) {
+        left_of
+    } else {
+        (space_width as i32 - width_i).max(0)
+    };
+
+    let y = (centre_y - height_i / 2).clamp(0, (space_height as i32 - height_i).max(0));
+
+    Palette {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
 /// The strip's metrics for a display scale.
 pub fn metrics_for(factor: f64) -> Metrics {
     let scale = |value: i32| crate::ui_layout::scale(value, factor);
@@ -347,6 +463,147 @@ mod tests {
 
     fn metrics() -> Metrics {
         Metrics::BASE
+    }
+
+    /// A strip placed against a region in the middle of a large screen.
+    fn standard() -> (Placement, Metrics) {
+        let metrics = Metrics::BASE;
+        let placement = place(
+            Region {
+                x: 600,
+                y: 250,
+                width: 400,
+                height: 300,
+            },
+            1920,
+            1080,
+            &metrics,
+        );
+        (placement, metrics)
+    }
+
+    #[test]
+    fn the_palette_has_one_swatch_per_colour_in_order() {
+        let (strip, metrics) = standard();
+        let palette = palette_for(&strip, 1920, 1080, &metrics);
+        let swatches = palette.swatches(&metrics);
+
+        let colours: Vec<Colour> = swatches.iter().map(|(colour, _)| *colour).collect();
+        assert_eq!(
+            colours,
+            Colour::ALL.to_vec(),
+            "the palette must offer every colour, in the order C cycles them, so the two ways "
+        );
+        // And they must not overlap: a swatch drawn on top of another is one that cannot be
+        // picked, whatever the hit test believes.
+        for pair in swatches.windows(2) {
+            assert!(
+                pair[0].1.right <= pair[1].1.left,
+                "swatches {:?} and {:?} overlap",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn every_swatch_is_inside_the_palette_and_hits_only_itself() {
+        let (strip, metrics) = standard();
+        let palette = palette_for(&strip, 1920, 1080, &metrics);
+
+        for (colour, rect) in palette.swatches(&metrics) {
+            assert!(palette.contains(rect.left, rect.top), "{colour:?} starts outside");
+            assert!(
+                palette.contains(rect.right - 1, rect.bottom - 1),
+                "{colour:?} ends outside"
+            );
+            // A point well inside its own square must come back as that colour, and the same
+            // point must not answer for any other.
+            let (x, y) = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+            assert_eq!(palette.hit(&metrics, x, y), Some(colour));
+        }
+        // A point in the palette's padding belongs to no swatch, and one outside to nothing.
+        assert_eq!(palette.hit(&metrics, palette.x, palette.y), None);
+        assert_eq!(palette.hit(&metrics, palette.x - 1, palette.y), None);
+    }
+
+    #[test]
+    fn the_palette_opens_beside_the_strip_and_not_over_it() {
+        let (strip, metrics) = standard();
+
+        // Everywhere on a strip that is on the left of its region, the palette goes to the
+        // right of the strip — it must not cover the buttons that opened it.
+        for region_x in [300i32, 600, 900] {
+            let placement = place(
+                Region {
+                    x: region_x,
+                    y: 250,
+                    width: 300,
+                    height: 200,
+                },
+                1920,
+                1080,
+                &metrics,
+            );
+            let palette = palette_for(&placement, 1920, 1080, &metrics);
+            assert_eq!(
+                palette.x,
+                placement.x + placement.width as i32 + metrics.standoff,
+                "for a region at {region_x} the palette should sit to the right of the strip"
+            );
+            assert!(
+                palette.x >= placement.x + placement.width as i32,
+                "the palette overlaps the strip"
+            );
+        }
+    }
+
+    #[test]
+    fn the_palette_lines_up_with_the_colour_button() {
+        let (strip, metrics) = standard();
+        let palette = palette_for(&strip, 1920, 1080, &metrics);
+
+        let (_, _, by, _, bh) = metrics
+            .button_rects()
+            .into_iter()
+            .find(|(button, ..)| *button == Button::Colour)
+            .expect("the colour button is in the strip");
+        let button_centre = strip.y + by + bh as i32 / 2;
+        let palette_centre = palette.y + palette.height as i32 / 2;
+
+        // Within half a button: it is a row of swatches beside a button, not a panel that
+        // could be anywhere on that side.
+        assert!(
+            (button_centre - palette_centre).abs() <= metrics.button / 2,
+            "the palette's centre {palette_centre} is not beside the colour button's {button_centre}"
+        );
+    }
+
+    #[test]
+    fn the_palette_stays_on_the_screen() {
+        let metrics = Metrics::BASE;
+        // A strip hard against the bottom, where a palette centred on the colour button would
+        // otherwise extend past the last row of pixels.
+        for region_y in [0i32, 900, 1040] {
+            let placement = place(
+                Region {
+                    x: 600,
+                    y: region_y,
+                    width: 200,
+                    height: 40,
+                },
+                1920,
+                1080,
+                &metrics,
+            );
+            let palette = palette_for(&placement, 1920, 1080, &metrics);
+            assert!(
+                palette.y >= 0 && palette.y + palette.height as i32 <= 1080,
+                "for a region at {region_y} the palette spans {}..{}",
+                palette.y,
+                palette.y + palette.height as i32
+            );
+        }
     }
 
     /// A selection of a size that leaves room on both sides in a 1920x1080 space.

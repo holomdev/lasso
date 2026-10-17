@@ -141,7 +141,7 @@ it is not using.
 | 3 | Rectangle | `R` | Drag two opposite corners. The box is **open, not filled**: a box on a screenshot marks something, and filling it would hide what is being marked. |
 | 4 | Ellipse | `E` | The same, as an open oval. |
 | 5 | Pencil | `P` | Freehand. A press without movement still leaves a dot, so a single point can be marked. |
-| 6 | Colour | `C` | Cycles red → yellow → green → blue → white. The button itself is drawn in the colour in force, so the strip says what will be drawn. |
+| 6 | Colour | `C` | A swatch of the colour in force, filled with it. Pointing at it opens a palette of the five colours beside the strip; clicking one chooses it. `C` cycles them for the keyboard. |
 | 7 | Thickness | `+` `-` | The stroke's width, from 1 to 24 in steps of two. The glyph is drawn at the width in force and grows with it. |
 | 8 | Undo | `Ctrl+Z` | Removes the last stroke. Drawn faint and ignored when there is nothing to undo. |
 | 9 | Redo | `Ctrl+Y` | Puts back the last stroke that was undone. Faint and ignored when there is nothing to redo. |
@@ -152,6 +152,13 @@ it is not using.
 The strip is placed beside the region and **never over it** while there is room
 anywhere on the screen. It is drawn every frame, including while a stroke is in
 progress.
+
+The palette opens to the side of the strip with room, lined up with the colour
+button it belongs to. It stays open while the pointer travels from the button onto
+a swatch, which is the part a hover menu usually gets wrong, and it closes when the
+pointer leaves both. It is a rectangle of the same buffer as everything else rather
+than a window of its own, so its swatches and its hit test come from one function
+and cannot disagree.
 
 `Esc` gives up the armed tool rather than the window when one is armed, so that
 "I did not mean to draw" does not throw away the region. A second `Esc` cancels.
