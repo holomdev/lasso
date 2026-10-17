@@ -94,12 +94,17 @@ impl Colour {
     }
 
     /// The value GDI wants, which is `0x00BBGGRR`.
+    ///
+    /// A palette rather than the pure hues: red, yellow, green and blue at full saturation
+    /// are the colours of a diagram, and on a photograph they shout. These are muted enough
+    /// to mark something without taking the eye off it, and still four clearly different
+    /// colours. White stays pure, because it is the one that has to read on dark content.
     pub fn to_colorref(self) -> COLORREF {
         COLORREF(match self {
-            Colour::Red => 0x0000_00FF,
-            Colour::Yellow => 0x0000_FFFF,
-            Colour::Green => 0x0000_FF00,
-            Colour::Blue => 0x00FF_0000,
+            Colour::Red => 0x0044_44EF,
+            Colour::Yellow => 0x0015_CCFA,
+            Colour::Green => 0x005E_C522,
+            Colour::Blue => 0x00F6_823B,
             Colour::White => 0x00FF_FFFF,
         })
     }
@@ -744,11 +749,31 @@ mod tests {
         // surprises people. Checked explicitly because getting it wrong produces a
         // capture that is the right drawing in the wrong colour, which is easy to
         // attribute to anything else.
-        assert_eq!(Colour::Red.to_colorref().0, 0x0000_00FF);
-        assert_eq!(Colour::Blue.to_colorref().0, 0x00FF_0000);
-        assert_eq!(Colour::Green.to_colorref().0, 0x0000_FF00);
-        assert_eq!(Colour::White.to_colorref().0, 0x00FF_FFFF);
-        assert_eq!(Colour::Yellow.to_colorref().0, 0x0000_FFFF);
+        assert_eq!(
+            Colour::Red.to_colorref().0,
+            0x0044_44EF,
+            "#EF4444 must stay the colour it is documented as"
+        );
+        assert_eq!(
+            Colour::Yellow.to_colorref().0,
+            0x0015_CCFA,
+            "#FACC15 must stay the colour it is documented as"
+        );
+        assert_eq!(
+            Colour::Green.to_colorref().0,
+            0x005E_C522,
+            "#22C55E must stay the colour it is documented as"
+        );
+        assert_eq!(
+            Colour::Blue.to_colorref().0,
+            0x00F6_823B,
+            "#3B82F6 must stay the colour it is documented as"
+        );
+        assert_eq!(
+            Colour::White.to_colorref().0,
+            0x00FF_FFFF,
+            "#FFFFFF must stay the colour it is documented as"
+        );
     }
 
     #[test]

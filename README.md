@@ -149,6 +149,19 @@ it is not using.
 | 11 | Copy | — | Puts the region on the clipboard and closes without writing a file. |
 | 12 | Cancel | `Esc`, right click | Closes without saving and without touching the clipboard. |
 
+The five colours are a palette rather than the pure hues: red, yellow, green and
+blue at full saturation are the colours of a diagram, and on a photograph they
+shout. These mark something without taking the eye off it. White stays pure,
+because it is the one that has to read on dark content.
+
+| Colour | Value |
+|---|---|
+| Red | `#EF4444` |
+| Yellow | `#FACC15` |
+| Green | `#22C55E` |
+| Blue | `#3B82F6` |
+| White | `#FFFFFF` |
+
 The strip is placed beside the region and **never over it** while there is room
 anywhere on the screen. It is drawn every frame, including while a stroke is in
 progress.

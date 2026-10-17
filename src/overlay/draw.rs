@@ -787,6 +787,24 @@ mod tests {
     }
 
     /// Count the pixels of a rectangle that are not the blank value.
+    /// A colour as the canvas buffer holds it: blue, green, red.
+    ///
+    /// The buffer is BGRA, and a `COLORREF` is `0x00BBGGRR`, so the two orders are the same
+    /// reversed. Deriving it means a change of palette does not have to be made twice; the
+    /// values themselves are pinned in `annotation`, where they are a decision rather than an
+    /// accident of layout.
+    fn buffer_pixel(colour: crate::overlay::annotation::Colour) -> (u8, u8, u8) {
+        // `COLORREF` is 0x00BBGGRR, so the low byte is red and the high one is blue; the buffer
+        // wants blue first. Reading them in the same order is what made this return red in the
+        // blue slot, and the test said so with a pixel value.
+        let raw = colour.to_colorref().0;
+        (
+            ((raw >> 16) & 0xFF) as u8,
+            ((raw >> 8) & 0xFF) as u8,
+            (raw & 0xFF) as u8,
+        )
+    }
+
     fn painted(canvas: &Canvas, rect: &RECT) -> usize {
         let mut count = 0;
         for y in rect.top..rect.bottom {
@@ -1083,14 +1101,7 @@ mod tests {
                 let _ = DeleteObject(HGDIOBJ(face.0));
             }
 
-            // The colour as the buffer holds it: `to_colorref` is 0x00BBGGRR, and the pixels
-            // come back as blue, green, red.
-            let wanted = match colour {
-                Colour::Red => (0u8, 0u8, 255u8),
-                Colour::Blue => (255, 0, 0),
-                Colour::White => (255, 255, 255),
-                other => panic!("{other:?} has no expectation here"),
-            };
+            let wanted = buffer_pixel(colour);
             let mut found = 0;
             for y in square.top..square.bottom {
                 for x in square.left..square.right {
@@ -1676,7 +1687,9 @@ mod tests {
                 // is counted by the ink, which is what "the icons went" was about.
                 let wanted = match button {
                     // The state this test draws with is red.
-                    Button::Colour => (0u8, 0u8, 255u8),
+                    Button::Colour => {
+                        buffer_pixel(crate::overlay::annotation::Colour::Red)
+                    }
                     _ => (0xE0, 0xE0, 0xE0),
                 };
                 let mut ink = 0;
