@@ -1193,16 +1193,19 @@ fn paint(window_dc: HDC, st: &State, invalid: &RECT) {
             }
         }
 
-        // The strip is drawn last so nothing lands on top of it, and only while the
-        // pointer is not drawing: it sits beside the region and would otherwise be
-        // repainted hundreds of times a second for nothing.
-        if let Some(placement) = st.strip {
-            if !matches!(st.drag, Drag::Annotate { .. }) {
-                draw_strip(mem, st, &placement);
-            }
-        }
+        // The strip is drawn last, so nothing lands on top of it, and it is drawn **every**
+        // frame there is one.
+        //
+        // It used to be skipped while a stroke was being drawn, to save repainting twelve
+        // glyphs during a drag. That was a false economy with a visible cost: the repaint
+        // clears the strip's area along with everything else, so skipping the drawing left
+        // the dimmed desktop there instead, and the strip vanished for as long as the drag
+        // lasted and came back when it ended. It looked like a fault, and it was one.
         match st.strip {
-            Some(placement) => draw_keys_hint(mem, &placement, &st.canvas),
+            Some(placement) => {
+                draw_strip(mem, st, &placement);
+                draw_keys_hint(mem, &placement, &st.canvas);
+            }
             None => draw_hint(mem, &st.canvas),
         }
 
