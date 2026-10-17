@@ -398,7 +398,23 @@ pub fn select_region(frame: &Frame) -> Result<Option<Composed>> {
         let _ = SetFocus(Some(hwnd));
 
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        // Three outcomes, not two. `GetMessageW` returns -1 on error, and `BOOL(-1)` is
+        // **true**, so `.as_bool()` turns an error into "there is a message" and the loop
+        // spins for ever on a message that never arrives: the window stays painted, the
+        // process stays alive, and nothing sent to it is ever handled. That is what a dead
+        // overlay looks like, so the error case is taken separately.
+        loop {
+            let result = GetMessageW(&mut msg, None, 0, 0);
+            if result.0 == 0 {
+                break; // WM_QUIT
+            }
+            if result.0 == -1 {
+                eprintln!(
+                    "[overlay] GetMessageW failed: {}",
+                    windows::Win32::Foundation::GetLastError().0
+                );
+                break;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }

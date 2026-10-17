@@ -224,7 +224,22 @@ pub fn run(hotkey_override: Option<hotkey::Hotkey>) -> Result<()> {
     // hidden rather than left behind as an empty window.
     let mut msg = MSG::default();
     unsafe {
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        // Three outcomes, not two: `GetMessageW` returns -1 on error and `BOOL(-1)` is
+        // true, so `.as_bool()` would turn an error into an endless loop of no messages.
+        // The resident mode would go on owning a tray icon and answer nothing — the same
+        // "nothing works" a dead overlay shows.
+        loop {
+            let result = GetMessageW(&mut msg, None, 0, 0);
+            if result.0 == 0 {
+                break;
+            }
+            if result.0 == -1 {
+                eprintln!(
+                    "[tray] GetMessageW failed: {}",
+                    windows::Win32::Foundation::GetLastError().0
+                );
+                break;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }

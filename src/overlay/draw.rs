@@ -558,21 +558,29 @@ mod tests {
         count
     }
 
-    /// A lock for the tests that count GDI objects.
+    /// The growth in GDI objects caused by `draw`, as the **median** over several rounds.
     ///
-    /// `GetGuiResources` reports what the **process** holds, so two of these tests running
-    /// at once read each other's objects and both fail. Rust runs tests in threads by
-    /// default, which is exactly what this prevents.
-    ///
-    /// The `static` lives here rather than inside the helper below, and that is the whole
-    /// point: a `static` declared inside a function is **one per call site**, so the two
-    /// tests would each have got their own lock and gone on running together.
-    static GDI_COUNTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn gdi_counting_lock() -> std::sync::MutexGuard<'static, ()> {
-        GDI_COUNTING
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// `GetGuiResources` reports the whole process, and Rust runs tests in threads, so the
+    /// count also moves while other tests draw. Taking the median of several rounds is what
+    /// makes the measurement survive that: a leak adds to every round, while another test
+    /// finishing adds a burst to one or two. The median of nine rounds is the fifth
+    /// largest, which a burst cannot reach and a leak cannot avoid.
+    fn growth_per_round(mut draw: impl FnMut(), rounds: usize, passes: usize) -> i64 {
+        // One warm-up pass first: the first call may create things the context keeps, and
+        // that is not a leak.
+        for _ in 0..3 {
+            draw();
+        }
+        let mut growths = Vec::with_capacity(rounds);
+        for _ in 0..rounds {
+            let before = user_objects() as i64;
+            for _ in 0..passes {
+                draw();
+            }
+            growths.push(user_objects() as i64 - before);
+        }
+        growths.sort_unstable();
+        growths[growths.len() / 2]
     }
 
     #[test]
@@ -588,7 +596,6 @@ mod tests {
         // Nothing about a screenshot shows this. Two numbers do.
         use crate::overlay::toolbar::{self, Region};
 
-        let _only = gdi_counting_lock();
         let metrics = toolbar::Metrics::BASE;
         let canvas = blank(200, 400);
         let placement = toolbar::place(
@@ -611,17 +618,13 @@ mod tests {
             can_redo: false,
         };
 
-        // One pass to reach a steady state: the first call may create things the context
-        // keeps, and that is not a leak.
-        for _ in 0..3 {
-            draw_strip(canvas.dc(), &placement, &metrics, &state, plate, edge, face);
-        }
-        let before = user_objects();
-
-        for _ in 0..50 {
-            draw_strip(canvas.dc(), &placement, &metrics, &state, plate, edge, face);
-        }
-        let after = user_objects();
+        let growth = growth_per_round(
+            || {
+                draw_strip(canvas.dc(), &placement, &metrics, &state, plate, edge, face);
+            },
+            9,
+            10,
+        );
 
         unsafe {
             let _ = DeleteObject(HGDIOBJ(plate.0));
@@ -629,10 +632,12 @@ mod tests {
             let _ = DeleteObject(HGDIOBJ(face.0));
         }
 
+        // One glyph's pen is one object. If the plates and separators draw and the glyphs
+        // leave their pens behind, this is around seventy per ten repaints.
         assert!(
-            after <= before + 4,
-            "fifty repaints of the strip took the GDI object count from {before} to {after}, \
-             so something created per glyph is never released"
+            growth <= 2,
+            "every ten repaints of the strip add {growth} GDI objects, so something created \
+             per glyph is never released"
         );
     }
 
@@ -640,7 +645,6 @@ mod tests {
     fn drawing_a_stroke_does_not_leak_gdi_objects() {
         // The same check for the annotations, because a stroke is the other thing drawn on
         // every frame while a drag is in progress.
-        let _only = gdi_counting_lock();
         let canvas = blank(120, 120);
         let bounds = Bounds::from_selection(0, 0, 120, 120);
         let strokes = [
@@ -684,22 +688,20 @@ mod tests {
             ),
         ];
 
-        for stroke in &strokes {
-            draw_stroke(canvas.dc(), stroke, &bounds, (0, 0));
-        }
-        let before = user_objects();
-
-        for _ in 0..50 {
-            for stroke in &strokes {
-                draw_stroke(canvas.dc(), stroke, &bounds, (0, 0));
-            }
-        }
-        let after = user_objects();
+        let growth = growth_per_round(
+            || {
+                for stroke in &strokes {
+                    draw_stroke(canvas.dc(), stroke, &bounds, (0, 0));
+                }
+            },
+            9,
+            10,
+        );
 
         assert!(
-            after <= before + 4,
-            "fifty passes over every shape took the GDI object count from {before} to \
-             {after}, so a pen or brush is never released"
+            growth <= 2,
+            "every ten passes over every shape add {growth} GDI objects, so a pen or brush \
+             is never released"
         );
     }
 

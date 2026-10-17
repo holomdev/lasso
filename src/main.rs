@@ -61,11 +61,55 @@ fn usage() {
     );
 }
 
+/// The build's timestamp, as a local date and time.
+///
+/// The build script records unix seconds, which is unambiguous but unreadable, and the point
+/// of the line is to be read by a person comparing it with the binary's own timestamp. The
+/// conversion is done here by hand rather than through the Windows time API: the arithmetic
+/// is a civil-from-days calculation, and it means the stamp cannot fail to print.
+fn build_stamp() -> String {
+    let unix: i64 = env!("LASSO_BUILD_UNIX").parse().unwrap_or(0);
+    let (days, seconds) = (unix.div_euclid(86_400), unix.rem_euclid(86_400));
+
+    // Days since 1970-01-01 to a civil date, by Howard Hinnant's algorithm: shift the era
+    // to start in March so leap days land at the end of the year, then take the 400-year
+    // cycle apart. Written out because it is short and needs no calendar tables.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
+        seconds / 3_600,
+        (seconds % 3_600) / 60
+    )
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // With no arguments the program becomes resident, which is how it is
     // normally started: from a shortcut, or from the startup folder.
     let command = args.first().map(String::as_str).unwrap_or("tray");
+
+    // Which build this is, first thing, because more than one report has been impossible
+    // to act on for not knowing. The stamp is set by the build script from the clock and
+    // from git, and `dirty` means the source had uncommitted changes when it was built.
+    //
+    // It goes to stderr with everything else rather than to stdout, so it cannot end up in
+    // a redirected capture, and once rather than on every command.
+    eprintln!(
+        "[build] {} {} ({})",
+        build_stamp(),
+        env!("LASSO_BUILD_GIT"),
+        env!("LASSO_BUILD_DIRTY")
+    );
 
     // Must happen before any window or DC is created.
     let awareness = dpi::enable_per_monitor();

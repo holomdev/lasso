@@ -24,6 +24,38 @@ fn main() {
     println!("cargo:rerun-if-changed=lasso.manifest");
     println!("cargo:rerun-if-changed=build.rs");
 
+    // A stamp for the binary, printed when it starts.
+    //
+    // More than once now a report has been impossible to act on because it was not known
+    // which build was running: the fix was in the source, the binary was older, and
+    // everything either side of that was guesswork. A build that says when it was compiled
+    // ends the doubt in one line. `rerun-if-env-changed` is deliberately absent: the stamp
+    // is taken at each build, and a build script that does not re-run would leave an old
+    // one on a new binary.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    println!("cargo:rustc-env=LASSO_BUILD_UNIX={stamp}");
+    // And a short git description, when git is there to ask.
+    let git = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=LASSO_BUILD_GIT={git}");
+    // Dirty or not, because a binary built from uncommitted changes is not the commit.
+    let dirty = Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false);
+    println!("cargo:rustc-env=LASSO_BUILD_DIRTY={}", if dirty { "dirty" } else { "clean" });
+
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
