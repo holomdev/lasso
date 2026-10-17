@@ -717,6 +717,21 @@ fn relayout(hwnd: HWND, st: &State, previous: &[Option<RECT>]) {
             }));
         }
     }
+    // The stroke being drawn, wherever it lies. A mark may be made outside the region now, and
+    // the region is not where it lives: without this the outside part is written into the back
+    // buffer and never presented, so it appears later, when something else happens to repaint
+    // that area — which is what made a box look half drawn until Escape.
+    if let (Some(stroke), Some(rect)) = (st.drawing.as_ref(), st.current) {
+        let (left, top, right, bottom) = stroke.canvas_extent((rect.left, rect.top));
+        if right > left && bottom > top {
+            rects.push(Some(RECT {
+                left,
+                top,
+                right,
+                bottom,
+            }));
+        }
+    }
     invalidate_rects(hwnd, &rects, DIRTY_PAD);
 }
 

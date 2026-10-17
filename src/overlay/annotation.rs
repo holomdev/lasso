@@ -289,7 +289,6 @@ impl Annotations {
             undone: self.undone.iter().map(|s| s.moved(dx, dy)).collect(),
         }
     }
-
     /// The same drawing, re-based so it stays where it is on the screen.
     ///
     /// The region's origin has moved by `delta`, and these coordinates are relative to it, so
@@ -303,6 +302,37 @@ impl Annotations {
 }
 
 impl Stroke {
+
+
+    /// Where a stroke lies on the canvas, as left, top, right and bottom.
+    ///
+    /// Padded by the stroke's own width, because a thick line reaches half its width to each
+    /// side of the points it is drawn between, and by one more pixel for the pen's corner.
+    pub fn canvas_extent(&self, origin: (i32, i32)) -> (i32, i32, i32, i32) {
+        let pad = self.thickness as i32 + 1;
+        let shift = |p: Point| (p.x + origin.0, p.y + origin.1);
+        let points: Vec<(i32, i32)> = match &self.shape {
+            Shape::Arrow { from, to }
+            | Shape::Rectangle { from, to }
+            | Shape::Ellipse { from, to } => vec![shift(*from), shift(*to)],
+            Shape::Pencil { points } => points.iter().copied().map(shift).collect(),
+        };
+        let mut left = i32::MAX;
+        let mut top = i32::MAX;
+        let mut right = i32::MIN;
+        let mut bottom = i32::MIN;
+        for (x, y) in points {
+            left = left.min(x);
+            top = top.min(y);
+            right = right.max(x);
+            bottom = bottom.max(y);
+        }
+        if left > right || top > bottom {
+            return (0, 0, 0, 0);
+        }
+        (left - pad, top - pad, right + pad, bottom + pad)
+    }
+
     pub fn new(shape: Shape, colour: Colour, thickness: u32) -> Self {
         Self {
             shape,
@@ -412,6 +442,47 @@ mod tests {
         assert!(!frame.contains(100, 49), "one above");
         assert!(!frame.contains(110, 50), "one past the right edge");
         assert!(!frame.contains(100, 54), "one past the bottom edge");
+    }
+
+    #[test]
+    fn a_strokes_extent_covers_where_it_is_drawn_and_its_width() {
+        // The extent is what the overlay repaints while a stroke is being drawn. Too small and
+        // the outside part of a mark is written into the buffer and never shown; the report was
+        // a box that came out in fragments until Escape repainted everything.
+        let stroke = Stroke::new(
+            Shape::Arrow {
+                from: Point::new(-40, -10),
+                to: Point::new(60, 30),
+            },
+            Colour::Red,
+            6,
+        );
+        let (left, top, right, bottom) = stroke.canvas_extent((100, 200));
+
+        // The points, in canvas coordinates, then padded by the width.
+        assert!(left <= 60 - 7, "the extent starts right of the stroke: {left}");
+        assert!(top <= 190 - 7, "the extent starts below the stroke: {top}");
+        assert!(right >= 160 + 7, "the extent ends left of the stroke: {right}");
+        assert!(bottom >= 230 + 7, "the extent ends above the stroke: {bottom}");
+
+        // And it is a rectangle, not a point.
+        assert!(right > left && bottom > top);
+    }
+
+    #[test]
+    fn a_strokes_extent_follows_the_origin() {
+        // A stroke drawn over the dimmed area has negative offsets; its extent is still a real
+        // rectangle on the canvas, which is the whole point of measuring it.
+        let stroke = Stroke::new(
+            Shape::Pencil {
+                points: vec![Point::new(-100, -80), Point::new(-60, -40)],
+            },
+            Colour::Blue,
+            4,
+        );
+        let (left, top, right, bottom) = stroke.canvas_extent((500, 500));
+        assert!(left < 400 && top < 420, "outside the canvas: {left},{top}");
+        assert!(right > 440 && bottom > 460, "the extent misses the stroke: {right},{bottom}");
     }
 
     #[test]

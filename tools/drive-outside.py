@@ -151,7 +151,26 @@ try:
     # immediately to the left of the region and its own colour button is the same red.
     key(0x52)  # R
     time.sleep(0.25)
-    drag((700, 180), (900, 400))
+    # Held, in steps, with a capture part way through: the parts of a stroke outside the region
+    # used to be written into the buffer and never presented, so they were missing until
+    # something repainted that area. A capture after the drag cannot see that.
+    move_to(700, 180)
+    time.sleep(0.2)
+    mouse(0x0002)
+    time.sleep(0.08)
+    for step in range(1, 9):
+        move_to(700 + 200 * step // 8, 180 + 220 * step // 8)
+        time.sleep(0.04)
+    time.sleep(0.25)
+    mid = np.array(ImageGrab.grab().convert("RGB"))
+    mid_mask = red_mask(mid)[: top - 20, 690:910]
+    mid_outside = int(mid_mask.sum())
+    mid_box = None
+    if mid_outside:
+        ys, xs = np.nonzero(mid_mask)
+        mid_box = (int(xs.min()) + 690, int(ys.min()), int(xs.max()) + 690, int(ys.max()))
+    mouse(0x0004)
+    time.sleep(0.35)
 
     screen = np.array(ImageGrab.grab().convert("RGB"))
     mask = red_mask(screen)
@@ -169,6 +188,19 @@ finally:
         process.kill()
 
 failures = []
+# The box's top edge is at y=180. If the part outside the region is not being presented while
+# the stroke is drawn, only the rows nearest the region show up: measured at 20 rows of it, and
+# 160 pixels against 1172.
+if mid_box is None or mid_box[1] > 182:
+    failures.append(
+        f"while the stroke was being drawn its top edge was not on screen: the outside part "
+        f"reached only to {mid_box}, so that area was never repainted"
+    )
+elif mid_outside < 800:
+    failures.append(
+        f"only {mid_outside} pixels of the stroke were on screen outside the region while it "
+        f"was drawn, in {mid_box}: most of that part was never repainted"
+    )
 if outside_pixels < 20:
     failures.append(
         f"only {outside_pixels} pixels were painted outside the region, so a mark outside it "
@@ -196,7 +228,7 @@ else:
                 "inside the region was lost with the part that was outside"
             )
 
-print(f"painted outside the region, on screen: {outside_pixels} px")
+print(f"painted outside, mid-drag: {mid_outside} px in {mid_box}, after release: {outside_pixels} px")
 if saved is not None:
     mask = red_mask(saved)
     columns = np.nonzero(mask.any(axis=0))[0]
