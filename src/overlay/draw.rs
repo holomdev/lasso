@@ -101,8 +101,11 @@ pub fn draw_stroke(hdc: HDC, stroke: &Stroke, bounds: &Bounds, origin: (i32, i32
             // Open, not filled: the point of a box on a screenshot is to mark something,
             // and filling it would hide exactly what is being marked.
             //
-            // `FrameRect` takes a brush rather than using the pen, so the stroke's
-            // colour is made into one here and released with the pen.
+            // `FrameRect` takes a brush rather than using the pen, so the stroke's colour is
+            // made into one. The brush is never selected into the context — `FrameRect` is
+            // given it directly — so it can be deleted here, and that matters: deleting an
+            // object that is still selected into a DC is how a handle is lost rather than
+            // released.
             let (left, top, right, bottom) = normalized(to_canvas(*from), to_canvas(*to));
             let outline = RECT {
                 left,
@@ -121,8 +124,8 @@ pub fn draw_stroke(hdc: HDC, stroke: &Stroke, bounds: &Bounds, origin: (i32, i32
         Shape::Ellipse { from, to } => {
             let (left, top, right, bottom) = normalized(to_canvas(*from), to_canvas(*to));
             // `Ellipse` fills its interior with whatever brush the context holds, so a
-            // hollow one is selected for the duration. Without this the ellipse would be
-            // a solid disc covering what it was drawn around.
+            // hollow one is selected for the duration. Without this the ellipse would be a
+            // solid disc covering what it was drawn around.
             let hollow = unsafe { GetStockObject(NULL_BRUSH) };
             let previous = unsafe { SelectObject(hdc, hollow) };
             unsafe {
@@ -317,6 +320,18 @@ impl StripState {
     }
 }
 
+/// The GDI objects this process currently holds, and the ceiling it is allowed.
+///
+/// A strip whose plate and separators are drawn and whose glyphs are not is what running
+/// out of them looks like: `FillRect` creates nothing, while every glyph needs a pen and
+/// possibly a brush. Printing both numbers next to a failure is what turns "the icons
+/// went" into a figure.
+fn user_objects() -> u32 {
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    use windows::Win32::System::Threading::{GetGuiResources, GR_GDIOBJECTS};
+    unsafe { GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS) }
+}
+
 /// A button's icon, drawn from lines so that it stays crisp at any scale.
 ///
 /// `ink` colours both the lines and, where a shape needs it, the fill. A button that
@@ -331,11 +346,31 @@ fn draw_button_glyph(hdc: HDC, button: Button, rect: &RECT, ink: COLORREF) {
     let arm = (width.min(height) / 4).max(2);
     let pen = unsafe { CreatePen(PS_SOLID, 2, ink) };
     if pen.is_invalid() {
+        // A pen that cannot be created is a glyph that vanishes while the plate and the
+        // separators — which are `FillRect` and create nothing — carry on looking right.
+        // That is the exact shape of the fault that was reported, so it says so out loud
+        // instead of returning quietly.
+        eprintln!(
+            "[strip] CreatePen failed for {button:?}: {} GDI objects held",
+            user_objects()
+        );
         return;
     }
     // The same colour as a brush, for the two glyphs that are framed rather than stroked.
+    //
+    // Both objects are selected into the context and **both** are put back afterwards. The
+    // brush used to be selected and never restored, and then deleted: deleting an object
+    // that is still selected into a device context does not release the handle, and the
+    // twelve glyphs of every repaint leaked about seven objects a frame between them. The
+    // process ran out at around ten thousand, after which `CreatePen` failed and the strip
+    // drew its plate and separators — which create nothing — with no icons in it.
     let brush = unsafe { CreateSolidBrush(ink) };
-    let saved = unsafe { SelectObject(hdc, HGDIOBJ(pen.0)) };
+    let saved_pen = unsafe { SelectObject(hdc, HGDIOBJ(pen.0)) };
+    let saved_brush = if brush.is_invalid() {
+        None
+    } else {
+        Some(unsafe { SelectObject(hdc, HGDIOBJ(brush.0)) })
+    };
 
     let line = |from: (i32, i32), to: (i32, i32)| unsafe {
         let _ = MoveToEx(hdc, from.0, from.1, None);
@@ -479,7 +514,14 @@ fn draw_button_glyph(hdc: HDC, button: Button, rect: &RECT, ink: COLORREF) {
     }
 
     unsafe {
-        SelectObject(hdc, saved);
+        // Put back what was there before either object is released: an object that is still
+        // the one a context holds cannot be deleted, and `DeleteObject` on it fails and
+        // leaves the handle behind.
+        if let Some(previous) = saved_brush {
+            SelectObject(hdc, previous);
+            let _ = DeleteObject(HGDIOBJ(brush.0));
+        }
+        SelectObject(hdc, saved_pen);
         let _ = DeleteObject(HGDIOBJ(pen.0));
     }
 }
@@ -514,6 +556,151 @@ mod tests {
             }
         }
         count
+    }
+
+    /// A lock for the tests that count GDI objects.
+    ///
+    /// `GetGuiResources` reports what the **process** holds, so two of these tests running
+    /// at once read each other's objects and both fail. Rust runs tests in threads by
+    /// default, which is exactly what this prevents.
+    ///
+    /// The `static` lives here rather than inside the helper below, and that is the whole
+    /// point: a `static` declared inside a function is **one per call site**, so the two
+    /// tests would each have got their own lock and gone on running together.
+    static GDI_COUNTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn gdi_counting_lock() -> std::sync::MutexGuard<'static, ()> {
+        GDI_COUNTING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn drawing_the_strip_does_not_leak_gdi_objects() {
+        // The fault that took the icons away, caught the way it has to be caught: by
+        // counting. A brush was selected into the context by every glyph and never put
+        // back, and `DeleteObject` on an object that is still selected does not release the
+        // handle. Twelve glyphs a repaint leaked about seven objects a frame; the process's
+        // ceiling is around ten thousand, so after a minute and a half of use `CreatePen`
+        // began to fail, and the strip drew its plate and separators — which create nothing
+        // — with no icons in them.
+        //
+        // Nothing about a screenshot shows this. Two numbers do.
+        use crate::overlay::toolbar::{self, Region};
+
+        let _only = gdi_counting_lock();
+        let metrics = toolbar::Metrics::BASE;
+        let canvas = blank(200, 400);
+        let placement = toolbar::place(
+            Region {
+                x: 160,
+                y: 20,
+                width: 30,
+                height: 30,
+            },
+            200,
+            400,
+            &metrics,
+        );
+        let plate = unsafe { CreateSolidBrush(COLORREF(0x0020_2020)) };
+        let edge = unsafe { CreateSolidBrush(COLORREF(0x0060_6060)) };
+        let face = unsafe { CreateSolidBrush(COLORREF(0x0040_4040)) };
+        let state = StripState {
+            active: Some(Button::Tool(Tool::Arrow)),
+            can_undo: true,
+            can_redo: false,
+        };
+
+        // One pass to reach a steady state: the first call may create things the context
+        // keeps, and that is not a leak.
+        for _ in 0..3 {
+            draw_strip(canvas.dc(), &placement, &metrics, &state, plate, edge, face);
+        }
+        let before = user_objects();
+
+        for _ in 0..50 {
+            draw_strip(canvas.dc(), &placement, &metrics, &state, plate, edge, face);
+        }
+        let after = user_objects();
+
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(plate.0));
+            let _ = DeleteObject(HGDIOBJ(edge.0));
+            let _ = DeleteObject(HGDIOBJ(face.0));
+        }
+
+        assert!(
+            after <= before + 4,
+            "fifty repaints of the strip took the GDI object count from {before} to {after}, \
+             so something created per glyph is never released"
+        );
+    }
+
+    #[test]
+    fn drawing_a_stroke_does_not_leak_gdi_objects() {
+        // The same check for the annotations, because a stroke is the other thing drawn on
+        // every frame while a drag is in progress.
+        let _only = gdi_counting_lock();
+        let canvas = blank(120, 120);
+        let bounds = Bounds::from_selection(0, 0, 120, 120);
+        let strokes = [
+            Stroke::new(
+                Shape::Rectangle {
+                    from: Point::new(10, 10),
+                    to: Point::new(100, 100),
+                },
+                Colour::Red,
+                2,
+            ),
+            Stroke::new(
+                Shape::Ellipse {
+                    from: Point::new(10, 10),
+                    to: Point::new(100, 100),
+                },
+                Colour::Green,
+                3,
+            ),
+            Stroke::new(
+                Shape::Arrow {
+                    from: Point::new(10, 10),
+                    to: Point::new(100, 100),
+                },
+                Colour::Blue,
+                2,
+            ),
+            Stroke::new(
+                Shape::Pencil {
+                    points: vec![Point::new(10, 10), Point::new(50, 50), Point::new(90, 90)],
+                },
+                Colour::White,
+                4,
+            ),
+            Stroke::new(
+                Shape::Pencil {
+                    points: vec![Point::new(40, 40)],
+                },
+                Colour::Yellow,
+                4,
+            ),
+        ];
+
+        for stroke in &strokes {
+            draw_stroke(canvas.dc(), stroke, &bounds, (0, 0));
+        }
+        let before = user_objects();
+
+        for _ in 0..50 {
+            for stroke in &strokes {
+                draw_stroke(canvas.dc(), stroke, &bounds, (0, 0));
+            }
+        }
+        let after = user_objects();
+
+        assert!(
+            after <= before + 4,
+            "fifty passes over every shape took the GDI object count from {before} to \
+             {after}, so a pen or brush is never released"
+        );
     }
 
     #[test]

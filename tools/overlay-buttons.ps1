@@ -163,3 +163,4 @@ foreach ($index in 5, 5, 7) {
 
 $proc.Kill()
 $results | Format-Table -AutoSize
+Get-Content (Join-Path $OutDir 'gdi.txt') -ErrorAction SilentlyContinue | Select-Object -Last 8

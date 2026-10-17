@@ -1233,7 +1233,11 @@ fn dump_canvas(st: &State) {
     // Once per paint would be a wall of text; the first, the last and every eighth is
     // enough to see the sequence.
     if n == 0 || n + 1 == MOST || n % 8 == 0 {
-        eprintln!("[overlay] canvas dump {n} -> {}", path.display());
+        eprintln!(
+            "[overlay] canvas dump {n} -> {} ({} GDI objects)",
+            path.display(),
+            gdi_objects()
+        );
     }
 }
 
@@ -1354,4 +1358,15 @@ fn draw_text(hdc: HDC, x: i32, y: i32, text: &str) {
         SetTextColor(hdc, WHITE);
         let _ = TextOutW(hdc, x, y, &utf16);
     }
+}
+
+/// How many GDI objects this process holds.
+///
+/// A strip whose plate and separators are drawn and whose glyphs are not is what running
+/// out of them looks like, because `FillRect` creates nothing while each glyph needs a pen.
+/// Printing this beside every dump turns "the icons went" into a number that either climbs
+/// or does not.
+pub fn gdi_objects() -> u32 {
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetGuiResources, GR_GDIOBJECTS};
+    unsafe { GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS) }
 }
