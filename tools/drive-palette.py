@@ -195,7 +195,11 @@ try:
     time.sleep(0.4)
     hovered = shot("1-hover")
 
-    # Onto a swatch: it has to stay open on the way.
+    # Onto a swatch in small steps, the way a hand moves. This is where it used to close:
+    # the pointer crossed the gap between the strip and the palette and was in neither.
+    for x in range(COLOUR[0], swatch(3)[0], 6):
+        move_to(x, COLOUR[1])
+        time.sleep(0.012)
     move_to(*swatch(3))
     time.sleep(0.35)
     on_swatch = shot("2-on-swatch")

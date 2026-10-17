@@ -335,12 +335,20 @@ pub fn hit(placement: &Placement, metrics: &Metrics, x: i32, y: i32) -> Option<B
 /// It is drawn into the overlay's own buffer like everything else, so it has no window of
 /// its own and no behaviour of its own: its rectangle and its swatches are worked out from
 /// the strip's placement, which means the drawing and the hit test cannot disagree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Palette {
     pub x: i32,
     pub y: i32,
     pub width: u32,
     pub height: u32,
+    /// The gap between the strip and the palette, and the strip's edge beside it.
+    ///
+    /// The palette stands off the strip, so the pointer leaving the colour button is in
+    /// neither for a few pixels and the panel would close on the way to a swatch. Treating
+    /// this corridor as part of the panel is what makes the journey continuous. It is
+    /// carried here rather than recomputed because it has to be exactly the corridor the
+    /// placement left, not an approximation of it.
+    pub bridge: RECT,
 }
 
 impl Palette {
@@ -350,6 +358,19 @@ impl Palette {
             && y >= self.y
             && x < self.x + self.width as i32
             && y < self.y + self.height as i32
+    }
+
+    /// Whether a point is anywhere the palette should stay open for.
+    ///
+    /// The panel itself and the corridor back to the strip. Deliberately not called
+    /// `contains`: this is a weaker condition than being over the palette, and it is only
+    /// ever used to *keep* it open. `palette_visible` still decides what opens it.
+    pub fn keeps_open(&self, x: i32, y: i32) -> bool {
+        self.contains(x, y)
+            || (x >= self.bridge.left
+                && y >= self.bridge.top
+                && x < self.bridge.right
+                && y < self.bridge.bottom)
     }
 
     /// Every swatch's square, in `Colour::ALL` order, in desktop coordinates.
@@ -448,11 +469,32 @@ pub fn palette_for(
 
     let y = (centre_y - height_i / 2).clamp(0, (space_height as i32 - height_i).max(0));
 
+    // The corridor from the strip's near edge to the palette, taller than the palette so a
+    // slightly diagonal journey does not fall out of it.
+    let slack = metrics.standoff;
+    let strip_near = if x >= strip.x + strip.width as i32 {
+        strip.x + strip.width as i32
+    } else {
+        strip.x
+    };
+    let palette_near = if x >= strip.x + strip.width as i32 {
+        x
+    } else {
+        x + width_i
+    };
+    let bridge = RECT {
+        left: strip_near.min(palette_near),
+        top: y - slack,
+        right: strip_near.max(palette_near),
+        bottom: y + height_i + slack,
+    };
+
     Palette {
         x,
         y,
         width,
         height,
+        bridge,
     }
 }
 
@@ -474,6 +516,54 @@ mod tests {
 
     fn metrics() -> Metrics {
         Metrics::BASE
+    }
+
+    #[test]
+    fn the_journey_from_the_button_to_a_swatch_never_leaves_the_palette() {
+        // Reported as "it hides too quickly to choose a colour". The palette stands off the
+        // strip, so the pointer crossing that gap was in neither the strip nor the palette,
+        // and the panel closed on the way — the button had to be hovered again for every
+        // attempt. The corridor belongs to the palette for this purpose.
+        let (strip, metrics) = standard();
+        let palette = palette_for(&strip, 1920, 1080, &metrics);
+
+        let (_, _, by, _, bh) = metrics
+            .button_rects()
+            .into_iter()
+            .find(|(button, ..)| *button == Button::Colour)
+            .expect("the colour button is in the strip");
+        let button_y = strip.y + by + bh as i32 / 2;
+        // The strip's own edge, exclusive: the pixel before it is inside the strip, where the
+        // pointer is still over the button and the question does not arise.
+        let button_x = strip.x + strip.width as i32;
+
+        // Every pixel of the straight line from the strip's edge to the first swatch, at the
+        // button's own height, has to count as "still in the palette".
+        let swatch_x = palette.swatches(&metrics)[0].1.right;
+        for x in button_x..=swatch_x {
+            assert!(
+                palette.keeps_open(x, button_y),
+                "at ({x}, {button_y}) the pointer is in neither the palette nor the corridor, \
+                 so the panel would close on the way to a swatch"
+            );
+        }
+    }
+
+    #[test]
+    fn the_corridor_does_not_reach_far_beyond_the_palette() {
+        // A corridor that kept the palette open across half the screen would be as odd as one
+        // that closes it too soon: it must be the gap and a little slack, no more.
+        let (strip, metrics) = standard();
+        let palette = palette_for(&strip, 1920, 1080, &metrics);
+
+        assert!(
+            !palette.keeps_open(palette.x + palette.width as i32 + 200, palette.y + 4),
+            "the palette stays open far beyond its own right edge"
+        );
+        assert!(
+            !palette.keeps_open(palette.x + 4, palette.y + palette.height as i32 + 200),
+            "the palette stays open far below itself"
+        );
     }
 
     #[test]

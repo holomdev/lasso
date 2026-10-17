@@ -840,7 +840,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 st.canvas.height(),
                                 &st.metrics,
                             );
-                            palette.contains(point.0, point.1)
+                            palette.keeps_open(point.0, point.1)
                         });
                         st.palette_open =
                             toolbar::palette_visible(st.palette_open, over_colour, inside_palette);
