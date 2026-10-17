@@ -186,12 +186,15 @@ the pointer was in neither, and the only way back was through the colour button.
 It is a rectangle of the same buffer as everything else rather than a window of its
 own, so its swatches and its hit test come from one function and cannot disagree.
 
-The drawing stays where it is on the screen. A mark belongs to the pixel it marks,
-so dragging the region over it does not drag the mark along: what the region no longer
-covers is dropped, and what it still covers is kept — half a box left outside is saved
-as the half inside. A shape that crosses the edge is pulled back to it rather than cut,
-because the box is drawn as an outline and a cut outline would need its missing edges
-drawn where nothing was drawn.
+The drawing stays where it is on the screen. A mark belongs to the pixel it marks, so
+dragging the region over it does not drag the mark along.
+
+**A mark may be made anywhere on the screen**, over the dimmed area as well, and only
+what the region covers is saved: half a box left outside the capture is saved as the
+half inside, cut exactly at the edge. That cut is not done by refusing to draw — the
+strokes are drawn onto the whole capture and the crop to the region is what keeps and
+discards. Nothing is thrown away as the region moves, so dragging it back over a mark
+finds the mark again.
 
 `Esc` gives up the armed tool rather than the window when one is armed, so that
 "I did not mean to draw" does not throw away the region. A second `Esc` cancels.

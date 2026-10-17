@@ -41,53 +41,15 @@ const PLATE_SHADOW: COLORREF = COLORREF(0x0010_1010);
 /// produce a shape that is invisible and looks like nothing happened.
 const MIN_THICKNESS: i32 = 1;
 
-/// The rectangle a selection covers, which annotations are clamped to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Bounds {
-    pub left: i32,
-    pub top: i32,
-    pub right: i32,
-    pub bottom: i32,
-}
-
-impl Bounds {
-    pub fn from_selection(x: i32, y: i32, width: u32, height: u32) -> Self {
-        Self {
-            left: x,
-            top: y,
-            right: x + width as i32,
-            bottom: y + height as i32,
-        }
-    }
-
-    /// Whether the rectangle has any area.
-    pub fn has_area(&self) -> bool {
-        self.right > self.left && self.bottom > self.top
-    }
-
-    /// A point pulled inside the selection.
-    ///
-    /// The far edge is `right - 1`, because a shape drawn *at* `right` would be the
-    /// first pixel of the dimmed area outside the selection.
-    fn clamp(&self, x: i32, y: i32) -> (i32, i32) {
-        (
-            x.clamp(self.left, (self.right - 1).max(self.left)),
-            y.clamp(self.top, (self.bottom - 1).max(self.top)),
-        )
-    }
-}
-
 /// Draw one stroke into a device context, in canvas coordinates.
-pub fn draw_stroke(hdc: HDC, stroke: &Stroke, bounds: &Bounds, origin: (i32, i32)) {
-    if !bounds.has_area() {
-        return;
-    }
-    // A point in the stroke's own space becomes a point on the canvas, then is clamped
-    // to the selection. The order matters: clamping first would compare coordinates from
-    // two different spaces.
-    let to_canvas = |point: Point| -> (i32, i32) {
-        bounds.clamp(point.x + origin.0, point.y + origin.1)
-    };
+///
+/// Nothing is clamped to the selection. A mark may be drawn anywhere on the screen and is kept
+/// where it was drawn; what is inside the selection is what gets saved, and that is decided when
+/// the capture is cropped, not by refusing to draw. Clamping here is what made a stroke stop at
+/// the region's edge instead of running past it.
+pub fn draw_stroke(hdc: HDC, stroke: &Stroke, origin: (i32, i32)) {
+    // A point in the stroke's own space becomes a point on the canvas.
+    let to_canvas = |point: Point| -> (i32, i32) { (point.x + origin.0, point.y + origin.1) };
 
     let colour = stroke.colour.to_colorref();
     let thickness = (stroke.thickness as i32).max(MIN_THICKNESS);
@@ -907,7 +869,6 @@ mod tests {
         // The same check for the annotations, because a stroke is the other thing drawn on
         // every frame while a drag is in progress.
         let canvas = blank(120, 120);
-        let bounds = Bounds::from_selection(0, 0, 120, 120);
         let strokes = [
             Stroke::new(
                 Shape::Rectangle {
@@ -952,7 +913,7 @@ mod tests {
         let growth = growth_per_round(
             || {
                 for stroke in &strokes {
-                    draw_stroke(canvas.dc(), stroke, &bounds, (0, 0));
+                    draw_stroke(canvas.dc(), stroke, (0, 0));
                 }
             },
             9,
@@ -1124,7 +1085,6 @@ mod tests {
         // not. It was drawn with `FrameRect`, which always makes a one-pixel frame with a brush,
         // so the width was never consulted. Nothing about a picture of one rectangle shows it;
         // two of them at different widths do.
-        let bounds = Bounds::from_selection(0, 0, 120, 120);
         let box_of = || Shape::Rectangle {
             from: Point::new(20, 30),
             to: Point::new(100, 90),
@@ -1136,7 +1096,6 @@ mod tests {
             draw_stroke(
                 canvas.dc(),
                 &Stroke::new(box_of(), Colour::Red, thickness),
-                &bounds,
                 (0, 0),
             );
             let area = painted(
@@ -1184,13 +1143,53 @@ mod tests {
     }
 
     #[test]
+    fn a_stroke_is_not_confined_to_the_selection() {
+        // The opposite of what this module used to test. A mark may be made anywhere on the
+        // screen, so a stroke drawn from outside the region keeps its outside part; what is
+        // saved is decided by cropping the capture, not by refusing to draw.
+        let canvas = blank(120, 120);
+        // An origin in the middle, and a stroke whose tail starts well to its upper left: the
+        // old clamp would have pulled that tail to the origin and painted nothing to the left
+        // of it.
+        draw_stroke(
+            canvas.dc(),
+            &Stroke::new(
+                Shape::Arrow {
+                    from: Point::new(-20, -20),
+                    to: Point::new(40, 40),
+                },
+                Colour::Red,
+                2,
+            ),
+            (50, 50),
+        );
+        unsafe {
+            let _ = GdiFlush();
+        }
+
+        let left_of_the_origin = painted(
+            &canvas,
+            &RECT {
+                left: 0,
+                top: 0,
+                right: 50,
+                bottom: 120,
+            },
+        );
+        assert!(
+            left_of_the_origin > 0,
+            "nothing was drawn to the upper left of the origin, so the stroke is still being \
+             clamped to the region"
+        );
+    }
+
+    #[test]
     fn a_rectangle_is_drawn_inside_its_own_outline() {
         // The property that matters for every shape: whatever it draws is within the
         // bounding box its two points describe. Checked by counting what changed outside
         // that box, which is the failure a person would not see until a corner of the
         // drawing was over something it should not cover.
         let canvas = blank(120, 120);
-        let bounds = Bounds::from_selection(0, 0, 120, 120);
         let stroke = Stroke::new(
             Shape::Rectangle {
                 from: Point::new(20, 30),
@@ -1199,7 +1198,7 @@ mod tests {
             Colour::Red,
             2,
         );
-        draw_stroke(canvas.dc(), &stroke, &bounds, (0, 0));
+        draw_stroke(canvas.dc(), &stroke, (0, 0));
         unsafe {
             let _ = GdiFlush();
         }
@@ -1239,7 +1238,6 @@ mod tests {
         let mut counts = Vec::new();
         for (from, to) in directions {
             let canvas = blank(120, 120);
-            let bounds = Bounds::from_selection(0, 0, 120, 120);
             draw_stroke(
                 canvas.dc(),
                 &Stroke::new(
@@ -1250,7 +1248,6 @@ mod tests {
                     Colour::Red,
                     2,
                 ),
-                &bounds,
                 (0, 0),
             );
             unsafe {
@@ -1274,7 +1271,6 @@ mod tests {
         // A filled ellipse hides whatever it was drawn around, which defeats the point of
         // drawing on a screenshot. The centre must stay untouched.
         let canvas = blank(120, 120);
-        let bounds = Bounds::from_selection(0, 0, 120, 120);
         draw_stroke(
             canvas.dc(),
             &Stroke::new(
@@ -1285,7 +1281,6 @@ mod tests {
                 Colour::Red,
                 2,
             ),
-            &bounds,
             (0, 0),
         );
         unsafe {
@@ -1302,52 +1297,11 @@ mod tests {
     }
 
     #[test]
-    fn a_stroke_is_clamped_to_the_selection() {
-        // A shape asked for outside the selection must not appear there: the area beyond
-        // it is the dimmed capture, and a stroke over it would be drawn outside the
-        // region the person is capturing.
-        let canvas = blank(200, 200);
-        let bounds = Bounds::from_selection(50, 50, 40, 40);
-        draw_stroke(
-            canvas.dc(),
-            &Stroke::new(
-                Shape::Rectangle {
-                    from: Point::new(-100, -100),
-                    to: Point::new(500, 500),
-                },
-                Colour::Red,
-                2,
-            ),
-            &bounds,
-            (0, 0),
-        );
-        unsafe {
-            let _ = GdiFlush();
-        }
-
-        assert!(
-            painted(&canvas, &RECT { left: 49, top: 49, right: 91, bottom: 91 }) > 0,
-            "nothing was drawn inside the selection"
-        );
-        let mut strays = 0;
-        for y in 0..200 {
-            for x in 0..200 {
-                let inside = x >= 49 && x < 91 && y >= 49 && y < 91;
-                if !inside && pixel(&canvas, x, y) != (0, 0, 0) {
-                    strays += 1;
-                }
-            }
-        }
-        assert_eq!(strays, 0, "the stroke reached outside the selection");
-    }
-
-    #[test]
     fn a_colour_reaches_the_canvas_as_the_colour_it_names() {
         // `COLORREF` is 0x00BBGGRR, so red and blue are the way round that surprises
         // people. Checked by reading the pixel back, because getting it wrong produces a
         // drawing in the wrong colour, which is easy to blame on anything else.
         let canvas = blank(60, 60);
-        let bounds = Bounds::from_selection(0, 0, 60, 60);
         draw_stroke(
             canvas.dc(),
             &Stroke::new(
@@ -1358,7 +1312,6 @@ mod tests {
                 Colour::Blue,
                 2,
             ),
-            &bounds,
             (0, 0),
         );
         unsafe {
@@ -1387,7 +1340,6 @@ mod tests {
         // A press with no movement. Drawing nothing would look like the tool had not
         // registered the click.
         let canvas = blank(40, 40);
-        let bounds = Bounds::from_selection(0, 0, 40, 40);
         draw_stroke(
             canvas.dc(),
             &Stroke::new(
@@ -1397,7 +1349,6 @@ mod tests {
                 Colour::Red,
                 3,
             ),
-            &bounds,
             (0, 0),
         );
         unsafe {
@@ -1415,7 +1366,6 @@ mod tests {
         // tool exists. The head is checked by counting what was drawn near the tip and
         // comparing it with the same count for a zero-length arrow, which has no head.
         let canvas = blank(100, 100);
-        let bounds = Bounds::from_selection(0, 0, 100, 100);
         draw_stroke(
             canvas.dc(),
             &Stroke::new(
@@ -1426,7 +1376,6 @@ mod tests {
                 Colour::Red,
                 2,
             ),
-            &bounds,
             (0, 0),
         );
         unsafe {
@@ -1458,7 +1407,6 @@ mod tests {
         // Pressed and released on one pixel: there is no direction, so there is nothing
         // for a head to point along. It must not divide by zero or draw a stray triangle.
         let canvas = blank(40, 40);
-        let bounds = Bounds::from_selection(0, 0, 40, 40);
         draw_stroke(
             canvas.dc(),
             &Stroke::new(
@@ -1469,7 +1417,6 @@ mod tests {
                 Colour::Red,
                 2,
             ),
-            &bounds,
             (0, 0),
         );
         unsafe {
@@ -1481,39 +1428,9 @@ mod tests {
     }
 
     #[test]
-    fn nothing_is_drawn_into_a_selection_with_no_area() {
-        // The degenerate case, which the model also guards. Two guards is correct here:
-        // this one is the last thing between a stale coordinate and the canvas.
-        let canvas = blank(40, 40);
-        let bounds = Bounds::from_selection(10, 10, 0, 0);
-        draw_stroke(
-            canvas.dc(),
-            &Stroke::new(
-                Shape::Rectangle {
-                    from: Point::new(0, 0),
-                    to: Point::new(10, 10),
-                },
-                Colour::Red,
-                2,
-            ),
-            &bounds,
-            (0, 0),
-        );
-        unsafe {
-            let _ = GdiFlush();
-        }
-        assert_eq!(
-            painted(&canvas, &RECT { left: 0, top: 0, right: 40, bottom: 40 }),
-            0,
-            "something was drawn for a selection with no area"
-        );
-    }
-
-    #[test]
     fn a_shape_is_placed_by_the_selection_origin() {
-        // The conversion the whole module is about: the same stroke, drawn with two
-        // different origins, must land in two different places — and each within its own
-        // selection.
+        // The conversion the whole module is about: the same stroke, drawn with two different
+        // origins, must land in two different places.
         let stroke = Stroke::new(
             Shape::Rectangle {
                 from: Point::new(5, 5),
@@ -1524,19 +1441,9 @@ mod tests {
         );
 
         let first = blank(100, 100);
-        draw_stroke(
-            first.dc(),
-            &stroke,
-            &Bounds::from_selection(10, 10, 40, 40),
-            (10, 10),
-        );
+        draw_stroke(first.dc(), &stroke, (10, 10));
         let second = blank(100, 100);
-        draw_stroke(
-            second.dc(),
-            &stroke,
-            &Bounds::from_selection(50, 50, 40, 40),
-            (50, 50),
-        );
+        draw_stroke(second.dc(), &stroke, (50, 50));
         unsafe {
             let _ = GdiFlush();
         }

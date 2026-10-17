@@ -43,7 +43,7 @@ use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DEFAULT_GUI_FONT, DeleteObject, EndPaint, FillRect, FrameRect,
-    GetStockObject, HBRUSH, HDC, HGDIOBJ, IntersectClipRect, InvalidateRect, PAINTSTRUCT, RestoreDC,
+    GetStockObject, HBRUSH, HDC, HGDIOBJ, InvalidateRect, PAINTSTRUCT, RestoreDC,
     SaveDC, SelectObject, SetBkMode, SetTextColor, TRANSPARENT, TextOutW,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -478,15 +478,13 @@ pub fn select_region(frame: &Frame) -> Result<Option<Composed>> {
     // nothing else, where the window's also carries the dimmed area, the border, the
     // handles — none of which belong in the file.
     let composed = canvas::Canvas::new(&frame.bgra, width, height)?;
-    let bounds = draw::Bounds::from_selection(
-        selection.x,
-        selection.y,
-        selection.width,
-        selection.height,
-    );
+    // Drawn onto the whole canvas and cropped afterwards by the caller, which is what decides
+    // what is kept: a stroke that runs past the region is cut by the crop, not by refusing to
+    // draw it. That is the only clipping left, and it cannot disagree with the selection because
+    // it is the selection.
     let origin = (selection.x, selection.y);
     for stroke in annotations.strokes() {
-        draw::draw_stroke(composed.dc(), stroke, &bounds, origin);
+        draw::draw_stroke(composed.dc(), stroke, origin);
     }
     let bgra = composed.composed_bgra();
 
@@ -565,6 +563,33 @@ fn stroke_worth_keeping(stroke: &Stroke) -> bool {
 /// Returns `true` even when the button did nothing, because a click on the plate must
 /// never fall through to the selection: otherwise aiming at a button that does not apply
 /// would move the region instead.
+/// Begin a stroke at a point on the screen.
+///
+/// One function for both cases: the press may land inside the region or outside it, and with a
+/// drawing tool armed both mean the same thing. The anchor is held relative to the region's
+/// origin like every other annotation coordinate, so a stroke may start at a negative offset
+/// when the region does not cover the point — which is exactly what drawing over the dimmed area
+/// looks like from the inside.
+fn start_a_stroke(st: &mut State, rect: &RECT, point: (i32, i32)) {
+    let frame = selection_frame(rect);
+    let anchor = frame.to_relative(point.0, point.1);
+    let shape = match st.tool {
+        Tool::Arrow => Shape::Arrow { from: anchor, to: anchor },
+        Tool::Rectangle => Shape::Rectangle {
+            from: anchor,
+            to: anchor,
+        },
+        Tool::Ellipse => Shape::Ellipse { from: anchor, to: anchor },
+        Tool::Pencil => Shape::Pencil {
+            points: vec![anchor],
+        },
+        Tool::Move => unreachable!("Move is not a drawing tool"),
+    };
+    st.drawing = Some(Stroke::new(shape, st.colour, st.thickness));
+    st.drag = Drag::Annotate { anchor };
+    st.active_cursor = st.cursors.cross;
+}
+
 /// The palette, when it should be showing.
 ///
 /// Showing means there is a strip, no stroke is being drawn, and the pointer is either over
@@ -785,23 +810,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                     Zone::Move if st.tool.draws() => {
                         let rect = st.current.expect("a zone implies a selection");
-                        let frame = selection_frame(&rect);
-                        let anchor = frame.to_relative(point.0, point.1);
-                        let shape = match st.tool {
-                            Tool::Arrow => Shape::Arrow { from: anchor, to: anchor },
-                            Tool::Rectangle => Shape::Rectangle {
-                                from: anchor,
-                                to: anchor,
-                            },
-                            Tool::Ellipse => Shape::Ellipse { from: anchor, to: anchor },
-                            Tool::Pencil => Shape::Pencil {
-                                points: vec![anchor],
-                            },
-                            Tool::Move => unreachable!("Move is not a drawing tool"),
-                        };
-                        st.drawing = Some(Stroke::new(shape, st.colour, st.thickness));
-                        st.drag = Drag::Annotate { anchor };
-                        st.active_cursor = st.cursors.cross;
+                        start_a_stroke(st, &rect, point);
                     }
                     Zone::Move => {
                         let rect = st.current.expect("a zone implies a selection");
@@ -810,6 +819,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             start: rect,
                         };
                         st.active_cursor = st.cursors.size_all;
+                    }
+                    // A drawing tool armed means the press draws, wherever it lands — over the
+                    // dimmed area as well. The region is still changed by dragging its handles
+                    // or its inside with the move tool, so nothing is lost by giving the press to
+                    // the tool.
+                    Zone::Outside if st.tool.draws() && st.current.is_some() => {
+                        let rect = st.current.expect("a selection is checked above");
+                        start_a_stroke(st, &rect, point);
                     }
                     Zone::Outside => {
                         st.drag = Drag::Create { anchor: point };
@@ -938,11 +955,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         if delta != (0, 0) {
                             st.annotations = st.annotations.rebased(delta);
                         }
-                        // Whatever the move has taken outside the region is not part of the
-                        // capture, so it is dropped rather than kept to reappear if the region
-                        // is dragged back.
-                        let frame = selection_frame(&moved);
-                        st.annotations = st.annotations.clip_to(frame.width, frame.height);
+                        // Nothing is discarded. The marks stay where they are on the screen,
+                        // and one the region no longer covers is simply not in the file — so
+                        // dragging the region back over it finds it again, which is what
+                        // "only what is inside is saved" means when it is the crop that decides.
                         st.strip = strip_for(&st.canvas, st.current, &st.metrics);
                     }
                     Drag::Resize { edges, start } => {
@@ -959,8 +975,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         if delta != (0, 0) {
                             st.annotations = st.annotations.rebased(delta);
                         }
-                        let frame = selection_frame(&resized);
-                        st.annotations = st.annotations.clip_to(frame.width, frame.height);
+                        // As with a move: the marks are not thrown away, only left out of the
+                        // file while the region does not cover them.
                         st.strip = strip_for(&st.canvas, st.current, &st.metrics);
                     }
                     Drag::Annotate { anchor } => {
@@ -1325,32 +1341,19 @@ fn paint(window_dc: HDC, st: &State, invalid: &RECT) {
             SelectObject(mem, font);
         }
 
-        // The drawing goes on after the bright copy of the capture and before the
-        // border, so a stroke can run right up to the edge without being cut by it. It
-        // is clipped to the selection first: a stroke that escaped would be drawn over
-        // the dimmed area outside, where nothing belongs.
+        // The drawing goes on after the bright copy of the capture and before the border.
+        //
+        // It is **not** clipped to the selection. A mark may be made anywhere on the screen — on
+        // the dimmed area as well — and the file keeps only what the region covers, which is
+        // decided by cropping the capture rather than by refusing to draw. Clipping here is what
+        // used to make a stroke stop dead at the region's edge.
         if let Some(rect) = selection {
-            let bounds = draw::Bounds::from_selection(
-                rect.left,
-                rect.top,
-                (rect.right - rect.left) as u32,
-                (rect.bottom - rect.top) as u32,
-            );
             let origin = (rect.left, rect.top);
-            let clip = unsafe { SaveDC(mem) };
-            if clip != 0 {
-                unsafe {
-                    IntersectClipRect(mem, rect.left, rect.top, rect.right, rect.bottom);
-                }
-                for stroke in st.annotations.strokes() {
-                    draw::draw_stroke(mem, stroke, &bounds, origin);
-                }
-                if let Some(stroke) = st.drawing.as_ref() {
-                    draw::draw_stroke(mem, stroke, &bounds, origin);
-                }
-                unsafe {
-                    let _ = RestoreDC(mem, clip);
-                }
+            for stroke in st.annotations.strokes() {
+                draw::draw_stroke(mem, stroke, origin);
+            }
+            if let Some(stroke) = st.drawing.as_ref() {
+                draw::draw_stroke(mem, stroke, origin);
             }
         }
 

@@ -204,95 +204,6 @@ impl Shape {
         }
     }
 
-    /// The shape with everything outside `[0, width) x [0, height)` removed.
-    ///
-    /// Used when the selection is made smaller than what has been drawn on it. `None`
-    /// means nothing of the shape is left, which is reported rather than guessed at so
-    /// the caller can tell "clipped" from "gone".
-    ///
-    /// The two-corner shapes are clipped by moving the offending corner to the edge
-    /// rather than by rejecting the shape: a rectangle dragged past the edge should stop
-    /// at the edge, which is what a person expects. But a shape that is **entirely**
-    /// outside on one side is dropped, because dragging it onto the edge would invent a
-    /// mark where none was drawn.
-    pub fn clipped(&self, width: u32, height: u32) -> Option<Shape> {
-        // A selection with no area holds nothing. `saturating_sub` below would turn its
-        // no-such-pixel bounds into a point at the origin, which is how a stroke that
-        // should have vanished came back as a dot in the corner.
-        if width == 0 || height == 0 {
-            return None;
-        }
-        let max_x = (width - 1) as i32;
-        let max_y = (height - 1) as i32;
-        let clamp = |p: Point| Point::new(p.x.clamp(0, max_x), p.y.clamp(0, max_y));
-
-        match self {
-            // Both corners strictly past the same edge: there is nothing to keep.
-            Shape::Arrow { from, to } => two_corners(*from, *to, max_x, max_y)
-                .map(|(from, to)| Shape::Arrow { from, to }),
-            Shape::Rectangle { from, to } => two_corners(*from, *to, max_x, max_y)
-                .map(|(from, to)| Shape::Rectangle { from, to }),
-            Shape::Ellipse { from, to } => two_corners(*from, *to, max_x, max_y)
-                .map(|(from, to)| Shape::Ellipse { from, to }),
-            Shape::Pencil { points } => {
-                // The pen keeps the runs that are still inside, rather than dragging
-                // every stray point to the edge: a line pulled back to the border would
-                // draw a false segment along it.
-                let runs = inside_runs(points, &clamp);
-                if runs.is_empty() {
-                    None
-                } else {
-                    Some(Shape::Pencil { points: runs })
-                }
-            }
-        }
-    }
-}
-
-/// Two corners reduced to the region, or `None` when the shape is entirely outside it.
-///
-/// "Entirely outside" means both corners on the same side of the same edge, which is the
-/// only arrangement where clamping would move a mark that was never inside.
-fn two_corners(from: Point, to: Point, max_x: i32, max_y: i32) -> Option<(Point, Point)> {
-    let past_the_left = from.x < 0 && to.x < 0;
-    let past_the_right = from.x > max_x && to.x > max_x;
-    let above = from.y < 0 && to.y < 0;
-    let below = from.y > max_y && to.y > max_y;
-    if past_the_left || past_the_right || above || below {
-        return None;
-    }
-    let clamp = |p: Point| Point::new(p.x.clamp(0, max_x), p.y.clamp(0, max_y));
-    Some((clamp(from), clamp(to)))
-}
-
-/// The points that lie inside the region, with a corner point added where a run leaves
-/// it.
-///
-/// A freehand line that goes out of the selection and comes back should keep the part
-/// that went out up to the edge, not stop short of it: the difference is a visible gap
-/// between where the line was drawn and where the edge is.
-fn inside_runs(points: &[Point], clamp: &impl Fn(Point) -> Point) -> Vec<Point> {
-    let inside = |p: &Point| clamp(*p) == *p;
-    let mut kept: Vec<Point> = Vec::with_capacity(points.len());
-    for point in points {
-        if inside(point) {
-            kept.push(*point);
-        } else if kept.last().is_some_and(inside) {
-            // Leaving: stop at the edge.
-            kept.push(clamp(*point));
-            kept.push(*point);
-        } else {
-            kept.push(*point);
-        }
-    }
-    // Trim anything at the ends that is outside, so a run cannot begin or end off the
-    // selection, where it would never be drawn anyway.
-    let first = kept.iter().position(inside);
-    let last = kept.iter().rposition(inside);
-    match (first, last) {
-        (Some(first), Some(last)) if first <= last => kept[first..=last].to_vec(),
-        _ => Vec::new(),
-    }
 }
 
 /// One stroke: a shape, with the colour and thickness it was drawn in.
@@ -389,21 +300,6 @@ impl Annotations {
         self.moved(-delta.0, -delta.1)
     }
 
-    /// Everything outside a selection of this size removed.
-    ///
-    /// The redo stack is not clipped along with the strokes. It is a stack of things
-    /// that have already been taken back, so clipping it would silently change what redo
-    /// puts back; leaving it alone is the smaller surprise of the two.
-    pub fn clip_to(&self, width: u32, height: u32) -> Annotations {
-        Annotations {
-            strokes: self
-                .strokes
-                .iter()
-                .filter_map(|stroke| clip_stroke(stroke, width, height))
-                .collect(),
-            undone: self.undone.clone(),
-        }
-    }
 }
 
 impl Stroke {
@@ -414,15 +310,6 @@ impl Stroke {
             thickness: thickness.max(1),
         }
     }
-}
-
-/// A stroke reduced to the region, or dropped when nothing of it is left.
-fn clip_stroke(stroke: &Stroke, width: u32, height: u32) -> Option<Stroke> {
-    stroke.shape.clipped(width, height).map(|shape| Stroke {
-        shape,
-        colour: stroke.colour,
-        thickness: stroke.thickness,
-    })
 }
 
 /// Move a stroke, keeping its colour and thickness.
@@ -528,37 +415,12 @@ mod tests {
     }
 
     #[test]
-    fn a_point_outside_the_selection_keeps_its_offset() {
-        // Clamping here would flatten a line that leaves the region onto its edge, so
-        // the offset is kept and clipping is left to `clipped`, which knows the shape.
-        let frame = Frame::new(100, 100, 50, 50);
-        assert_eq!(frame.to_relative(90, 100), Point::new(-10, 0));
-        assert_eq!(frame.to_relative(400, 400), Point::new(300, 300));
-    }
-
-    #[test]
-    fn moving_the_drawing_and_moving_it_back_is_a_no_op() {
-        // A round trip, so it holds whatever the numbers are. It used to be called "moving the
-        // selection takes the drawing with it", which described the coordinates rather than
-        // what anybody wants to happen: a mark stays on the screen, and the shift exists to
-        // keep it there as the origin moves under it.
-        let annotations = {
-            let mut a = Annotations::new();
-            a.add(arrow((10, 20), (30, 40)));
-            a
-        };
-
-        let moved = annotations.moved(7, -3);
-        let back = moved.moved(-7, 3);
-        assert_eq!(back.strokes(), annotations.strokes(), "a move and back is a no-op");
-    }
-
-    #[test]
     fn a_mark_stays_on_the_screen_when_the_region_moves() {
         // The report: paint something, drag the region, and the painting is gone. Coordinates
-        // are held relative to the region's origin, and the origin moves with the drag, so a
-        // mark shifted the same way as the region travels twice as far as it and leaves the
-        // frame. It has to be shifted the opposite way to stay put.
+        // are held relative to the region's origin, and the origin moves with the drag, so a mark
+        // shifted the same way as the region travels twice as far as it and leaves the frame. It
+        // has to be shifted the opposite way to stay put, and `rebased` is what the overlay
+        // calls, so this exercises the code that runs rather than repeating its arithmetic.
         let frame = Frame::new(100, 100, 200, 200);
         let mut annotations = Annotations::new();
         annotations.add(Stroke::new(
@@ -579,9 +441,6 @@ mod tests {
             frame.width,
             frame.height,
         );
-        // Without clipping, because this is about where the mark sits: `clip_to` pulls a shape
-        // that crosses the edge back into the region, which would move this one and leave the
-        // test measuring the clip instead of the shift. `rebased` is what the overlay calls.
         let after = annotations.rebased(delta);
 
         let stroke = &after.strokes()[0];
@@ -597,31 +456,50 @@ mod tests {
     }
 
     #[test]
-    fn dragging_the_region_away_drops_what_falls_outside() {
-        // What the move takes out of the region is not part of the capture, so it goes: half a
-        // box left outside is not saved, and does not come back when the region is dragged over
-        // it again.
+    fn a_mark_may_sit_outside_the_region_and_stays_there() {
+        // Drawing is not confined to the region any more: a mark made over the dimmed area is
+        // held at a negative offset from the origin, which is a coordinate and not an error. What
+        // saves only the inside is the crop, so nothing here may throw the outside part away.
         let mut annotations = Annotations::new();
         annotations.add(Stroke::new(
-            Shape::Rectangle {
-                from: Point::new(80, 10),
-                to: Point::new(120, 40),
+            Shape::Arrow {
+                from: Point::new(-30, -20),
+                to: Point::new(80, 70),
             },
-            Colour::Red,
-            2,
+            Colour::Green,
+            4,
         ));
 
-        // The region moves right by 40, so the box is now at 40..80 and stays.
-        let kept = annotations.moved(-40, 0).clip_to(100, 100);
-        assert_eq!(kept.strokes().len(), 1, "a box still inside was dropped");
-
-        // Far enough that it is wholly outside drops it entirely.
-        let gone = annotations.moved(-200, 0).clip_to(100, 100);
-        assert!(
-            gone.strokes().is_empty(),
-            "a box dragged out of the region is still there: {:?}",
-            gone.strokes()
+        // A move does not discard it, however far outside it is.
+        let moved = annotations.rebased((120, 90));
+        assert_eq!(
+            moved.strokes().len(),
+            1,
+            "a mark outside the region was discarded by moving the region"
         );
+        let Shape::Arrow { from, to } = moved.strokes()[0].shape else {
+            panic!("the shape changed");
+        };
+        // The whole stroke is still there, both ends, at the offsets the move implies.
+        assert_eq!(from, Point::new(-150, -110));
+        assert_eq!(to, Point::new(-40, -20));
+    }
+
+    #[test]
+    fn moving_the_drawing_and_moving_it_back_is_a_no_op() {
+        // A round trip, so it holds whatever the numbers are. It used to be called "moving the
+        // selection takes the drawing with it", which described the coordinates rather than
+        // what anybody wants to happen: a mark stays on the screen, and the shift exists to
+        // keep it there as the origin moves under it.
+        let annotations = {
+            let mut a = Annotations::new();
+            a.add(arrow((10, 20), (30, 40)));
+            a
+        };
+
+        let moved = annotations.moved(7, -3);
+        let back = moved.moved(-7, 3);
+        assert_eq!(back.strokes(), annotations.strokes(), "a move and back is a no-op");
     }
 
     #[test]
@@ -701,120 +579,6 @@ mod tests {
     }
 
     #[test]
-    fn shrinking_the_selection_pulls_a_rectangle_back_to_the_edge() {
-        // A rectangle dragged past the edge stops at the edge rather than disappearing.
-        let mut annotations = Annotations::new();
-        annotations.add(Stroke::new(
-            Shape::Rectangle {
-                from: Point::new(5, 5),
-                to: Point::new(500, 500),
-            },
-            Colour::Red,
-            2,
-        ));
-
-        let clipped = annotations.clip_to(100, 60);
-        assert_eq!(clipped.strokes().len(), 1);
-        assert_eq!(
-            clipped.strokes()[0].shape,
-            Shape::Rectangle {
-                from: Point::new(5, 5),
-                to: Point::new(99, 59),
-            }
-        );
-    }
-
-    #[test]
-    fn shrinking_the_selection_drops_a_stroke_that_falls_outside() {
-        let mut annotations = Annotations::new();
-        annotations.add(arrow((200, 200), (300, 300)));
-        let clipped = annotations.clip_to(100, 100);
-        assert!(
-            clipped.strokes().is_empty(),
-            "a stroke entirely outside should not be dragged onto the edge"
-        );
-    }
-
-    #[test]
-    fn a_pencil_is_cut_at_the_edge_rather_than_flattened_onto_it() {
-        // The case that makes the pen different from the two-corner shapes: points
-        // outside are dropped and the run is stopped at the border. Flattening them onto
-        // the edge would draw a false segment along it.
-        let mut annotations = Annotations::new();
-        annotations.add(Stroke::new(
-            Shape::Pencil {
-                points: vec![
-                    Point::new(1, 1),
-                    Point::new(2, 2),
-                    Point::new(50, 50),
-                    Point::new(60, 60),
-                ],
-            },
-            Colour::Blue,
-            1,
-        ));
-
-        let clipped = annotations.clip_to(10, 10);
-        let Shape::Pencil { points } = &clipped.strokes()[0].shape else {
-            panic!("the pen changed kind while clipping");
-        };
-        assert_eq!(points[0], Point::new(1, 1));
-        assert_eq!(points[1], Point::new(2, 2));
-        // The border is where the run stops, and nothing is kept past it.
-        assert!(
-            points.iter().all(|p| p.x < 10 && p.y < 10),
-            "a point outside the selection survived: {points:?}"
-        );
-    }
-
-    #[test]
-    fn growing_the_selection_leaves_the_drawing_alone() {
-        let mut annotations = Annotations::new();
-        annotations.add(arrow((10, 10), (20, 20)));
-        let before = annotations.strokes().to_vec();
-        let clipped = annotations.clip_to(1000, 1000);
-        assert_eq!(clipped.strokes(), before.as_slice());
-    }
-
-    #[test]
-    fn an_ellipse_is_clipped_like_the_rectangle_it_is_inscribed_in() {
-        // An ellipse is carried by the same two corners as a rectangle, so it has to
-        // behave the same way under clipping — including being dropped when it is
-        // entirely outside, which is the case a shared implementation gets wrong.
-        let mut annotations = Annotations::new();
-        annotations.add(Stroke::new(
-            Shape::Ellipse {
-                from: Point::new(5, 5),
-                to: Point::new(500, 500),
-            },
-            Colour::Yellow,
-            2,
-        ));
-        let clipped = annotations.clip_to(100, 60);
-        assert_eq!(
-            clipped.strokes()[0].shape,
-            Shape::Ellipse {
-                from: Point::new(5, 5),
-                to: Point::new(99, 59),
-            }
-        );
-
-        let mut outside = Annotations::new();
-        outside.add(Stroke::new(
-            Shape::Ellipse {
-                from: Point::new(200, 10),
-                to: Point::new(300, 90),
-            },
-            Colour::Yellow,
-            2,
-        ));
-        assert!(
-            outside.clip_to(100, 100).strokes().is_empty(),
-            "an ellipse entirely past the edge should not be pulled onto it"
-        );
-    }
-
-    #[test]
     fn a_colour_cycle_returns_to_where_it_started() {
         let mut colour = Colour::Red;
         for _ in 0..Colour::ALL.len() {
@@ -880,21 +644,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn clipping_to_a_selection_one_pixel_across_is_not_a_panic() {
-        // The degenerate size, which `saturating_sub` is there for.
-        let mut annotations = Annotations::new();
-        annotations.add(arrow((0, 0), (50, 50)));
-        let clipped = annotations.clip_to(1, 1);
-        assert_eq!(clipped.strokes().len(), 1);
-        assert_eq!(
-            clipped.strokes()[0].shape,
-            Shape::Arrow {
-                from: Point::new(0, 0),
-                to: Point::new(0, 0),
-            }
-        );
-        // And a selection with no size at all keeps nothing.
-        assert!(annotations.clip_to(0, 0).strokes().is_empty());
-    }
 }
