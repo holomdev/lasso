@@ -286,7 +286,12 @@ pub fn draw_strip(
         // every button below it and make the strip a different shape from one moment to
         // the next.
         let ink = if state.is_disabled(button) { DIM_INK } else { BUTTON_INK };
-        draw_button_glyph(hdc, button, &rect, ink);
+        // Only the colour button is filled, and with the colour a stroke would use.
+        let fill = match button {
+            Button::Colour => Some(state.colour.to_colorref()),
+            _ => None,
+        };
+        draw_button_glyph(hdc, button, &rect, ink, fill);
     }
 }
 
@@ -303,6 +308,11 @@ pub struct StripState {
     pub can_undo: bool,
     /// Whether there is anything for redo to put back.
     pub can_redo: bool,
+    /// The colour a stroke would be drawn in, which the colour button shows.
+    ///
+    /// The button is the only place the colour appears: without it the strip says nothing
+    /// about what will be drawn, and the only way to find out is to draw something.
+    pub colour: crate::overlay::annotation::Colour,
 }
 
 impl StripState {
@@ -337,7 +347,7 @@ fn user_objects() -> u32 {
 /// `ink` colours both the lines and, where a shape needs it, the fill. A button that
 /// cannot be used is drawn in a colour close to the plate: present, and visibly not
 /// available.
-fn draw_button_glyph(hdc: HDC, button: Button, rect: &RECT, ink: COLORREF) {
+fn draw_button_glyph(hdc: HDC, button: Button, rect: &RECT, ink: COLORREF, fill: Option<COLORREF>) {
     let width = rect.right - rect.left;
     let height = rect.bottom - rect.top;
     let centre = (rect.left + width / 2, rect.top + height / 2);
@@ -439,8 +449,24 @@ fn draw_button_glyph(hdc: HDC, button: Button, rect: &RECT, ink: COLORREF) {
             );
         }
         Button::Colour => {
-            // A filled disc: the colour itself is filled in by the caller's face
-            // drawing, and this is its outline.
+            // A disc filled with the colour in force, then outlined. Filling it is the
+            // whole point: a swatch that is not the colour is a button with no answer.
+            if let Some(colour) = fill {
+                let disc = RECT {
+                    left: centre.0 - arm,
+                    top: centre.1 - arm,
+                    right: centre.0 + arm + 1,
+                    bottom: centre.1 + arm + 1,
+                };
+                let swatch = unsafe { CreateSolidBrush(colour) };
+                if !swatch.is_invalid() {
+                    unsafe {
+                        let _ = Ellipse(hdc, disc.left, disc.top, disc.right, disc.bottom);
+                        windows::Win32::Graphics::Gdi::FillRect(hdc, &disc, swatch);
+                        let _ = DeleteObject(HGDIOBJ(swatch.0));
+                    }
+                }
+            }
             unsafe {
                 let _ = Ellipse(
                     hdc,
@@ -450,7 +476,6 @@ fn draw_button_glyph(hdc: HDC, button: Button, rect: &RECT, ink: COLORREF) {
                     centre.1 + arm + 1,
                 );
             }
-            line((centre.0 - arm, centre.1), (centre.0 + arm, centre.1));
         }
         Button::Thickness => {
             // Three lines of increasing weight, drawn as separate pens would be
@@ -615,6 +640,7 @@ mod tests {
         let state = StripState {
             active: Some(Button::Tool(Tool::Arrow)),
             can_undo: true,
+            colour: crate::overlay::annotation::Colour::Red,
             can_redo: false,
         };
 
@@ -703,6 +729,89 @@ mod tests {
             "every ten passes over every shape add {growth} GDI objects, so a pen or brush \
              is never released"
         );
+    }
+
+    #[test]
+    fn the_colour_button_is_filled_with_the_colour_a_stroke_would_use() {
+        // The button carried a comment saying the colour was filled in by the caller's face
+        // drawing, and the face is one brush shared by all twelve buttons — so the colour
+        // was in fact never shown anywhere. The only way to find out what would be drawn was
+        // to draw something.
+        use crate::overlay::annotation::Colour;
+        use crate::overlay::toolbar::{self, Region};
+
+        let metrics = toolbar::Metrics::BASE;
+        let placement = toolbar::place(
+            Region {
+                x: metrics.width() as i32 + 40,
+                y: 20,
+                width: 60,
+                height: 60,
+            },
+            200,
+            metrics.height() + 40,
+            &metrics,
+        );
+        // The colour button's own square, from the same arithmetic the drawing uses.
+        let (_, x, y, w, h) = metrics
+            .button_rects()
+            .into_iter()
+            .find(|(button, ..)| *button == Button::Colour)
+            .expect("the colour button is in the strip");
+        let square = RECT {
+            left: placement.x + x,
+            top: placement.y + y,
+            right: placement.x + x + w as i32,
+            bottom: placement.y + y + h as i32,
+        };
+
+        for colour in [Colour::Red, Colour::Blue, Colour::White] {
+            let canvas = blank(200, metrics.height() + 40);
+            let plate = unsafe { CreateSolidBrush(COLORREF(0x0020_2020)) };
+            let edge = unsafe { CreateSolidBrush(COLORREF(0x0060_6060)) };
+            let face = unsafe { CreateSolidBrush(COLORREF(0x0040_4040)) };
+            draw_strip(
+                canvas.dc(),
+                &placement,
+                &metrics,
+                &StripState {
+                    active: None,
+                    can_undo: false,
+                    can_redo: false,
+                    colour,
+                },
+                plate,
+                edge,
+                face,
+            );
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(plate.0));
+                let _ = DeleteObject(HGDIOBJ(edge.0));
+                let _ = DeleteObject(HGDIOBJ(face.0));
+            }
+
+            // The colour as the buffer holds it: `to_colorref` is 0x00BBGGRR, and the pixels
+            // come back as blue, green, red.
+            let wanted = match colour {
+                Colour::Red => (0u8, 0u8, 255u8),
+                Colour::Blue => (255, 0, 0),
+                Colour::White => (255, 255, 255),
+                other => panic!("{other:?} has no expectation here"),
+            };
+            let mut found = 0;
+            for y in square.top..square.bottom {
+                for x in square.left..square.right {
+                    if pixel(&canvas, x, y) == wanted {
+                        found += 1;
+                    }
+                }
+            }
+            assert!(
+                found > 20,
+                "{colour:?} should fill the colour button, and only {found} pixels of it \
+                 were drawn in that square: the swatch does not show the colour in force"
+            );
+        }
     }
 
     #[test]
@@ -1105,6 +1214,7 @@ mod tests {
         let state = StripState {
             active: Some(Button::Tool(Tool::Arrow)),
             can_undo: true,
+            colour: crate::overlay::annotation::Colour::Red,
             can_redo: false,
         };
         draw_strip(canvas.dc(), &placement, &metrics, &state, plate, edge, face);
@@ -1183,6 +1293,7 @@ mod tests {
                 &StripState {
                     active: None,
                     can_undo: true,
+                    colour: crate::overlay::annotation::Colour::Red,
                     can_redo: true,
                 },
                 plate,
@@ -1286,6 +1397,7 @@ mod tests {
                     active: None,
                     can_undo,
                     can_redo,
+                    colour: crate::overlay::annotation::Colour::Red,
                 },
                 plate,
                 edge,

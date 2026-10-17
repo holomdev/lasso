@@ -127,16 +127,45 @@ and reports the line it came from, rather than refusing to start.
 `--hotkey` overrides the file's combination for a single run and does not write
 back, which is what makes it usable from a shortcut.
 
+### The strip
+
+Twelve buttons, top to bottom, in four groups separated by a faint line: the
+tools, then how a stroke looks, then history, then the way out. The group is the
+order things are reached for, and the separator is so the eye can skip the ones
+it is not using.
+
+| # | Button | Key | What it does |
+|---|---|---|---|
+| 1 | Move | `S` | Arms nothing. The pointer goes back to a four-way arrow and the region can be moved and resized; this is the state the overlay starts in. |
+| 2 | Arrow | `A` | Drag from tail to head and a straight arrow is drawn between the two points. |
+| 3 | Rectangle | `R` | Drag two opposite corners. The box is **open, not filled**: a box on a screenshot marks something, and filling it would hide what is being marked. |
+| 4 | Ellipse | `E` | The same, as an open oval. |
+| 5 | Pencil | `P` | Freehand. A press without movement still leaves a dot, so a single point can be marked. |
+| 6 | Colour | `C` | Cycles red → yellow → green → blue → white. The button itself is drawn in the colour in force, so the strip says what will be drawn. |
+| 7 | Thickness | `+` `-` | The stroke's width, from 1 to 24 in steps of two. The glyph is drawn at the width in force and grows with it. |
+| 8 | Undo | `Ctrl+Z` | Removes the last stroke. Drawn faint and ignored when there is nothing to undo. |
+| 9 | Redo | `Ctrl+Y` | Puts back the last stroke that was undone. Faint and ignored when there is nothing to redo. |
+| 10 | Save | `Enter` | Writes the region with its annotations and closes. |
+| 11 | Copy | — | Puts the region on the clipboard and closes without writing a file. |
+| 12 | Cancel | `Esc`, right click | Closes without saving and without touching the clipboard. |
+
+The strip is placed beside the region and **never over it** while there is room
+anywhere on the screen. It is drawn every frame, including while a stroke is in
+progress.
+
+`Esc` gives up the armed tool rather than the window when one is armed, so that
+"I did not mean to draw" does not throw away the region. A second `Esc` cancels.
+
 ### Selection keys
 
 | Input | Result |
 |---|---|
 | left drag | defines the region; dragging again replaces it |
-| Enter | saves the region, or the whole screen when nothing is selected |
-| Esc or right click | cancels |
-
-covers the handles on the far side, and it stays out of the way entirely while
-the whole region is being moved.
+| left drag inside | moves the region, keeping its size |
+| left drag on an edge or corner | resizes it; dragging past the opposite edge flips it |
+| arrow keys | nudges the region by one pixel, ten with `Shift`, and the strokes with it |
+| `Enter` | saves the region, or the whole screen when nothing is selected |
+| `Esc` or right click | cancels |
 
 By default output goes to `target/test-output/`. Keeping it under `target/` means
 throwaway runs never leave files that could be committed by accident. Pass

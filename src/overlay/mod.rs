@@ -1274,6 +1274,7 @@ fn draw_strip(hdc: HDC, st: &State, placement: &Placement) {
         active,
         can_undo: st.annotations.can_undo(),
         can_redo: st.annotations.can_redo(),
+        colour: st.colour,
     };
     draw::draw_strip(hdc, placement, &st.metrics, &state, st.plate, st.edge, st.face);
 }
