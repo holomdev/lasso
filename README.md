@@ -138,7 +138,7 @@ it is not using.
 |---|---|---|---|
 | 1 | Move | `S` | Arms nothing. The pointer goes back to a four-way arrow and the region can be moved and resized; this is the state the overlay starts in. |
 | 2 | Arrow | `A` | Drag from tail to head and a straight arrow is drawn between the two points. |
-| 3 | Rectangle | `R` | Drag two opposite corners. The box is **open, not filled**: a box on a screenshot marks something, and filling it would hide what is being marked. |
+| 3 | Rectangle | `R` | Drag two opposite corners. The box is **open, not filled**: a box on a screenshot marks something, and filling it would hide what is being marked. Its sides are the width in force, drawn inside the corners so a thick box never reaches past what was dragged. |
 | 4 | Ellipse | `E` | The same, as an open oval. |
 | 5 | Pencil | `P` | Freehand. A press without movement still leaves a dot, so a single point can be marked. |
 | 6 | Colour | `C` | A swatch of the colour in force, filled with it. Pointing at it opens a palette of the five colours beside the strip; clicking one chooses it. `C` cycles them for the keyboard. |

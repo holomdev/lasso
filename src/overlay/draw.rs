@@ -104,25 +104,62 @@ pub fn draw_stroke(hdc: HDC, stroke: &Stroke, bounds: &Bounds, origin: (i32, i32
             draw_arrow(hdc, from, to, thickness);
         }
         Shape::Rectangle { from, to } => {
-            // Open, not filled: the point of a box on a screenshot is to mark something,
-            // and filling it would hide exactly what is being marked.
+            // Open, not filled: the point of a box on a screenshot is to mark something, and
+            // filling it would hide exactly what is being marked.
             //
-            // `FrameRect` takes a brush rather than using the pen, so the stroke's colour is
-            // made into one. The brush is never selected into the context — `FrameRect` is
-            // given it directly — so it can be deleted here, and that matters: deleting an
-            // object that is still selected into a DC is how a handle is lost rather than
-            // released.
+            // Four bars rather than `FrameRect`, which always draws a one-pixel frame with a
+            // brush and so ignored the width while every other shape honoured it. And rather
+            // than a pen, because a pen is centred on the path: a thick one would reach half
+            // its width outside the box, and staying inside the box the two points describe is
+            // the one property a marking box has to keep.
+            //
+            // The brush is never selected into the context — `FillRect` is given it directly —
+            // so it can be deleted here.
             let (left, top, right, bottom) = normalized(to_canvas(*from), to_canvas(*to));
-            let outline = RECT {
-                left,
-                top,
-                right: right + 1,
-                bottom: bottom + 1,
-            };
+            let width = (right - left + 1).max(1);
+            let height = (bottom - top + 1).max(1);
+            // A box smaller than the stroke is all stroke, and that is what a thick outline
+            // looks like: no bar may be wider than the box it sits in.
+            let bar = thickness.min(width).min(height);
+
             let brush = unsafe { CreateSolidBrush(colour) };
             if !brush.is_invalid() {
+                let bars = [
+                    // Top and bottom, full width.
+                    RECT {
+                        left,
+                        top,
+                        right: right + 1,
+                        bottom: top + bar,
+                    },
+                    RECT {
+                        left,
+                        top: bottom + 1 - bar,
+                        right: right + 1,
+                        bottom: bottom + 1,
+                    },
+                    // Left and right, between them.
+                    RECT {
+                        left,
+                        top,
+                        right: left + bar,
+                        bottom: bottom + 1,
+                    },
+                    RECT {
+                        left: right + 1 - bar,
+                        top,
+                        right: right + 1,
+                        bottom: bottom + 1,
+                    },
+                ];
+                for side in bars {
+                    if side.right > side.left && side.bottom > side.top {
+                        unsafe {
+                            windows::Win32::Graphics::Gdi::FillRect(hdc, &side, brush);
+                        }
+                    }
+                }
                 unsafe {
-                    FrameRect(hdc, &outline, brush);
                     let _ = DeleteObject(HGDIOBJ(brush.0));
                 }
             }
@@ -1068,6 +1105,71 @@ mod tests {
                  were drawn in that square: the swatch does not show the colour in force"
             );
         }
+    }
+
+    #[test]
+    fn a_rectangle_thickens_with_the_stroke() {
+        // Reported: the arrow, the ellipse and the pencil took the chosen width and the box did
+        // not. It was drawn with `FrameRect`, which always makes a one-pixel frame with a brush,
+        // so the width was never consulted. Nothing about a picture of one rectangle shows it;
+        // two of them at different widths do.
+        let bounds = Bounds::from_selection(0, 0, 120, 120);
+        let box_of = || Shape::Rectangle {
+            from: Point::new(20, 30),
+            to: Point::new(100, 90),
+        };
+
+        let mut painted_at = Vec::new();
+        for thickness in [2u32, 12] {
+            let canvas = blank(120, 120);
+            draw_stroke(
+                canvas.dc(),
+                &Stroke::new(box_of(), Colour::Red, thickness),
+                &bounds,
+                (0, 0),
+            );
+            let area = painted(
+                &canvas,
+                &RECT {
+                    left: 0,
+                    top: 0,
+                    right: 120,
+                    bottom: 120,
+                },
+            );
+            painted_at.push(area);
+
+            // And it still stays inside the box its two points describe, whatever its width.
+            let outside = painted(
+                &canvas,
+                &RECT {
+                    left: 0,
+                    top: 0,
+                    right: 120,
+                    bottom: 120,
+                },
+            ) - painted(
+                &canvas,
+                &RECT {
+                    left: 20,
+                    top: 30,
+                    right: 101,
+                    bottom: 91,
+                },
+            );
+            assert_eq!(
+                outside, 0,
+                "a {thickness}px box drew {outside} pixels outside its own corners"
+            );
+        }
+
+        assert!(
+            painted_at[1] > painted_at[0] * 2,
+            "a 12px box painted {} pixels and a 2px one painted {}: the width is being \
+             ignored",
+            painted_at[1],
+            painted_at[0]
+        );
     }
 
     #[test]
