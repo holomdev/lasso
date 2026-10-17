@@ -139,11 +139,11 @@ const PLATE_EDGE: COLORREF = COLORREF(0x0055_5555);
 const BUTTON_FACE: COLORREF = COLORREF(0x0048_4848);
 
 /// The stroke width a new stroke starts at, in 96-DPI pixels.
-const DEFAULT_THICKNESS: u32 = 2;
+const DEFAULT_THICKNESS: u32 = annotation::THICKNESS_STEPS[0];
 
 /// How thick a stroke may be made, so that the key that changes it cannot run away and
 /// leave a stroke wider than the selection.
-const MAX_THICKNESS: u32 = 24;
+
 
 /// Where the strip goes for the current selection.
 ///
@@ -299,7 +299,7 @@ struct State {
     /// pointer being on the colour button and kept open by the pointer being inside the
     /// palette, and those two are not the same test. Without this flag, crossing the empty
     /// space where the swatches would be opened a palette out of nothing.
-    palette_open: bool,
+    open_palette: Option<toolbar::PaletteKind>,
     /// Whether the timer that closes the palette after the pointer has left is running.
     ///
     /// Without it the palette closed the instant the pointer was in neither the strip nor the
@@ -403,7 +403,7 @@ pub fn select_region(frame: &Frame) -> Result<Option<Composed>> {
             drawing: None,
             strip: None,
             hovered: None,
-        palette_open: false,
+        open_palette: None,
         palette_grace: false,
             pressed: None,
             metrics: toolbar::metrics_for(crate::ui_layout::factor(unsafe {
@@ -573,13 +573,12 @@ fn stroke_worth_keeping(stroke: &Stroke) -> bool {
 /// classic way a hover menu becomes unusable.
 fn palette_shown(st: &State) -> Option<toolbar::Palette> {
     let strip = st.strip?;
+    let kind = st.open_palette?;
     if matches!(st.drag, Drag::Annotate { .. }) {
         return None;
     }
-    if !st.palette_open {
-        return None;
-    }
     Some(toolbar::palette_for(
+        kind,
         &strip,
         st.canvas.width(),
         st.canvas.height(),
@@ -589,10 +588,15 @@ fn palette_shown(st: &State) -> Option<toolbar::Palette> {
 
 fn strip_clicked(st: &mut State, point: (i32, i32)) -> bool {
     // The palette is asked first: it opens beside the strip, and a press that lands on it is
-    // a colour chosen, not a button pressed.
+    // a choice made, not a button pressed.
     if let Some(palette) = palette_shown(st) {
-        if let Some(colour) = palette.hit(&st.metrics, point.0, point.1) {
-            st.colour = colour;
+        if let Some(index) = palette.index_at(&st.metrics, point.0, point.1) {
+            match palette.kind {
+                toolbar::PaletteKind::Colour => st.colour = Colour::ALL[index],
+                toolbar::PaletteKind::Thickness => {
+                    st.thickness = annotation::THICKNESS_STEPS[index];
+                }
+            }
             return true;
         }
     }
@@ -613,11 +617,9 @@ fn strip_clicked(st: &mut State, point: (i32, i32)) -> bool {
         }
         Button::Colour => st.colour = st.colour.next(),
         Button::Thickness => {
-            st.thickness = if st.thickness >= MAX_THICKNESS {
-                DEFAULT_THICKNESS
-            } else {
-                st.thickness + 2
-            };
+            // The same list the palette offers, so clicking the button can never land on a
+            // width that has no dot in the palette to mark as chosen.
+            st.thickness = annotation::next_thickness(st.thickness);
         }
         Button::Undo => {
             st.annotations.undo();
@@ -671,19 +673,24 @@ fn relayout(hwnd: HWND, st: &State, previous: &[Option<RECT>]) {
     // The palette opens and closes by the pointer moving, with no other state change, so its
     // area is invalidated every time: otherwise the panel would be painted and never cleared,
     // or cleared and never painted.
+    // Both palettes, whichever is showing: a palette that has just closed has to be repainted
+    // with the capture, and the moment it closes is the moment its kind is forgotten.
     if let Some(strip) = st.strip {
-        let palette = toolbar::palette_for(
-            &strip,
-            st.canvas.width(),
-            st.canvas.height(),
-            &st.metrics,
-        );
-        rects.push(Some(RECT {
-            left: palette.x,
-            top: palette.y,
-            right: palette.x + palette.width as i32,
-            bottom: palette.y + palette.height as i32,
-        }));
+        for kind in [toolbar::PaletteKind::Colour, toolbar::PaletteKind::Thickness] {
+            let palette = toolbar::palette_for(
+                kind,
+                &strip,
+                st.canvas.width(),
+                st.canvas.height(),
+                &st.metrics,
+            );
+            rects.push(Some(RECT {
+                left: palette.x,
+                top: palette.y,
+                right: palette.x + palette.width as i32,
+                bottom: palette.y + palette.height as i32,
+            }));
+        }
     }
     invalidate_rects(hwnd, &rects, DIRTY_PAD);
 }
@@ -851,33 +858,38 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             .and_then(|placement| {
                                 toolbar::hit(placement, &st.metrics, point.0, point.1)
                             });
-                        // The palette's own rule, kept in one place and tested there:
-                        // being inside it holds it open, but only the colour button opens it.
-                        let over_colour = st.hovered == Some(Button::Colour);
-                        let inside_palette = st.strip.is_some_and(|placement| {
-                            let palette = toolbar::palette_for(
-                                &placement,
-                                st.canvas.width(),
-                                st.canvas.height(),
-                                &st.metrics,
-                            );
-                            palette.keeps_open(point.0, point.1)
+                        // The palette's own rule, kept in one place and tested there: being
+                        // inside it holds it open, but only its own button opens it.
+                        let over = match st.hovered {
+                            Some(Button::Colour) => Some(toolbar::PaletteKind::Colour),
+                            Some(Button::Thickness) => Some(toolbar::PaletteKind::Thickness),
+                            _ => None,
+                        };
+                        let inside = st.open_palette.is_some_and(|kind| {
+                            st.strip.is_some_and(|placement| {
+                                toolbar::palette_for(
+                                    kind,
+                                    &placement,
+                                    st.canvas.width(),
+                                    st.canvas.height(),
+                                    &st.metrics,
+                                )
+                                .keeps_open(point.0, point.1)
+                            })
                         });
-                        if toolbar::palette_visible(
-                            st.palette_open,
-                            over_colour,
-                            inside_palette,
-                        ) {
-                            st.palette_open = true;
-                            // Back inside: the clock stops, and the palette never flickered.
+                        let opened = toolbar::palette_opened(st.open_palette, over, inside);
+                        if opened.is_some() {
+                            st.open_palette = opened;
+                            // Back inside: the clock stops, so nothing flickers for a pointer
+                            // moving within the panel.
                             if st.palette_grace {
                                 unsafe {
                                     let _ = KillTimer(Some(hwnd), PALETTE_TIMER);
                                 }
                                 st.palette_grace = false;
                             }
-                        } else if st.palette_open && !st.palette_grace {
-                            // Out of the zone with the palette showing: it stays for a moment
+                        } else if st.open_palette.is_some() && !st.palette_grace {
+                            // Out of the zone with a palette showing: it stays for a moment
                             // rather than vanishing under a hand that has not finished moving.
                             unsafe {
                                 let _ = SetTimer(Some(hwnd), PALETTE_TIMER, PALETTE_GRACE_MS, None);
@@ -948,7 +960,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // panel would appear beside a button nobody is pointing at, so it closes.
                 // Opening again is one hover away.
                 if st.strip != previous_strip {
-                    st.palette_open = false;
+                    st.open_palette = None;
                 }
 
                 // A mouse move that lands on the same pixel and leaves the
@@ -1168,9 +1180,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 STATE.with(|slot| {
                     if let Some(st) = slot.borrow_mut().as_mut() {
                         st.thickness = if key == b'-' as u16 {
-                            st.thickness.saturating_sub(2).max(1)
+                            annotation::previous_thickness(st.thickness)
                         } else {
-                            (st.thickness + 2).min(MAX_THICKNESS)
+                            annotation::next_thickness(st.thickness)
                         };
                         relayout(hwnd, st, &[]);
                     }
@@ -1213,8 +1225,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let _ = KillTimer(Some(hwnd), PALETTE_TIMER);
                 }
                 st.palette_grace = false;
-                if st.palette_open {
-                    st.palette_open = false;
+                if st.open_palette.is_some() {
+                    st.open_palette = None;
                     // Its area has to be repainted with the capture now that it is gone.
                     relayout(hwnd, st, &[]);
                 }
@@ -1345,7 +1357,14 @@ fn paint(window_dc: HDC, st: &State, invalid: &RECT) {
                 // The palette goes after the strip, so it is over it where the two meet, and
                 // after the hint, so the hint is never drawn on top of a swatch.
                 if let Some(palette) = palette_shown(st) {
-                    draw::draw_palette(mem, &palette, &st.metrics, st.colour, st.plate, st.edge);
+                    draw::draw_palette(
+                        mem,
+                        &palette,
+                        &st.metrics,
+                        &strip_state(st),
+                        st.plate,
+                        st.edge,
+                    );
                 }
             }
             None => draw_hint(mem, &st.canvas),
@@ -1403,22 +1422,37 @@ fn dump_canvas(st: &State) {
 }
 
 /// The strip, with the armed tool, the hovered button and the unavailable ones showing.
-fn draw_strip(hdc: HDC, st: &State, placement: &Placement) {
-    // The armed tool is highlighted, unless the pointer is over another button, in which
-    // case that one is: the highlight follows the pointer because that is what a press
-    // would act on.
+/// What the strip and its palette are drawn with.
+///
+/// One builder rather than two: a palette that showed a different colour from the button that
+/// opened it would be a defect of exactly the kind this state exists to prevent.
+fn strip_state(st: &State) -> draw::StripState {
+    // The armed tool is highlighted, unless the pointer is over another button, in which case
+    // that one is: the highlight follows the pointer because that is what a press would act on.
     let active = match st.hovered {
         Some(button) => Some(button),
         None if st.tool.draws() => Some(Button::Tool(st.tool)),
         None => None,
     };
-    let state = draw::StripState {
+    draw::StripState {
         active,
         can_undo: st.annotations.can_undo(),
         can_redo: st.annotations.can_redo(),
         colour: st.colour,
-    };
-    draw::draw_strip(hdc, placement, &st.metrics, &state, st.plate, st.edge, st.face);
+        thickness: st.thickness,
+    }
+}
+
+fn draw_strip(hdc: HDC, st: &State, placement: &Placement) {
+    draw::draw_strip(
+        hdc,
+        placement,
+        &st.metrics,
+        &strip_state(st),
+        st.plate,
+        st.edge,
+        st.face,
+    );
 }
 
 fn draw_border(hdc: HDC, rect: &RECT, white: HBRUSH, black: HBRUSH) {

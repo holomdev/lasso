@@ -87,7 +87,7 @@ impl Colour {
         Colour::White,
     ];
 
-    /// The next colour in the cycle, wrapping.
+/// The next colour in the cycle, wrapping.
     pub fn next(self) -> Colour {
         let index = Colour::ALL.iter().position(|&c| c == self).unwrap_or(0);
         Colour::ALL[(index + 1) % Colour::ALL.len()]
@@ -104,6 +104,45 @@ impl Colour {
         })
     }
 }
+
+    /// The stroke widths on offer, thinnest first.
+///
+/// The thinnest is four and not two: GDI draws a filled ellipse three pixels across as
+/// nothing at all, so a two-pixel dot in a palette of dots is an empty cell, and the eye
+/// cannot tell two from four in a row anyway.
+///
+/// A list rather than an arithmetic progression, because the widths have to be told apart by
+/// eye in a row of dots: two and four are different, four and six barely are, and twelve and
+/// twenty-four are different again. The gaps widen as the width grows, which is how the eye
+/// orders them. `+` and `-` move through this same list, so the keyboard and the palette never
+/// disagree about what widths exist.
+pub const THICKNESS_STEPS: [u32; 6] = [4, 6, 8, 12, 18, 24];
+
+/// Where a width sits in the list, or the nearest place for one that is not in it.
+pub fn thickness_index(thickness: u32) -> usize {
+    let mut best = 0;
+    let mut best_gap = u32::MAX;
+    for (index, step) in THICKNESS_STEPS.iter().enumerate() {
+        let gap = step.abs_diff(thickness);
+        if gap < best_gap {
+            best = index;
+            best_gap = gap;
+        }
+    }
+    best
+}
+
+/// The next width in the list, wrapping.
+pub fn next_thickness(thickness: u32) -> u32 {
+    THICKNESS_STEPS[(thickness_index(thickness) + 1) % THICKNESS_STEPS.len()]
+}
+
+/// The previous width in the list, wrapping.
+pub fn previous_thickness(thickness: u32) -> u32 {
+    let index = thickness_index(thickness);
+    THICKNESS_STEPS[(index + THICKNESS_STEPS.len() - 1) % THICKNESS_STEPS.len()]
+}
+
 
 /// A point in selection-relative pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

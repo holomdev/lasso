@@ -330,24 +330,53 @@ pub fn hit(placement: &Placement, metrics: &Metrics, x: i32, y: i32) -> Option<B
         .map(|(button, _, _, _, _)| button)
 }
 
-/// The palette that opens beside the colour button.
+/// What a palette offers.
 ///
-/// It is drawn into the overlay's own buffer like everything else, so it has no window of
-/// its own and no behaviour of its own: its rectangle and its swatches are worked out from
-/// the strip's placement, which means the drawing and the hit test cannot disagree.
+/// One panel with two uses rather than two panels: the placement, the corridor that keeps it
+/// open and the hit test are the same problem either way, and duplicating them would mean
+/// fixing every one of those twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaletteKind {
+    Colour,
+    Thickness,
+}
+
+impl PaletteKind {
+    /// The button that opens it.
+    pub fn button(self) -> Button {
+        match self {
+            PaletteKind::Colour => Button::Colour,
+            PaletteKind::Thickness => Button::Thickness,
+        }
+    }
+
+    /// How many choices it offers.
+    pub fn count(self) -> usize {
+        match self {
+            PaletteKind::Colour => Colour::ALL.len(),
+            PaletteKind::Thickness => super::annotation::THICKNESS_STEPS.len(),
+        }
+    }
+}
+
+/// The palette that opens beside the button that owns it.
+///
+/// It is drawn into the overlay's own buffer like everything else, so it has no window of its
+/// own and no behaviour of its own: its rectangle and its swatches are worked out from the
+/// strip's placement, which means the drawing and the hit test cannot disagree.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Palette {
+    pub kind: PaletteKind,
     pub x: i32,
     pub y: i32,
     pub width: u32,
     pub height: u32,
     /// The gap between the strip and the palette, and the strip's edge beside it.
     ///
-    /// The palette stands off the strip, so the pointer leaving the colour button is in
-    /// neither for a few pixels and the panel would close on the way to a swatch. Treating
-    /// this corridor as part of the panel is what makes the journey continuous. It is
-    /// carried here rather than recomputed because it has to be exactly the corridor the
-    /// placement left, not an approximation of it.
+    /// The palette stands off the strip, so the pointer leaving the button is in neither for a
+    /// few pixels and the panel would close on the way to a swatch. Treating this corridor as
+    /// part of the panel is what makes the journey continuous. It is carried here rather than
+    /// recomputed because it has to be exactly the corridor the placement left.
     pub bridge: RECT,
 }
 
@@ -363,8 +392,8 @@ impl Palette {
     /// Whether a point is anywhere the palette should stay open for.
     ///
     /// The panel itself and the corridor back to the strip. Deliberately not called
-    /// `contains`: this is a weaker condition than being over the palette, and it is only
-    /// ever used to *keep* it open. `palette_visible` still decides what opens it.
+    /// `contains`: this is a weaker condition than being over the palette, and it is only ever
+    /// used to *keep* it open. `palette_opened` still decides what opens it.
     pub fn keeps_open(&self, x: i32, y: i32) -> bool {
         self.contains(x, y)
             || (x >= self.bridge.left
@@ -373,84 +402,82 @@ impl Palette {
                 && y < self.bridge.bottom)
     }
 
-    /// Every swatch's square, in `Colour::ALL` order, in desktop coordinates.
+    /// Every choice's square, in order, in desktop coordinates.
     ///
-    /// One function rather than two: the drawing fills these and the hit test reads them, so
-    /// a swatch cannot be drawn in one place and picked up in another.
-    pub fn swatches(&self, metrics: &Metrics) -> Vec<(Colour, RECT)> {
-        let mut swatches = Vec::with_capacity(Colour::ALL.len());
+    /// One function rather than two: the drawing paints these and the hit test reads them, so
+    /// a choice cannot be drawn in one place and picked up in another.
+    pub fn swatches(&self, metrics: &Metrics) -> Vec<RECT> {
+        let mut squares = Vec::with_capacity(self.kind.count());
         let mut x = self.x + metrics.padding;
         let y = self.y + metrics.padding;
-        for colour in Colour::ALL {
-            swatches.push((
-                colour,
-                RECT {
-                    left: x,
-                    top: y,
-                    right: x + metrics.button,
-                    bottom: y + metrics.button,
-                },
-            ));
+        for _ in 0..self.kind.count() {
+            squares.push(RECT {
+                left: x,
+                top: y,
+                right: x + metrics.button,
+                bottom: y + metrics.button,
+            });
             x += metrics.button + metrics.gap;
         }
-        swatches
+        squares
     }
 
-    /// The colour under a point, if any.
-    pub fn hit(&self, metrics: &Metrics, x: i32, y: i32) -> Option<Colour> {
+    /// Which choice is under a point, if any.
+    pub fn index_at(&self, metrics: &Metrics, x: i32, y: i32) -> Option<usize> {
         if !self.contains(x, y) {
             return None;
         }
-        self.swatches(metrics)
-            .into_iter()
-            .find(|(_, rect)| {
-                x >= rect.left && y >= rect.top && x < rect.right && y < rect.bottom
-            })
-            .map(|(colour, _)| colour)
+        self.swatches(metrics).iter().position(|rect| {
+            x >= rect.left && y >= rect.top && x < rect.right && y < rect.bottom
+        })
     }
 }
 
 impl Metrics {
-    /// The palette's size: one row of swatches with the strip's own padding around it.
-    pub fn palette_size(&self) -> (u32, u32) {
-        let count = Colour::ALL.len() as i32;
+    /// A palette's size: one row of choices with the strip's own padding around it.
+    pub fn palette_size(&self, kind: PaletteKind) -> (u32, u32) {
+        let count = kind.count() as i32;
         let width = count * self.button + (count - 1) * self.gap + self.padding * 2;
         let height = self.button + self.padding * 2;
         (width.max(1) as u32, height.max(1) as u32)
     }
 }
 
-/// Whether the palette should be showing, given what the pointer is over.
+/// Whether a palette should be showing, given what the pointer is over.
 ///
-/// Three inputs, because one is not enough: `was_open` is the whole point. Being inside the
-/// palette's rectangle **keeps** it open — so the pointer can travel from the colour button
-/// to a swatch — but it must not **open** it, or passing over empty space where the swatches
-/// would be would make them appear out of nothing. Opening is something only the colour
-/// button does.
-pub fn palette_visible(was_open: bool, over_colour_button: bool, inside_palette: bool) -> bool {
-    over_colour_button || (was_open && inside_palette)
+/// `over` is the button under the pointer that owns a palette, if any; `inside` is whether the
+/// pointer is in the palette that is already open. Being inside **keeps** it open, so the
+/// pointer can travel from the button to a swatch, and it must not **open** it, or crossing
+/// empty space where the swatches would be would make them appear from nothing.
+pub fn palette_opened(
+    current: Option<PaletteKind>,
+    over: Option<PaletteKind>,
+    inside: bool,
+) -> Option<PaletteKind> {
+    over.or(if inside { current } else { None })
 }
 
-/// Where the palette goes, given where the strip went.
+/// Where a palette goes, given where the strip went.
 ///
-/// Beside the strip on the side with room, centred on the colour button it belongs to, and
-/// pulled back into the space so a strip near an edge does not push it off the screen.
-/// Beside the strip rather than over it: the palette is opened by pointing at a button, and
-/// a panel that covered the buttons would make the pointer leave the button that opened it.
+/// Beside the strip on the side with room, centred on the button it belongs to, and pulled
+/// back into the space so a strip near an edge does not push it off the screen. Beside the
+/// strip rather than over it: the palette is opened by pointing at a button, and a panel that
+/// covered the buttons would make the pointer leave the button that opened it.
 pub fn palette_for(
+    kind: PaletteKind,
     strip: &Placement,
     space_width: u32,
     space_height: u32,
     metrics: &Metrics,
 ) -> Palette {
-    let (width, height) = metrics.palette_size();
+    let (width, height) = metrics.palette_size(kind);
     let (width_i, height_i) = (width as i32, height as i32);
 
-    // The colour button's own row, so the palette lines up with the button that opened it.
+    // The owning button's own row, so the palette lines up with the button that opened it.
     let row = metrics
         .button_rects()
         .into_iter()
-        .find(|(button, ..)| *button == Button::Colour);
+        .find(|(button, ..)| *button == kind.button());
     let centre_y = match row {
         Some((_, _, by, _, bh)) => strip.y + by + bh as i32 / 2,
         None => strip.y + strip.height as i32 / 2,
@@ -472,16 +499,13 @@ pub fn palette_for(
     // The corridor from the strip's near edge to the palette, taller than the palette so a
     // slightly diagonal journey does not fall out of it.
     let slack = metrics.standoff;
-    let strip_near = if x >= strip.x + strip.width as i32 {
+    let on_the_right = x >= strip.x + strip.width as i32;
+    let strip_near = if on_the_right {
         strip.x + strip.width as i32
     } else {
         strip.x
     };
-    let palette_near = if x >= strip.x + strip.width as i32 {
-        x
-    } else {
-        x + width_i
-    };
+    let palette_near = if on_the_right { x } else { x + width_i };
     let bridge = RECT {
         left: strip_near.min(palette_near),
         top: y - slack,
@@ -490,6 +514,7 @@ pub fn palette_for(
     };
 
     Palette {
+        kind,
         x,
         y,
         width,
@@ -518,80 +543,6 @@ mod tests {
         Metrics::BASE
     }
 
-    #[test]
-    fn the_journey_from_the_button_to_a_swatch_never_leaves_the_palette() {
-        // Reported as "it hides too quickly to choose a colour". The palette stands off the
-        // strip, so the pointer crossing that gap was in neither the strip nor the palette,
-        // and the panel closed on the way — the button had to be hovered again for every
-        // attempt. The corridor belongs to the palette for this purpose.
-        let (strip, metrics) = standard();
-        let palette = palette_for(&strip, 1920, 1080, &metrics);
-
-        let (_, _, by, _, bh) = metrics
-            .button_rects()
-            .into_iter()
-            .find(|(button, ..)| *button == Button::Colour)
-            .expect("the colour button is in the strip");
-        let button_y = strip.y + by + bh as i32 / 2;
-        // The strip's own edge, exclusive: the pixel before it is inside the strip, where the
-        // pointer is still over the button and the question does not arise.
-        let button_x = strip.x + strip.width as i32;
-
-        // Every pixel of the straight line from the strip's edge to the first swatch, at the
-        // button's own height, has to count as "still in the palette".
-        let swatch_x = palette.swatches(&metrics)[0].1.right;
-        for x in button_x..=swatch_x {
-            assert!(
-                palette.keeps_open(x, button_y),
-                "at ({x}, {button_y}) the pointer is in neither the palette nor the corridor, \
-                 so the panel would close on the way to a swatch"
-            );
-        }
-    }
-
-    #[test]
-    fn the_corridor_does_not_reach_far_beyond_the_palette() {
-        // A corridor that kept the palette open across half the screen would be as odd as one
-        // that closes it too soon: it must be the gap and a little slack, no more.
-        let (strip, metrics) = standard();
-        let palette = palette_for(&strip, 1920, 1080, &metrics);
-
-        assert!(
-            !palette.keeps_open(palette.x + palette.width as i32 + 200, palette.y + 4),
-            "the palette stays open far beyond its own right edge"
-        );
-        assert!(
-            !palette.keeps_open(palette.x + 4, palette.y + palette.height as i32 + 200),
-            "the palette stays open far below itself"
-        );
-    }
-
-    #[test]
-    fn the_palette_opens_only_from_the_colour_button() {
-        // The fault this exists for: the palette appeared when the pointer crossed the empty
-        // space where its swatches would be, with the palette hidden. "Inside it" has to keep
-        // it open without being able to open it.
-        assert!(
-            !palette_visible(false, false, true),
-            "the pointer in the palette's area opened it with nothing shown there"
-        );
-        assert!(
-            palette_visible(false, true, false),
-            "the pointer on the colour button did not open it"
-        );
-    }
-
-    #[test]
-    fn the_palette_stays_open_on_the_way_to_a_swatch() {
-        // Once open, being inside it keeps it: otherwise the pointer leaves the button and
-        // the swatches vanish before it reaches them.
-        assert!(palette_visible(true, false, true));
-        // And it closes when the pointer is in neither.
-        assert!(!palette_visible(true, false, false));
-        // The button still counts as part of it, so moving back does not close it.
-        assert!(palette_visible(true, true, false));
-    }
-
     /// A strip placed against a region in the middle of a large screen.
     fn standard() -> (Placement, Metrics) {
         let metrics = Metrics::BASE;
@@ -607,130 +558,6 @@ mod tests {
             &metrics,
         );
         (placement, metrics)
-    }
-
-    #[test]
-    fn the_palette_has_one_swatch_per_colour_in_order() {
-        let (strip, metrics) = standard();
-        let palette = palette_for(&strip, 1920, 1080, &metrics);
-        let swatches = palette.swatches(&metrics);
-
-        let colours: Vec<Colour> = swatches.iter().map(|(colour, _)| *colour).collect();
-        assert_eq!(
-            colours,
-            Colour::ALL.to_vec(),
-            "the palette must offer every colour, in the order C cycles them, so the two ways "
-        );
-        // And they must not overlap: a swatch drawn on top of another is one that cannot be
-        // picked, whatever the hit test believes.
-        for pair in swatches.windows(2) {
-            assert!(
-                pair[0].1.right <= pair[1].1.left,
-                "swatches {:?} and {:?} overlap",
-                pair[0],
-                pair[1]
-            );
-        }
-    }
-
-    #[test]
-    fn every_swatch_is_inside_the_palette_and_hits_only_itself() {
-        let (strip, metrics) = standard();
-        let palette = palette_for(&strip, 1920, 1080, &metrics);
-
-        for (colour, rect) in palette.swatches(&metrics) {
-            assert!(palette.contains(rect.left, rect.top), "{colour:?} starts outside");
-            assert!(
-                palette.contains(rect.right - 1, rect.bottom - 1),
-                "{colour:?} ends outside"
-            );
-            // A point well inside its own square must come back as that colour, and the same
-            // point must not answer for any other.
-            let (x, y) = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
-            assert_eq!(palette.hit(&metrics, x, y), Some(colour));
-        }
-        // A point in the palette's padding belongs to no swatch, and one outside to nothing.
-        assert_eq!(palette.hit(&metrics, palette.x, palette.y), None);
-        assert_eq!(palette.hit(&metrics, palette.x - 1, palette.y), None);
-    }
-
-    #[test]
-    fn the_palette_opens_beside_the_strip_and_not_over_it() {
-        let metrics = Metrics::BASE;
-
-        // Everywhere on a strip that is on the left of its region, the palette goes to the
-        // right of the strip — it must not cover the buttons that opened it.
-        for region_x in [300i32, 600, 900] {
-            let placement = place(
-                Region {
-                    x: region_x,
-                    y: 250,
-                    width: 300,
-                    height: 200,
-                },
-                1920,
-                1080,
-                &metrics,
-            );
-            let palette = palette_for(&placement, 1920, 1080, &metrics);
-            assert_eq!(
-                palette.x,
-                placement.x + placement.width as i32 + metrics.standoff,
-                "for a region at {region_x} the palette should sit to the right of the strip"
-            );
-            assert!(
-                palette.x >= placement.x + placement.width as i32,
-                "the palette overlaps the strip"
-            );
-        }
-    }
-
-    #[test]
-    fn the_palette_lines_up_with_the_colour_button() {
-        let (strip, metrics) = standard();
-        let palette = palette_for(&strip, 1920, 1080, &metrics);
-
-        let (_, _, by, _, bh) = metrics
-            .button_rects()
-            .into_iter()
-            .find(|(button, ..)| *button == Button::Colour)
-            .expect("the colour button is in the strip");
-        let button_centre = strip.y + by + bh as i32 / 2;
-        let palette_centre = palette.y + palette.height as i32 / 2;
-
-        // Within half a button: it is a row of swatches beside a button, not a panel that
-        // could be anywhere on that side.
-        assert!(
-            (button_centre - palette_centre).abs() <= metrics.button / 2,
-            "the palette's centre {palette_centre} is not beside the colour button's {button_centre}"
-        );
-    }
-
-    #[test]
-    fn the_palette_stays_on_the_screen() {
-        let metrics = Metrics::BASE;
-        // A strip hard against the bottom, where a palette centred on the colour button would
-        // otherwise extend past the last row of pixels.
-        for region_y in [0i32, 900, 1040] {
-            let placement = place(
-                Region {
-                    x: 600,
-                    y: region_y,
-                    width: 200,
-                    height: 40,
-                },
-                1920,
-                1080,
-                &metrics,
-            );
-            let palette = palette_for(&placement, 1920, 1080, &metrics);
-            assert!(
-                palette.y >= 0 && palette.y + palette.height as i32 <= 1080,
-                "for a region at {region_y} the palette spans {}..{}",
-                palette.y,
-                palette.y + palette.height as i32
-            );
-        }
     }
 
     /// A selection of a size that leaves room on both sides in a 1920x1080 space.
@@ -1025,5 +852,224 @@ mod tests {
         assert!(!Button::Redo.starts_a_group());
         assert!(Button::Save.starts_a_group(), "the way out is its own group");
         assert!(!Button::Copy.starts_a_group());
+    }
+    const KINDS: [PaletteKind; 2] = [PaletteKind::Colour, PaletteKind::Thickness];
+
+    #[test]
+    fn each_palette_offers_every_choice_in_order() {
+        let (strip, metrics) = standard();
+        for kind in KINDS {
+            let palette = palette_for(kind, &strip, 1920, 1080, &metrics);
+            let cells = palette.swatches(&metrics);
+
+            let expected = match kind {
+                PaletteKind::Colour => Colour::ALL.len(),
+                PaletteKind::Thickness => super::super::annotation::THICKNESS_STEPS.len(),
+            };
+            assert_eq!(cells.len(), expected, "{kind:?} offers the wrong number of choices");
+            // They must not overlap: a cell drawn on top of another is one that cannot be
+            // picked, whatever the hit test believes.
+            for pair in cells.windows(2) {
+                assert!(
+                    pair[0].right <= pair[1].left,
+                    "{kind:?} cells {:?} and {:?} overlap",
+                    pair[0],
+                    pair[1]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_cell_is_inside_the_palette_and_hits_only_itself() {
+        let (strip, metrics) = standard();
+        for kind in KINDS {
+            let palette = palette_for(kind, &strip, 1920, 1080, &metrics);
+            for (index, cell) in palette.swatches(&metrics).into_iter().enumerate() {
+                assert!(palette.contains(cell.left, cell.top), "{kind:?} cell starts outside");
+                assert!(
+                    palette.contains(cell.right - 1, cell.bottom - 1),
+                    "{kind:?} cell ends outside"
+                );
+                let (x, y) = ((cell.left + cell.right) / 2, (cell.top + cell.bottom) / 2);
+                assert_eq!(
+                    palette.index_at(&metrics, x, y),
+                    Some(index),
+                    "{kind:?} cell {index} does not answer for itself"
+                );
+            }
+            // The padding belongs to no cell, and neither does the outside.
+            assert_eq!(palette.index_at(&metrics, palette.x, palette.y), None);
+            assert_eq!(palette.index_at(&metrics, palette.x - 1, palette.y), None);
+        }
+    }
+
+    #[test]
+    fn a_palette_opens_beside_the_strip_and_not_over_it() {
+        let metrics = Metrics::BASE;
+        for kind in KINDS {
+            for region_x in [300i32, 600, 900] {
+                let strip = place(
+                    Region {
+                        x: region_x,
+                        y: 250,
+                        width: 300,
+                        height: 200,
+                    },
+                    1920,
+                    1080,
+                    &metrics,
+                );
+                let palette = palette_for(kind, &strip, 1920, 1080, &metrics);
+                assert_eq!(
+                    palette.x,
+                    strip.x + strip.width as i32 + metrics.standoff,
+                    "{kind:?} should sit to the right of the strip for a region at {region_x}"
+                );
+                assert!(
+                    palette.x >= strip.x + strip.width as i32,
+                    "{kind:?} overlaps the strip"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn each_palette_lines_up_with_the_button_that_opens_it() {
+        let (strip, metrics) = standard();
+        for kind in KINDS {
+            let palette = palette_for(kind, &strip, 1920, 1080, &metrics);
+            let (_, _, by, _, bh) = metrics
+                .button_rects()
+                .into_iter()
+                .find(|(button, ..)| *button == kind.button())
+                .expect("the button is in the strip");
+            let button_centre = strip.y + by + bh as i32 / 2;
+            let palette_centre = palette.y + palette.height as i32 / 2;
+
+            assert!(
+                (button_centre - palette_centre).abs() <= metrics.button / 2,
+                "{kind:?} centre {palette_centre} is not beside its button's {button_centre}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_palette_stays_on_the_screen() {
+        let metrics = Metrics::BASE;
+        for kind in KINDS {
+            for region_y in [0i32, 900, 1040] {
+                let strip = place(
+                    Region {
+                        x: 600,
+                        y: region_y,
+                        width: 200,
+                        height: 40,
+                    },
+                    1920,
+                    1080,
+                    &metrics,
+                );
+                let palette = palette_for(kind, &strip, 1920, 1080, &metrics);
+                assert!(
+                    palette.y >= 0 && palette.y + palette.height as i32 <= 1080,
+                    "{kind:?} spans {}..{} for a region at {region_y}",
+                    palette.y,
+                    palette.y + palette.height as i32
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_journey_from_the_button_to_a_choice_never_leaves_the_palette() {
+        // The palette stands off the strip, so the pointer crossing that gap was in neither,
+        // and the panel closed on the way. The corridor belongs to it for this purpose.
+        let (strip, metrics) = standard();
+        for kind in KINDS {
+            let palette = palette_for(kind, &strip, 1920, 1080, &metrics);
+            let (_, _, by, _, bh) = metrics
+                .button_rects()
+                .into_iter()
+                .find(|(button, ..)| *button == kind.button())
+                .expect("the button is in the strip");
+            let row = strip.y + by + bh as i32 / 2;
+
+            // From the strip's own edge — the pixel before it is inside the strip — to the
+            // first cell's far edge, at the button's height.
+            let from = strip.x + strip.width as i32;
+            let to = palette.swatches(&metrics)[0].right;
+            for x in from..=to {
+                assert!(
+                    palette.keeps_open(x, row),
+                    "{kind:?}: at ({x}, {row}) the pointer is in neither the palette nor the \
+                     corridor, so it would close on the way to a choice"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_corridor_does_not_reach_far_beyond_the_palette() {
+        let (strip, metrics) = standard();
+        for kind in KINDS {
+            let palette = palette_for(kind, &strip, 1920, 1080, &metrics);
+            assert!(
+                !palette.keeps_open(palette.x + palette.width as i32 + 200, palette.y + 4),
+                "{kind:?} stays open far beyond its own right edge"
+            );
+            assert!(
+                !palette.keeps_open(palette.x + 4, palette.y + palette.height as i32 + 200),
+                "{kind:?} stays open far below itself"
+            );
+        }
+    }
+
+    #[test]
+    fn a_palette_opens_only_from_its_own_button() {
+        // The fault this exists for: a palette appeared when the pointer crossed the empty
+        // space where its cells would be. "Inside" keeps it open without being able to open it.
+        for kind in KINDS {
+            assert!(
+                palette_opened(None, None, true).is_none(),
+                "{kind:?} opened from empty space"
+            );
+            assert_eq!(
+                palette_opened(None, Some(kind), false),
+                Some(kind),
+                "{kind:?} did not open from its own button"
+            );
+            // And one palette does not open the other.
+            let other = match kind {
+                PaletteKind::Colour => PaletteKind::Thickness,
+                PaletteKind::Thickness => PaletteKind::Colour,
+            };
+            assert_eq!(
+                palette_opened(None, Some(other), false),
+                Some(other),
+                "hovering the {other:?} button opened {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_palette_stays_open_on_the_way_to_a_choice() {
+        for kind in KINDS {
+            assert_eq!(
+                palette_opened(Some(kind), None, true),
+                Some(kind),
+                "{kind:?} closed while the pointer was still inside it"
+            );
+            assert_eq!(
+                palette_opened(Some(kind), None, false),
+                None,
+                "{kind:?} stayed open with the pointer in neither"
+            );
+            assert_eq!(
+                palette_opened(Some(kind), Some(kind), false),
+                Some(kind),
+                "{kind:?} closed while over its own button"
+            );
+        }
     }
 }

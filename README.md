@@ -142,7 +142,7 @@ it is not using.
 | 4 | Ellipse | `E` | The same, as an open oval. |
 | 5 | Pencil | `P` | Freehand. A press without movement still leaves a dot, so a single point can be marked. |
 | 6 | Colour | `C` | A swatch of the colour in force, filled with it. Pointing at it opens a palette of the five colours beside the strip; clicking one chooses it. `C` cycles them for the keyboard. |
-| 7 | Thickness | `+` `-` | The stroke's width, from 1 to 24 in steps of two. The glyph is drawn at the width in force and grows with it. |
+| 7 | Thickness | `+` `-` | A dot of the width in force. Pointing at it opens a palette of six widths beside the strip, each drawn as a dot of its own size; clicking one chooses it. `+` and `-` move through the same six, so the keyboard and the palette never disagree about what widths exist. |
 | 8 | Undo | `Ctrl+Z` | Removes the last stroke. Drawn faint and ignored when there is nothing to undo. |
 | 9 | Redo | `Ctrl+Y` | Puts back the last stroke that was undone. Faint and ignored when there is nothing to redo. |
 | 10 | Save | `Enter` | Writes the region with its annotations and closes. |
@@ -153,8 +153,14 @@ The strip is placed beside the region and **never over it** while there is room
 anywhere on the screen. It is drawn every frame, including while a stroke is in
 progress.
 
-The palette opens to the side of the strip with room, lined up with the colour
-button it belongs to. **Only the colour button opens it.** Being inside the
+Both palettes work the same way, and are the same code: one panel that offers a row
+of choices, with the colour palette filling its cells with colours and the thickness
+palette filling them with dots. The widths are **4, 6, 8, 12, 18 and 24**, which is also
+the default of 4: below that the dots stop being distinguishable, and GDI draws a filled
+ellipse three pixels across as nothing at all, so a two-pixel dot would be an empty cell.
+
+A palette opens to the side of the strip with room, lined up with the button it belongs
+to. **Only the colour button opens it.** Being inside the
 palette's area keeps it open — that is what lets the pointer travel from the button
 onto a swatch, the part a hover menu usually gets wrong — but it cannot open it, or
 crossing empty space where the swatches would be would make them appear from

@@ -20,7 +20,7 @@
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
     CreatePen, CreateSolidBrush, DeleteObject, Ellipse, FrameRect, GetStockObject, HDC, HGDIOBJ,
-    LineTo, MoveToEx, NULL_BRUSH, PS_SOLID, Polyline, Rectangle, SelectObject,
+    LineTo, MoveToEx, NULL_BRUSH, NULL_PEN, PS_SOLID, Polyline, Rectangle, SelectObject,
 };
 
 use super::annotation::{Point, Shape, Stroke};
@@ -232,20 +232,23 @@ fn draw_arrow(hdc: HDC, from: (i32, i32), to: (i32, i32), thickness: i32) {
     }
 }
 
-/// Draw the colour palette, and the ring that says which colour is in force.
+/// Draw a palette, and the ring that says which choice is in force.
 ///
-/// The swatches come from `Palette::swatches`, the same function the hit test reads, so a
-/// colour cannot be drawn in one place and picked up in another. Written without early
-/// returns, for the reason the strip's glyphs are: this runs on every repaint, and anything
-/// created here has to be released.
+/// The cells come from `Palette::swatches`, the same function the hit test reads, so a choice
+/// cannot be drawn in one place and picked up in another. Written without early returns, for
+/// the reason the strip's glyphs are: this runs on every repaint, and anything created here has
+/// to be released.
 pub fn draw_palette(
     hdc: HDC,
     palette: &super::toolbar::Palette,
     metrics: &Metrics,
-    selected: super::annotation::Colour,
+    state: &StripState,
     plate: windows::Win32::Graphics::Gdi::HBRUSH,
     edge: windows::Win32::Graphics::Gdi::HBRUSH,
 ) {
+    use super::annotation::{thickness_index, Colour, THICKNESS_STEPS};
+    use super::toolbar::PaletteKind;
+
     let body = RECT {
         left: palette.x,
         top: palette.y,
@@ -257,26 +260,81 @@ pub fn draw_palette(
         FrameRect(hdc, &body, edge);
     }
 
+    // Which cell is the one in force. A width between two steps marks the nearer one, which is
+    // where `+` and `-` would take it next.
+    let selected = match palette.kind {
+        PaletteKind::Colour => Colour::ALL
+            .iter()
+            .position(|colour| *colour == state.colour)
+            .unwrap_or(0),
+        PaletteKind::Thickness => thickness_index(state.thickness),
+    };
+
     let rim = unsafe { CreateSolidBrush(PLATE_SHADOW) };
-    for (colour, square) in palette.swatches(metrics) {
-        let paint = unsafe { CreateSolidBrush(colour.to_colorref()) };
-        if !paint.is_invalid() {
-            unsafe {
-                windows::Win32::Graphics::Gdi::FillRect(hdc, &square, paint);
-            }
-            // Inside the swatch, so the colour keeps its full size and the rim is what
-            // separates it from the plate — which is what makes white visible at all.
-            if !rim.is_invalid() {
-                unsafe {
-                    FrameRect(hdc, &square, rim);
+    for (index, square) in palette.swatches(metrics).into_iter().enumerate() {
+        match palette.kind {
+            PaletteKind::Colour => {
+                let colour = Colour::ALL[index];
+                let paint = unsafe { CreateSolidBrush(colour.to_colorref()) };
+                if !paint.is_invalid() {
+                    unsafe {
+                        windows::Win32::Graphics::Gdi::FillRect(hdc, &square, paint);
+                    }
+                    if !rim.is_invalid() {
+                        // Inside the swatch, so the colour keeps its full size and the rim is
+                        // what separates it from the plate — which is what makes white visible.
+                        unsafe {
+                            FrameRect(hdc, &square, rim);
+                        }
+                    }
+                    unsafe {
+                        let _ = DeleteObject(HGDIOBJ(paint.0));
+                    }
                 }
             }
-            unsafe {
-                let _ = DeleteObject(HGDIOBJ(paint.0));
+            PaletteKind::Thickness => {
+                // A dot of that width, centred in its cell. The cell is only outlined, so the
+                // dot is the mark and the outline is not mistaken for one.
+                let thickness = THICKNESS_STEPS[index];
+                let cell = (square.right - square.left).min(square.bottom - square.top);
+                let diameter = (thickness as i32).clamp(4, (cell - 6).max(4));
+                let centre = (
+                    (square.left + square.right) / 2,
+                    (square.top + square.bottom) / 2,
+                );
+                let dot = unsafe { CreateSolidBrush(BUTTON_INK) };
+                if !dot.is_invalid() {
+                    let half = diameter / 2;
+                    // Both objects are selected and both are put back. The pen matters as much
+                    // as the brush: `Ellipse` outlines with the pen, so a dot two pixels across
+                    // has no interior at all and came out as the pen's colour instead of the
+                    // row's — a mark of the wrong size and the wrong brightness. With no pen
+                    // the dot is exactly the width it was asked for.
+                    let no_pen = unsafe { GetStockObject(NULL_PEN) };
+                    let previous_pen = unsafe { SelectObject(hdc, no_pen) };
+                    let previous_brush = unsafe { SelectObject(hdc, HGDIOBJ(dot.0)) };
+                    unsafe {
+                        let _ = Ellipse(
+                            hdc,
+                            centre.0 - half,
+                            centre.1 - half,
+                            centre.0 - half + diameter,
+                            centre.1 - half + diameter,
+                        );
+                        SelectObject(hdc, previous_brush);
+                        SelectObject(hdc, previous_pen);
+                        let _ = DeleteObject(HGDIOBJ(dot.0));
+                    }
+                }
+                if !rim.is_invalid() {
+                    unsafe {
+                        FrameRect(hdc, &square, edge);
+                    }
+                }
             }
         }
-        // The colour in force is outlined, so the palette answers "which one am I using".
-        if colour == selected {
+        // The choice in force is outlined, so the palette answers "which one am I using".
+        if index == selected {
             let ring = unsafe { CreateSolidBrush(BUTTON_INK) };
             if !ring.is_invalid() {
                 let marker = RECT {
@@ -358,12 +416,7 @@ pub fn draw_strip(
         // every button below it and make the strip a different shape from one moment to
         // the next.
         let ink = if state.is_disabled(button) { DIM_INK } else { BUTTON_INK };
-        // Only the colour button is filled, and with the colour a stroke would use.
-        let fill = match button {
-            Button::Colour => Some(state.colour.to_colorref()),
-            _ => None,
-        };
-        draw_button_glyph(hdc, button, &rect, ink, fill);
+        draw_button_glyph(hdc, button, &rect, ink, state);
     }
 }
 
@@ -385,6 +438,8 @@ pub struct StripState {
     /// The button is the only place the colour appears: without it the strip says nothing
     /// about what will be drawn, and the only way to find out is to draw something.
     pub colour: crate::overlay::annotation::Colour,
+    /// The width a stroke would be drawn at, which the thickness button shows as a dot.
+    pub thickness: u32,
 }
 
 impl StripState {
@@ -419,7 +474,7 @@ fn user_objects() -> u32 {
 /// `ink` colours both the lines and, where a shape needs it, the fill. A button that
 /// cannot be used is drawn in a colour close to the plate: present, and visibly not
 /// available.
-fn draw_button_glyph(hdc: HDC, button: Button, rect: &RECT, ink: COLORREF, fill: Option<COLORREF>) {
+fn draw_button_glyph(hdc: HDC, button: Button, rect: &RECT, ink: COLORREF, state: &StripState) {
     let width = rect.right - rect.left;
     let height = rect.bottom - rect.top;
     let centre = (rect.left + width / 2, rect.top + height / 2);
@@ -531,44 +586,42 @@ fn draw_button_glyph(hdc: HDC, button: Button, rect: &RECT, ink: COLORREF, fill:
             // objects would leak on every repaint. The leak test said so — "every ten
             // repaints of the strip add 20 GDI objects" — which is exactly what a return
             // placed above the cleanup costs.
-            let mut painted = false;
-            if let Some(colour) = fill {
-                // Inset by the padding the other glyphs keep, so the colour is a pill inside
-                // the button rather than a block that fills it edge to edge.
-                let pill = RECT {
-                    left: rect.left + 3,
-                    top: rect.top + 3,
-                    right: rect.right - 3,
-                    bottom: rect.bottom - 3,
-                };
-                if pill.right > pill.left && pill.bottom > pill.top {
-                    let paint = unsafe { CreateSolidBrush(colour) };
-                    let rim = unsafe { CreateSolidBrush(PLATE_SHADOW) };
+            let colour = state.colour.to_colorref();
+            // Inset by the padding the other glyphs keep, so the colour is a pill inside the
+            // button rather than a block that fills it edge to edge.
+            let pill = RECT {
+                left: rect.left + 3,
+                top: rect.top + 3,
+                right: rect.right - 3,
+                bottom: rect.bottom - 3,
+            };
+            let usable = pill.right > pill.left && pill.bottom > pill.top;
+            if usable {
+                let paint = unsafe { CreateSolidBrush(colour) };
+                let rim = unsafe { CreateSolidBrush(PLATE_SHADOW) };
+                if !paint.is_invalid() {
+                    unsafe {
+                        windows::Win32::Graphics::Gdi::FillRect(hdc, &pill, paint);
+                    }
+                }
+                if !rim.is_invalid() {
+                    // Inside the swatch, so the colour keeps its full size and the rim is what
+                    // separates it from the plate.
+                    unsafe {
+                        FrameRect(hdc, &pill, rim);
+                    }
+                }
+                unsafe {
                     if !paint.is_invalid() {
-                        unsafe {
-                            windows::Win32::Graphics::Gdi::FillRect(hdc, &pill, paint);
-                        }
+                        let _ = DeleteObject(HGDIOBJ(paint.0));
                     }
                     if !rim.is_invalid() {
-                        // Inside the swatch, so the colour keeps its full size and the rim is
-                        // what separates it from the plate.
-                        unsafe {
-                            FrameRect(hdc, &pill, rim);
-                        }
+                        let _ = DeleteObject(HGDIOBJ(rim.0));
                     }
-                    unsafe {
-                        if !paint.is_invalid() {
-                            let _ = DeleteObject(HGDIOBJ(paint.0));
-                        }
-                        if !rim.is_invalid() {
-                            let _ = DeleteObject(HGDIOBJ(rim.0));
-                        }
-                    }
-                    painted = true;
                 }
             }
-            if !painted {
-                // Nothing to show: an empty square says "a colour goes here".
+            if !usable {
+                // No room for a swatch: an empty square says "a colour goes here".
                 let empty = unsafe { CreateSolidBrush(ink) };
                 if !empty.is_invalid() {
                     unsafe {
@@ -579,10 +632,35 @@ fn draw_button_glyph(hdc: HDC, button: Button, rect: &RECT, ink: COLORREF, fill:
             }
         }
         Button::Thickness => {
-            // Three lines of increasing weight, drawn as separate pens would be
-            // expensive; two lines of different lengths read the same.
-            line((centre.0 - arm, centre.1 - 2), (centre.0 + arm, centre.1 - 2));
-            line((centre.0 - arm, centre.1 + 2), (centre.0 + arm, centre.1 + 2));
+            // A dot of the width in force. The width is what the button is for, and a dot is
+            // the only way to show it: a number would need a font and would still need the
+            // scale explained, while the dot is the mark a stroke will make.
+            //
+            // Clamped to the button, so the widest does not paint over its neighbours.
+            let diameter = (state.thickness as i32).clamp(4, (width.min(height) - 6).max(4));
+            let dot = unsafe { CreateSolidBrush(ink) };
+            if !dot.is_invalid() {
+                let half = diameter / 2;
+                // Selected, not merely created: `Ellipse` fills with the brush the context
+                // holds, so a brush that is only created is a brush that is never used. And no
+                // pen, because the outline would add a pixel to every width and make the
+                // thinnest indistinguishable from the pen's own colour.
+                let no_pen = unsafe { GetStockObject(NULL_PEN) };
+                let previous_pen = unsafe { SelectObject(hdc, no_pen) };
+                let previous_brush = unsafe { SelectObject(hdc, HGDIOBJ(dot.0)) };
+                unsafe {
+                    let _ = Ellipse(
+                        hdc,
+                        centre.0 - half,
+                        centre.1 - half,
+                        centre.0 - half + diameter,
+                        centre.1 - half + diameter,
+                    );
+                    SelectObject(hdc, previous_brush);
+                    SelectObject(hdc, previous_pen);
+                    let _ = DeleteObject(HGDIOBJ(dot.0));
+                }
+            }
         }
         Button::Undo => {
             line((centre.0 + arm, centre.1 + arm), (centre.0 - arm, centre.1 + arm));
@@ -742,6 +820,7 @@ mod tests {
             active: Some(Button::Tool(Tool::Arrow)),
             can_undo: true,
             colour: crate::overlay::annotation::Colour::Red,
+            thickness: 2,
             can_redo: false,
         };
 
@@ -833,6 +912,81 @@ mod tests {
     }
 
     #[test]
+    fn the_thickness_palette_draws_a_dot_that_grows_across_the_row() {
+        // Two faults have lived here. A dot can be drawn with a brush that was created and
+        // never selected into the context, which leaves the cell outlined and empty; and the
+        // widths can be chosen so that two of them look the same, which makes the row a row of
+        // marks that says nothing about what it offers.
+        use crate::overlay::annotation::THICKNESS_STEPS;
+        use crate::overlay::toolbar::{self, PaletteKind, Region};
+
+        let metrics = toolbar::Metrics::BASE;
+        let height = metrics.height() + 40;
+        let strip = toolbar::place(
+            Region {
+                x: metrics.width() as i32 + 40,
+                y: 20,
+                width: 60,
+                height: 60,
+            },
+            340,
+            height,
+            &metrics,
+        );
+        let palette = toolbar::palette_for(PaletteKind::Thickness, &strip, 340, height, &metrics);
+
+        let canvas = blank(340, height);
+        let plate = unsafe { CreateSolidBrush(COLORREF(0x0020_2020)) };
+        let edge = unsafe { CreateSolidBrush(COLORREF(0x0060_6060)) };
+        draw_palette(
+            canvas.dc(),
+            &palette,
+            &metrics,
+            &StripState {
+                active: None,
+                can_undo: false,
+                can_redo: false,
+                colour: crate::overlay::annotation::Colour::Red,
+                thickness: THICKNESS_STEPS[0],
+            },
+            plate,
+            edge,
+        );
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(plate.0));
+            let _ = DeleteObject(HGDIOBJ(edge.0));
+        }
+        unsafe {
+            let _ = GdiFlush();
+        }
+
+        let mut per_cell = Vec::new();
+        for cell in palette.swatches(&metrics) {
+            let mut ink = 0;
+            for y in cell.top..cell.bottom {
+                for x in cell.left..cell.right {
+                    // The dots are drawn in the button ink; the cell's own outline is the edge
+                    // colour, so counting only the ink counts only the dot.
+                    if pixel(&canvas, x, y) == (0xE0, 0xE0, 0xE0) {
+                        ink += 1;
+                    }
+                }
+            }
+            per_cell.push(ink);
+        }
+
+        assert!(
+            per_cell.iter().all(|count| *count >= 4),
+            "a thickness cell came out with no dot in it: {per_cell:?}. A cell that is \
+             outlined and empty is a brush that was created and never selected"
+        );
+        assert!(
+            per_cell.windows(2).all(|pair| pair[0] < pair[1]),
+            "the dots do not grow across the row: {per_cell:?}"
+        );
+    }
+
+    #[test]
     fn the_colour_button_is_filled_with_the_colour_a_stroke_would_use() {
         // The button carried a comment saying the colour was filled in by the caller's face
         // drawing, and the face is one brush shared by all twelve buttons — so the colour
@@ -880,6 +1034,7 @@ mod tests {
                     can_undo: false,
                     can_redo: false,
                     colour,
+                    thickness: 2,
                 },
                 plate,
                 edge,
@@ -1316,6 +1471,7 @@ mod tests {
             active: Some(Button::Tool(Tool::Arrow)),
             can_undo: true,
             colour: crate::overlay::annotation::Colour::Red,
+            thickness: 2,
             can_redo: false,
         };
         draw_strip(canvas.dc(), &placement, &metrics, &state, plate, edge, face);
@@ -1395,6 +1551,7 @@ mod tests {
                     active: None,
                     can_undo: true,
                     colour: crate::overlay::annotation::Colour::Red,
+                    thickness: 2,
                     can_redo: true,
                 },
                 plate,
@@ -1507,6 +1664,7 @@ mod tests {
                     can_undo,
                     can_redo,
                     colour: crate::overlay::annotation::Colour::Red,
+                thickness: 2,
                 },
                 plate,
                 edge,
