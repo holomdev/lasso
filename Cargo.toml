@@ -3,6 +3,9 @@ name = "lasso"
 version = "0.1.0"
 edition = "2024"
 description = "A screenshot tool for Windows"
+# Shown as the executable's CompanyName. Taken from the repository's owner, which is the
+# only evidence there is; change it if the product belongs to something else.
+authors = ["holomdev"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/holomdev/lasso"
 

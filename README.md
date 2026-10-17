@@ -354,6 +354,25 @@ own colour, which is what the manifest is for.
 The version 6 common controls are also what gives the window its check boxes, its
 themed field and its default button. The layout is unaffected.
 
+The same resource pass carries the executable's version block, so its Properties
+show a description, a product name and a version rather than nothing. Without it a
+downloaded file looks like an executable of unknown origin, which is not what an
+unsigned program should add to the warning Windows already shows.
+
+### Knowing which build is running
+
+Every run prints one line before anything else:
+
+```
+[build] 2026-10-17 09:10 UTC 45ac856 (clean)
+```
+
+The time is when `build.rs` ran, the short hash is `HEAD`, and `dirty` means the
+working copy had uncommitted changes — a binary built from a working copy is not the
+commit. This exists because a report that cannot say which binary produced it is
+guesswork: the fix can be in the source while the binary is older, and everything
+either side of that is speculation.
+
 ### Known shortcoming: the group frames' background
 
 The four group frames still stand on a `COLOR_WINDOW` white background instead of

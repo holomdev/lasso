@@ -85,7 +85,61 @@ fn main() {
     }
     // `1` is `CREATEPROCESS_MANIFEST_RESOURCE_ID`: the manifest for the program
     // itself, as opposed to one for a DLL or for an isolation-aware component.
-    if std::fs::write(&script, "1 24 \"lasso.manifest\"\n").is_err() {
+    //
+    // The version block goes in the same script, because it is the same compiler and the
+    // same pass. Without it the file has no product name, no version and no description in
+    // its Properties — it shows as a bare executable of unknown origin, which is what makes
+    // an unsigned download look like something that arrived uninvited.
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into());
+    let description = std::env::var("CARGO_PKG_DESCRIPTION")
+        .unwrap_or_else(|_| "Screenshot capture for Windows".into());
+    let name = std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| "lasso".into());
+    let authors = std::env::var("CARGO_PKG_AUTHORS").unwrap_or_default();
+
+    // `VS_VERSION_INFO` wants the four numbers separately, and takes whatever is missing as
+    // zero: "0.1.0" becomes 0,1,0,0.
+    let mut parts = version.split('.').map(|p| p.parse::<u16>().unwrap_or(0));
+    let major = parts.next().unwrap_or(0);
+    let minor = parts.next().unwrap_or(0);
+    let patch = parts.next().unwrap_or(0);
+    let build = parts.next().unwrap_or(0);
+
+    let escaped = |text: &str| text.replace('\\', "\\\\").replace('"', "\\\"");
+
+    let script_text = format!(
+        "1 24 \"lasso.manifest\"\n\
+         \n\
+         1 VERSIONINFO\n\
+         FILEVERSION {major},{minor},{patch},{build}\n\
+         PRODUCTVERSION {major},{minor},{patch},{build}\n\
+         FILEOS 0x40004L\n\
+         FILETYPE 0x1L\n\
+         BEGIN\n\
+         \x20   BLOCK \"StringFileInfo\"\n\
+         \x20   BEGIN\n\
+         \x20       BLOCK \"040904B0\"\n\
+         \x20       BEGIN\n\
+         \x20           VALUE \"FileDescription\", \"{description}\"\n\
+         \x20           VALUE \"FileVersion\", \"{version}\"\n\
+         \x20           VALUE \"InternalName\", \"{name}\"\n\
+         \x20           VALUE \"OriginalFilename\", \"{name}.exe\"\n\
+         \x20           VALUE \"ProductName\", \"lasso\"\n\
+         \x20           VALUE \"ProductVersion\", \"{version}\"\n\
+         \x20           VALUE \"CompanyName\", \"{authors}\"\n\
+         \x20           VALUE \"LegalCopyright\", \"\"\n\
+         \x20       END\n\
+         \x20   END\n\
+         \x20   BLOCK \"VarFileInfo\"\n\
+         \x20   BEGIN\n\
+         \x20       VALUE \"Translation\", 0x409, 1200\n\
+         \x20   END\n\
+         END\n",
+        description = escaped(&description),
+        name = escaped(&name),
+        version = escaped(&version),
+        authors = escaped(&authors),
+    );
+    if std::fs::write(&script, script_text).is_err() {
         println!("cargo:warning=could not write the resource script");
         return;
     }
