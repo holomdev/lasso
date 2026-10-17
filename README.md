@@ -154,11 +154,14 @@ anywhere on the screen. It is drawn every frame, including while a stroke is in
 progress.
 
 The palette opens to the side of the strip with room, lined up with the colour
-button it belongs to. It stays open while the pointer travels from the button onto
-a swatch, which is the part a hover menu usually gets wrong, and it closes when the
-pointer leaves both. It is a rectangle of the same buffer as everything else rather
-than a window of its own, so its swatches and its hit test come from one function
-and cannot disagree.
+button it belongs to. **Only the colour button opens it.** Being inside the
+palette's area keeps it open — that is what lets the pointer travel from the button
+onto a swatch, the part a hover menu usually gets wrong — but it cannot open it, or
+crossing empty space where the swatches would be would make them appear from
+nothing. It closes when the pointer is on neither.
+
+It is a rectangle of the same buffer as everything else rather than a window of its
+own, so its swatches and its hit test come from one function and cannot disagree.
 
 `Esc` gives up the armed tool rather than the window when one is armed, so that
 "I did not mean to draw" does not throw away the region. A second `Esc` cancels.

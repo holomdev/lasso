@@ -280,6 +280,13 @@ struct State {
     /// The button under the pointer, for the highlight. Also suppressed while drawing,
     /// when the strip is hidden.
     hovered: Option<Button>,
+    /// Whether the colour palette is showing.
+    ///
+    /// Held rather than derived, because it cannot be derived: the palette is opened by the
+    /// pointer being on the colour button and kept open by the pointer being inside the
+    /// palette, and those two are not the same test. Without this flag, crossing the empty
+    /// space where the swatches would be opened a palette out of nothing.
+    palette_open: bool,
     /// An action button of the strip that was pressed, which closes the window.
     pressed: Option<Pressed>,
     /// The strip's metrics for this display's scale.
@@ -376,6 +383,7 @@ pub fn select_region(frame: &Frame) -> Result<Option<Composed>> {
             drawing: None,
             strip: None,
             hovered: None,
+        palette_open: false,
             pressed: None,
             metrics: toolbar::metrics_for(crate::ui_layout::factor(unsafe {
                 windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd)
@@ -547,20 +555,15 @@ fn palette_shown(st: &State) -> Option<toolbar::Palette> {
     if matches!(st.drag, Drag::Annotate { .. }) {
         return None;
     }
-    let palette = toolbar::palette_for(
+    if !st.palette_open {
+        return None;
+    }
+    Some(toolbar::palette_for(
         &strip,
         st.canvas.width(),
         st.canvas.height(),
         &st.metrics,
-    );
-    let pointer = st.pointer?;
-    let over_colour = toolbar::hit(&strip, &st.metrics, pointer.0, pointer.1)
-        == Some(Button::Colour);
-    if over_colour || palette.contains(pointer.0, pointer.1) {
-        Some(palette)
-    } else {
-        None
-    }
+    ))
 }
 
 fn strip_clicked(st: &mut State, point: (i32, i32)) -> bool {
@@ -827,6 +830,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             .and_then(|placement| {
                                 toolbar::hit(placement, &st.metrics, point.0, point.1)
                             });
+                        // The palette's own rule, kept in one place and tested there:
+                        // being inside it holds it open, but only the colour button opens it.
+                        let over_colour = st.hovered == Some(Button::Colour);
+                        let inside_palette = st.strip.is_some_and(|placement| {
+                            let palette = toolbar::palette_for(
+                                &placement,
+                                st.canvas.width(),
+                                st.canvas.height(),
+                                &st.metrics,
+                            );
+                            palette.contains(point.0, point.1)
+                        });
+                        st.palette_open =
+                            toolbar::palette_visible(st.palette_open, over_colour, inside_palette);
+
                         st.active_cursor = if st.hovered.is_some() {
                             st.cursors.cross
                         } else if st.tool.draws() && inside_selection(st, point) {
@@ -884,6 +902,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                         let _ = anchor;
                     }
+                }
+
+                // The palette belongs to where the strip is: if the strip has moved, the
+                // panel would appear beside a button nobody is pointing at, so it closes.
+                // Opening again is one hover away.
+                if st.strip != previous_strip {
+                    st.palette_open = false;
                 }
 
                 // A mouse move that lands on the same pixel and leaves the

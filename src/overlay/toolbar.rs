@@ -399,6 +399,17 @@ impl Metrics {
     }
 }
 
+/// Whether the palette should be showing, given what the pointer is over.
+///
+/// Three inputs, because one is not enough: `was_open` is the whole point. Being inside the
+/// palette's rectangle **keeps** it open — so the pointer can travel from the colour button
+/// to a swatch — but it must not **open** it, or passing over empty space where the swatches
+/// would be would make them appear out of nothing. Opening is something only the colour
+/// button does.
+pub fn palette_visible(was_open: bool, over_colour_button: bool, inside_palette: bool) -> bool {
+    over_colour_button || (was_open && inside_palette)
+}
+
 /// Where the palette goes, given where the strip went.
 ///
 /// Beside the strip on the side with room, centred on the colour button it belongs to, and
@@ -465,6 +476,32 @@ mod tests {
         Metrics::BASE
     }
 
+    #[test]
+    fn the_palette_opens_only_from_the_colour_button() {
+        // The fault this exists for: the palette appeared when the pointer crossed the empty
+        // space where its swatches would be, with the palette hidden. "Inside it" has to keep
+        // it open without being able to open it.
+        assert!(
+            !palette_visible(false, false, true),
+            "the pointer in the palette's area opened it with nothing shown there"
+        );
+        assert!(
+            palette_visible(false, true, false),
+            "the pointer on the colour button did not open it"
+        );
+    }
+
+    #[test]
+    fn the_palette_stays_open_on_the_way_to_a_swatch() {
+        // Once open, being inside it keeps it: otherwise the pointer leaves the button and
+        // the swatches vanish before it reaches them.
+        assert!(palette_visible(true, false, true));
+        // And it closes when the pointer is in neither.
+        assert!(!palette_visible(true, false, false));
+        // The button still counts as part of it, so moving back does not close it.
+        assert!(palette_visible(true, true, false));
+    }
+
     /// A strip placed against a region in the middle of a large screen.
     fn standard() -> (Placement, Metrics) {
         let metrics = Metrics::BASE;
@@ -529,7 +566,7 @@ mod tests {
 
     #[test]
     fn the_palette_opens_beside_the_strip_and_not_over_it() {
-        let (strip, metrics) = standard();
+        let metrics = Metrics::BASE;
 
         // Everywhere on a strip that is on the left of its region, the palette goes to the
         // right of the strip — it must not cover the buttons that opened it.

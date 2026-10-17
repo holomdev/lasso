@@ -23,6 +23,14 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=lasso.manifest");
     println!("cargo:rerun-if-changed=build.rs");
+    // The whole source tree, because the stamp has to say when **this binary** was built.
+    //
+    // It watched only this script and the manifest, so a change to a source file recompiled
+    // the program without re-running the script, and the stamp went on naming an older
+    // commit. A stamp that can be three commits out of date is worse than none, because it is
+    // believable. Watching the sources costs a re-run of this script on each rebuild, which
+    // is exactly what a build stamp is for.
+    println!("cargo:rerun-if-changed=src");
 
     // A stamp for the binary, printed when it starts.
     //
