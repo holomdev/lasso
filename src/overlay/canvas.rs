@@ -58,6 +58,15 @@ impl Canvas {
             ..Default::default()
         };
 
+        // The capture's own alpha byte is not transparency: the screen has none, and both
+        // capture backends leave the byte at zero. Copied through it made everything drawn on
+        // this canvas transparent in anything that reads the fourth byte — the clipboard, where
+        // a `CF_DIB` with `BI_RGB` has no alpha channel and the byte is undefined.
+        let mut base = Vec::with_capacity(bgra.len());
+        for px in bgra.chunks_exact(4) {
+            base.extend_from_slice(&[px[0], px[1], px[2], 0xFF]);
+        }
+
         let mut dim = Vec::with_capacity(bgra.len());
         for px in bgra.chunks_exact(4) {
             let b = (px[0] as u32 * DIM_KEEP / 256) as u8;
@@ -89,7 +98,7 @@ impl Canvas {
         let original = unsafe { SelectObject(mem, HGDIOBJ(back.0)) };
 
         Ok(Self {
-            base: bgra.to_vec(),
+            base,
             dim,
             width,
             height,
@@ -198,6 +207,15 @@ impl Canvas {
         }
     }
 
+    /// Copy the capture itself into the back buffer, undimmed and whole.
+    ///
+    /// What the saved image starts from. `compose` is for the window, which needs the dimmed
+    /// area around a bright selection; the file needs neither, just the capture, so this is the
+    /// one blit without the dressing.
+    pub fn fill_with_capture(&self) {
+        self.stretch(&self.base);
+    }
+
     /// Compose the dimmed capture, and the bright capture inside `selection`,
     /// into the back buffer, limited to `invalid`.
     pub fn compose(&self, invalid: &RECT, selection: Option<&RECT>) {
@@ -303,4 +321,35 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn a_new_canvas_is_empty_and_filling_it_brings_the_capture() {
+        // The trap the saved image fell into: a canvas is constructed from the capture, but the
+        // capture sits in its `base` layer and only reaches the back buffer when something blits
+        // it there. Drawing on a fresh canvas draws on black, and reading it back returns black
+        // with whatever was drawn on top — which is exactly what was written to the file and to
+        // the clipboard.
+        let capture: Vec<u8> = (0..8 * 8).flat_map(|_| [0x11u8, 0x22, 0x33, 0xFF]).collect();
+        let canvas = Canvas::new(&capture, 8, 8).expect("a canvas");
+
+        let empty = canvas.composed_bgra();
+        assert!(
+            empty.iter().all(|byte| *byte == 0),
+            "a fresh canvas is not empty, so this test no longer describes the trap"
+        );
+
+        canvas.fill_with_capture();
+        let filled = canvas.composed_bgra();
+        for pixel in filled.chunks_exact(4) {
+            assert_eq!(
+                &pixel[..3],
+                &[0x11, 0x22, 0x33],
+                "the capture did not reach the back buffer"
+            );
+            // A capture is opaque. Carrying its alpha byte through put a zero there, and a
+            // `CF_DIB` with `BI_RGB` has no alpha channel, so the byte is undefined to whoever
+            // reads it — which is a transparency nobody asked for.
+            assert_eq!(pixel[3], 0xFF, "the composed pixels are not opaque");
+        }
+    }
 }

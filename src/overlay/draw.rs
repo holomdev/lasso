@@ -841,13 +841,20 @@ mod tests {
             can_redo: false,
         };
 
-        let growth = growth_per_round(
+        // The count is process-wide, so other tests running in parallel move it while this one
+        // measures. Rather than loosening the threshold until noise fits under it — which made
+        // the check blind to a leak of one object a repaint — the same measurement is taken with
+        // nothing drawing, and subtracted. Other threads' objects land in both numbers; only
+        // what this loop leaks survives the difference.
+        let idle = growth_per_round(|| {}, 9, 40);
+        let busy = growth_per_round(
             || {
                 draw_strip(canvas.dc(), &placement, &metrics, &state, plate, edge, face);
             },
             9,
-            10,
+            40,
         );
+        let growth = busy - idle;
 
         unsafe {
             let _ = DeleteObject(HGDIOBJ(plate.0));
@@ -855,11 +862,12 @@ mod tests {
             let _ = DeleteObject(HGDIOBJ(face.0));
         }
 
-        // One glyph's pen is one object. If the plates and separators draw and the glyphs
-        // leave their pens behind, this is around seventy per ten repaints.
+        // One glyph's pen is one object. Forty repaints that leak one apiece leave forty behind;
+        // what survives the idle subtraction is a few objects of timing noise, so ten separates
+        // the two without pretending the noise is not there.
         assert!(
-            growth <= 2,
-            "every ten repaints of the strip add {growth} GDI objects, so something created \
+            growth <= 10,
+            "forty repaints of the strip add {growth} more GDI objects than an idle round, so something created \
              per glyph is never released"
         );
     }

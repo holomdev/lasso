@@ -25,6 +25,19 @@ use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, Glo
 /// documented value is used.
 const CF_DIB: u32 = 8;
 
+/// The same pixels with every alpha byte set to opaque.
+///
+/// `CF_DIB` with `BI_RGB` has no alpha channel, so the fourth byte is undefined — and some
+/// readers take it as transparency, which is how a pasted screenshot came out black. A capture
+/// never has transparency, so it is removed on the way in rather than trusted to be absent.
+fn opaque(bgra: &[u8]) -> Vec<u8> {
+    let mut out = bgra.to_vec();
+    for pixel in out.chunks_exact_mut(4) {
+        pixel[3] = 0xFF;
+    }
+    out
+}
+
 /// Copy an opaque BGRA8 frame to the clipboard.
 pub fn copy_bgra(bgra: &[u8], width: u32, height: u32) -> Result<()> {
     if width == 0 || height == 0 {
@@ -67,10 +80,12 @@ pub fn copy_bgra(bgra: &[u8], width: u32, height: u32) -> Result<()> {
         );
 
         let destination = (memory as *mut u8).add(size_of::<BITMAPINFOHEADER>());
+        // Rows come from the opaque copy, which is where the alpha bytes were set.
+        let source = opaque(bgra);
         for row in 0..height as usize {
             let source_row = height as usize - 1 - row;
             std::ptr::copy_nonoverlapping(
-                bgra.as_ptr().add(source_row * stride),
+                source.as_ptr().add(source_row * stride),
                 destination.add(row * stride),
                 stride,
             );

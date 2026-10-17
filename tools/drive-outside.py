@@ -218,6 +218,20 @@ else:
             f"{right - left}x{bottom - top}"
         )
     else:
+        # The image is the capture, so it cannot be black and cannot be one flat colour. Both
+        # were true of a canvas that was never filled with the capture before being drawn on.
+        brightness = float(saved.astype(float).mean())
+        distinct = len(np.unique(saved.reshape(-1, 3), axis=0))
+        print(f"saved image brightness {brightness:.1f}, {distinct} distinct colours")
+        if brightness < 20:
+            failures.append(
+                f"the saved image is essentially black, mean brightness {brightness:.1f}: the "
+                "capture never reached the canvas it was drawn on"
+            )
+        elif distinct < 100:
+            failures.append(
+                f"the saved image has only {distinct} distinct colours, so it is not the screen"
+            )
         inside = red_mask(saved)
         if inside.sum() < 20:
             failures.append("the saved image has no stroke in it at all")

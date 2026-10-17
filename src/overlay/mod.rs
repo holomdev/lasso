@@ -482,6 +482,11 @@ pub fn select_region(frame: &Frame) -> Result<Option<Composed>> {
     // what is kept: a stroke that runs past the region is cut by the crop, not by refusing to
     // draw it. That is the only clipping left, and it cannot disagree with the selection because
     // it is the selection.
+    // The capture first. `Canvas::new` starts empty — the pixels arrive in its `base` layer and
+    // are only copied into the back buffer by `compose`, which the window calls while painting
+    // and this canvas never did. Without this the strokes were drawn onto black, and the file and
+    // the clipboard got black with the marks on top.
+    composed.fill_with_capture();
     let origin = (selection.x, selection.y);
     for stroke in annotations.strokes() {
         draw::draw_stroke(composed.dc(), stroke, origin);
