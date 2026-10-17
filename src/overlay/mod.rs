@@ -487,18 +487,6 @@ fn panel_for(st: &State, pointer: (i32, i32)) -> RECT {
     geometry::magnifier_panel_biased(pointer, st.canvas.width(), st.canvas.height(), bias)
 }
 
-impl State {
-    /// The whole canvas as a rectangle, for invalidating all of it.
-    fn canvas_bounds(&self) -> RECT {
-        RECT {
-            left: 0,
-            top: 0,
-            right: self.canvas.width() as i32,
-            bottom: self.canvas.height() as i32,
-        }
-    }
-}
-
 /// Whether a point is inside the current selection.
 fn inside_selection(st: &State, point: (i32, i32)) -> bool {
     st.current.is_some_and(|rect| {
@@ -603,6 +591,25 @@ fn invalidate_rects(hwnd: HWND, rects: &[Option<RECT>], pad: i32) {
     }
 }
 
+/// Invalidate everything that depends on what is drawn: the selection and the strip.
+///
+/// Called from every place that changes the drawing or the region, instead of listing
+/// rectangles at each call site. A person reported the strip losing its icons and the
+/// drawing going with it, and the cause was exactly this: a repaint was invalidated over
+/// part of the strip, so the plate and the separators were redrawn where the damaged
+/// rectangle reached and the glyphs were not — leaving a strip that is present, correct in
+/// size, and empty. Listing the rectangles per call site got it right in most places and
+/// wrong in others, which is the kind of bug that only shows on the paths nobody exercised.
+///
+/// `st.strip` is recomputed by the caller before this, so both the old and the new
+/// placement are dirtied and a strip that moves leaves nothing behind.
+fn relayout(hwnd: HWND, st: &State, previous: &[Option<RECT>]) {
+    let mut rects: Vec<Option<RECT>> = previous.to_vec();
+    rects.push(st.current);
+    rects.push(st.strip.map(rect_of));
+    invalidate_rects(hwnd, &rects, DIRTY_PAD);
+}
+
 fn shifted() -> bool {
     key_down(VK_SHIFT)
 }
@@ -671,20 +678,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // The strip is asked first. A click on it must never become a
                 // selection gesture, or aiming at a button would move the region.
                 if strip_clicked(st, point) {
-                    // Undo and redo change what is drawn, and the drawing is composed
-                    // into the back buffer, so the selection has to be repainted rather
-                    // than merely re-presented.
-                    let repaint = st.current;
-                    let current_strip = st.strip;
-                    invalidate_rects(
-                        hwnd,
-                        &[
-                            repaint,
-                            previous_strip.map(rect_of),
-                            current_strip.map(rect_of),
-                        ],
-                        DIRTY_PAD,
-                    );
+                    // Undo, redo, a colour and a tool all change what is drawn or what the
+                    // strip shows, so the selection is recomposed rather than merely
+                    // re-presented: the drawing lives in the back buffer.
+                    relayout(hwnd, st, &[previous_strip.map(rect_of)]);
                     return;
                 }
 
@@ -739,16 +736,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
 
                 let current_magnifier = panel_for(st, point);
-                invalidate_rects(
+                relayout(
                     hwnd,
+                    st,
                     &[
                         previous_selection,
-                        st.current,
                         previous_magnifier,
                         Some(current_magnifier),
                         previous_strip.map(rect_of),
                     ],
-                    DIRTY_PAD,
                 );
             });
             unsafe {
@@ -850,16 +846,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
 
                 let current_magnifier = panel_for(st, point);
-                invalidate_rects(
+                relayout(
                     hwnd,
+                    st,
                     &[
                         previous_selection,
-                        st.current,
                         previous_magnifier,
                         Some(current_magnifier),
                         previous_strip.map(rect_of),
                     ],
-                    DIRTY_PAD,
                 );
             });
             LRESULT(0)
@@ -965,11 +960,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     } else {
                         st.annotations.undo();
                     }
-                    // The drawing is composed into the buffer, so the whole selection has
-                    // to be recomposed: there is no record of which pixels a removed
-                    // stroke touched.
-                    let selection = st.current;
-                    invalidate_rects(hwnd, &[selection], DIRTY_PAD);
+                    // There is no record of which pixels a removed stroke touched, so the
+                    // whole selection is recomposed rather than the stroke's own area.
+                    relayout(hwnd, st, &[]);
                 });
                 return LRESULT(0);
             }
@@ -1052,8 +1045,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         st.cursors.size_all
                     };
                     // The strip draws the armed tool, so it has to be redrawn.
-                    let whole = st.canvas_bounds();
-                    invalidate_rects(hwnd, &[Some(whole)], 0);
+                    relayout(hwnd, st, &[]);
                 });
                 return LRESULT(0);
             }
@@ -1062,8 +1054,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 STATE.with(|slot| {
                     if let Some(st) = slot.borrow_mut().as_mut() {
                         st.colour = st.colour.next();
-                        let whole = st.canvas_bounds();
-                        invalidate_rects(hwnd, &[Some(whole)], 0);
+                        relayout(hwnd, st, &[]);
                     }
                 });
                 return LRESULT(0);
@@ -1077,8 +1068,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         } else {
                             (st.thickness + 2).min(MAX_THICKNESS)
                         };
-                        let whole = st.canvas_bounds();
-                        invalidate_rects(hwnd, &[Some(whole)], 0);
+                        relayout(hwnd, st, &[]);
                     }
                 });
                 return LRESULT(0);
@@ -1101,9 +1091,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     };
                     let previous = st.current.replace(nudged);
                     st.annotations = st.annotations.moved(delta.0, delta.1);
+                    let previous_strip = st.strip;
                     st.strip = strip_for(&st.canvas, st.current, &st.metrics);
                     let magnifier = st.pointer.map(|p| panel_for(st, p));
-                    invalidate_rects(hwnd, &[previous, Some(nudged), magnifier], DIRTY_PAD);
+                    relayout(hwnd, st, &[previous, magnifier, previous_strip.map(rect_of)]);
                 });
             }
             LRESULT(0)
@@ -1233,12 +1224,51 @@ fn paint(window_dc: HDC, st: &State, invalid: &RECT) {
             None => draw_hint(mem, &st.canvas),
         }
 
+        // The window before it is presented, so what is written is what the screen shows.
+        // Off unless asked for, because a program that writes a file on every repaint is a
+        // program that fills a disk.
+        dump_canvas(st);
+
         unsafe {
             let _ = RestoreDC(mem, saved);
         }
     }
 
     st.canvas.present(window_dc, invalid);
+}
+
+/// Write the composed buffer a few times, when asked to.
+///
+/// A fault that shows as "the drawing went black" cannot be told apart by looking at the
+/// window from "the drawing was never composed": both are a dark rectangle where something
+/// was. This separates them, and it is the only way to see what a repaint that nobody
+/// triggered actually put in the buffer.
+fn dump_canvas(st: &State) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    /// Enough to catch the first repaint after the fault, few enough to be harmless.
+    const MOST: u32 = 40;
+
+    static COUNT: AtomicU32 = AtomicU32::new(0);
+    let Ok(dir) = std::env::var("LASSO_DUMP_CANVAS") else {
+        return;
+    };
+    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    if n >= MOST {
+        return;
+    }
+    let dir = std::path::PathBuf::from(dir);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join(format!("paint-{n:03}.bmp"));
+    if st.canvas.dump_to(&path).is_err() {
+        return;
+    }
+    // Once per paint would be a wall of text; the first, the last and every eighth is
+    // enough to see the sequence.
+    if n == 0 || n + 1 == MOST || n % 8 == 0 {
+        eprintln!("[overlay] canvas dump {n} -> {}", path.display());
+    }
 }
 
 /// The strip, with the armed tool, the hovered button and the unavailable ones showing.
@@ -1382,6 +1412,43 @@ fn draw_magnifier(hdc: HDC, st: &State) {
     if visible.right > visible.left && visible.bottom > visible.top {
         let dest = geometry::magnifier_dest(&content, &source, &visible);
         canvas.magnify(&dest, &visible);
+        // The panel came out solid white on screen while this code looked right, and the
+        // arithmetic is checked by tests that pass. So the numbers themselves are printed,
+        // because what is left is a value that is not what the test used.
+        if std::env::var("LASSO_TRACE_MAGNIFIER").is_ok() {
+            eprintln!(
+                "[magnifier] pointer {pointer:?} panel ({},{})-({},{}) source ({},{})-({},{}) \
+                 visible ({},{})-({},{}) dest ({},{})-({},{}), canvas {}x{}",
+                panel.left,
+                panel.top,
+                panel.right,
+                panel.bottom,
+                source.left,
+                source.top,
+                source.right,
+                source.bottom,
+                visible.left,
+                visible.top,
+                visible.right,
+                visible.bottom,
+                dest.left,
+                dest.top,
+                dest.right,
+                dest.bottom,
+                canvas.width(),
+                canvas.height()
+            );
+        }
+    } else if std::env::var("LASSO_TRACE_MAGNIFIER").is_ok() {
+        eprintln!(
+            "[magnifier] pointer {pointer:?}: nothing visible; source ({},{})-({},{}) canvas {}x{}",
+            source.left,
+            source.top,
+            source.right,
+            source.bottom,
+            canvas.width(),
+            canvas.height()
+        );
     }
 
     let marked = geometry::magnifier_marked(&content);

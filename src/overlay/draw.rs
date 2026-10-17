@@ -956,10 +956,119 @@ mod tests {
     }
 
     #[test]
+    fn every_button_draws_its_icon_at_every_scale() {
+        // A person reported the strip losing its icons and the drawing going with it, and
+        // it could not be reproduced at 100%. The strip's size scales with the display, so
+        // the scale is the first thing to suspect: a glyph is built from a quarter of the
+        // button's side and a fixed two-pixel pen, so a small enough or large enough button
+        // could produce something that is there and cannot be seen.
+        use crate::overlay::toolbar::{self, Region};
+
+        for factor in [1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0] {
+            let metrics = toolbar::metrics_for(factor);
+            // The canvas grows with the strip. Pinning it would read outside the buffer at
+            // the larger factors, which is the test being wrong rather than the drawing.
+            let width = metrics.width() * 2 + 200;
+            let height = metrics.height() + 40;
+            let placement = toolbar::place(
+                Region {
+                    x: metrics.width() as i32 + 100,
+                    y: 20,
+                    width: 80,
+                    height: 80,
+                },
+                width,
+                height,
+                &metrics,
+            );
+            let canvas = blank(width, height);
+            let plate = unsafe { CreateSolidBrush(COLORREF(0x0020_2020)) };
+            let edge = unsafe { CreateSolidBrush(COLORREF(0x0060_6060)) };
+            let face = unsafe { CreateSolidBrush(COLORREF(0x0040_4040)) };
+            draw_strip(
+                canvas.dc(),
+                &placement,
+                &metrics,
+                // Every button usable, so a greyed glyph cannot be mistaken for a missing
+                // one: the report was about the icons going, not about undo being dim.
+                &StripState {
+                    active: None,
+                    can_undo: true,
+                    can_redo: true,
+                },
+                plate,
+                edge,
+                face,
+            );
+            unsafe {
+                let _ = GdiFlush();
+            }
+
+            for (button, x, y, w, h) in metrics.button_rects() {
+                let rect = RECT {
+                    left: placement.x + x,
+                    top: placement.y + y,
+                    right: placement.x + x + w as i32,
+                    bottom: placement.y + y + h as i32,
+                };
+                let mut ink = 0;
+                for py in rect.top..rect.bottom {
+                    for px in rect.left..rect.right {
+                        let (b, g, r) = pixel(&canvas, px, py);
+                        if (b, g, r) == (0xE0, 0xE0, 0xE0) {
+                            ink += 1;
+                        }
+                    }
+                }
+                // A glyph is a handful of two-pixel strokes. Four is a low bar that still
+                // fails if nothing at all was drawn.
+                assert!(
+                    ink >= 4,
+                    "at {factor}x, {} drew {ink} pixels of ink in a {}x{} button",
+                    button.as_str_for_test(),
+                    w,
+                    h
+                );
+            }
+
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(plate.0));
+                let _ = DeleteObject(HGDIOBJ(edge.0));
+                let _ = DeleteObject(HGDIOBJ(face.0));
+            }
+        }
+    }
+
+    #[test]
+    fn the_strip_fits_inside_the_place_it_was_given_at_every_scale() {
+        // The plate is drawn from the placement's own size, so a metrics height that
+        // disagreed with the button walk would leave the last buttons outside the plate —
+        // drawn on the capture, over whatever is underneath, and outside every rectangle the
+        // hit test knows about.
+        use crate::overlay::toolbar;
+
+        for factor in [1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0] {
+            let metrics = toolbar::metrics_for(factor);
+            let rects = metrics.button_rects();
+            let last = rects.last().expect("the strip has buttons");
+            let last_bottom = last.2 + last.4 as i32;
+            assert!(
+                last_bottom + metrics.padding <= metrics.height() as i32,
+                "at {factor}x the last button ends at {last_bottom}, past the strip's {}",
+                metrics.height()
+            );
+            for (index, (_, x, _, w, _)) in rects.iter().enumerate() {
+                assert!(
+                    x + *w as i32 <= metrics.width() as i32,
+                    "at {factor}x button {index} is wider than the strip"
+                );
+            }
+        }
+    }
+
+    /// Undo and redo, drawn in the two inks so the states can be told apart.
+    #[test]
     fn an_unavailable_button_still_draws_something() {
-        // Undo starts unavailable, and it has to look like a button rather than a hole:
-        // hiding it would move every button below it, and the strip's shape would change
-        // from one moment to the next.
         use crate::overlay::toolbar::{self, Button, Region};
 
         let mut counts = Vec::new();
@@ -997,10 +1106,6 @@ mod tests {
                 let _ = GdiFlush();
             }
 
-            // Counted by the ink's own colour. Counting "anything other than the plate"
-            // was the first version of this, and it proved nothing: both inks differ from
-            // the plate, so both states came out with the same number and the test passed
-            // without telling them apart.
             let (button, x, y, w, h) = metrics
                 .button_rects()
                 .into_iter()
@@ -1013,7 +1118,6 @@ mod tests {
                 bottom: placement.y + y + h as i32,
             };
             let wanted = if can_undo { BUTTON_INK } else { DIM_INK };
-            // `COLORREF` is 0x00BBGGRR, and the DIB holds BGRA.
             let want = (
                 (wanted.0 & 0xFF) as u8,
                 ((wanted.0 >> 8) & 0xFF) as u8,
@@ -1040,8 +1144,7 @@ mod tests {
         let (_, available) = counts[1];
         assert!(
             unavailable > 0,
-            "{button:?} drew nothing in the dim ink, so it looks like a hole rather than \
-             a button that cannot be used"
+            "{button:?} drew nothing in the dim ink, so it looks like a hole"
         );
         assert!(
             available > 0,

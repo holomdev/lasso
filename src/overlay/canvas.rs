@@ -138,6 +138,46 @@ impl Canvas {
         out
     }
 
+    /// Write the back buffer to a BMP, for diagnosing what actually reached it.
+    ///
+    /// A fault that shows on screen as "the drawing went black" cannot be told apart from
+    /// "the drawing was never composed" by looking at the window: both are a dark
+    /// rectangle where something was. This writes out the buffer itself, so the two can be
+    /// separated. BMP rather than PNG because it needs no encoder and the file is read
+    /// back on this machine only.
+    ///
+    /// Called only when `LASSO_DUMP_CANVAS` is set, and only for the first few paints, so
+    /// that leaving it in the program costs nothing and cannot fill a disk.
+    pub fn dump_to(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+
+        let pixels = self.composed_bgra();
+        // A BMP row is padded to four bytes, which for BGRA is already true.
+        let image_bytes = pixels.len();
+        let header_size = 14 + 40;
+        let file_size = header_size + image_bytes;
+
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(b"BM")?;
+        file.write_all(&(file_size as u32).to_le_bytes())?;
+        file.write_all(&0u32.to_le_bytes())?;
+        file.write_all(&(header_size as u32).to_le_bytes())?;
+        file.write_all(&40u32.to_le_bytes())?;
+        file.write_all(&(self.width as i32).to_le_bytes())?;
+        // Negative height: the rows are stored top-down, like the DIB.
+        file.write_all(&(-(self.height as i32)).to_le_bytes())?;
+        file.write_all(&1u16.to_le_bytes())?;
+        file.write_all(&32u16.to_le_bytes())?;
+        file.write_all(&0u32.to_le_bytes())?;
+        file.write_all(&(image_bytes as u32).to_le_bytes())?;
+        file.write_all(&2835i32.to_le_bytes())?;
+        file.write_all(&2835i32.to_le_bytes())?;
+        file.write_all(&0u32.to_le_bytes())?;
+        file.write_all(&0u32.to_le_bytes())?;
+        file.write_all(&pixels)?;
+        file.flush()
+    }
+
     fn stretch(&self, pixels: &[u8]) {
         unsafe {
             StretchDIBits(
@@ -205,11 +245,17 @@ impl Canvas {
         }
 
         // GDI measures `ysrc` from the bottom of the DIB even though this one is
-        // declared top-down with a negative `biHeight`, so a sub-rectangle has to
-        // be asked for at its mirrored offset. Whole-image blits are unaffected
-        // because `height - 0 - height` is still 0, which is why only the
-        // magnifier ever looked wrong. This is covered by a test that reads the
-        // composed pixels back.
+        // declared top-down with a negative `biHeight`, so a sub-rectangle has to be
+        // asked for at its mirrored offset. Whole-image blits are unaffected because
+        // `height - 0 - height` is still 0, which is why only the magnifier ever looked
+        // wrong.
+        //
+        // This was changed to `source.top` on the strength of a panel that came out white,
+        // and reverted when the buffer was read back and the **capture itself** was white
+        // there: the panel was magnifying a white cloud, not failing to magnify. The
+        // mirrored arithmetic is what `magnify_reads_the_rows_the_source_rectangle_names`
+        // checks, by using a source deliberately far from the middle of the bitmap, where
+        // the two formulas differ by far more than the tolerance of the check.
         let ysrc = self.height as i32 - source.top - source_height;
 
         unsafe {
@@ -317,6 +363,60 @@ mod tests {
     }
 
     #[test]
+    fn magnify_reads_the_rows_the_source_rectangle_names() {
+        // The one test that would have caught this. `magnify` is given a rectangle in the
+        // capture's own coordinates and has to read **those rows** — nothing else.
+        //
+        // The tests beside this one passed while the magnifier was reading mirrored rows,
+        // because the canvas they used is made of gradients that are almost the same
+        // everywhere: sampling the wrong rows still produced the value the test wanted, and
+        // a mirrored read of a nearly flat region is still nearly flat. So this uses a
+        // canvas where every row is a distinct, unmistakable value.
+        let (width, height) = (64u32, 64u32);
+        let mut bgra = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for _ in 0..width {
+                // The green channel is the row number, so a pixel says which row it came
+                // from without any arithmetic.
+                bgra.extend_from_slice(&[0, y as u8, 0, 0xFF]);
+            }
+        }
+        let canvas = Canvas::new(&bgra, width, height).expect("the test canvas must build");
+
+        // A source well away from the middle, where a mirror is most obvious: rows 40..48
+        // mirrored become rows 16..24.
+        let source = RECT {
+            left: 8,
+            top: 40,
+            right: 16,
+            bottom: 48,
+        };
+        let content = RECT {
+            left: 0,
+            top: 0,
+            right: 64,
+            bottom: 64,
+        };
+        let dest = geometry::magnifier_dest(&content, &source, &source);
+        canvas.magnify(&dest, &source);
+
+        // Each source row fills eight destination rows, in order.
+        for row in 0..8 {
+            let y = dest.top + row * geometry::MAGNIFIER_ZOOM;
+            let (_, green, _) = canvas.back_pixel_for_test(dest.left + 1, y);
+            assert_eq!(
+                green,
+                (source.top + row) as u8,
+                "destination row {y} should hold source row {}, not {green}; the source \
+                 rectangle names capture rows {}..{}",
+                source.top + row,
+                source.top,
+                source.bottom
+            );
+        }
+    }
+
+    #[test]
     fn magnify_puts_the_pixel_under_the_pointer_at_the_marked_square() {
         // The panel is a screen-space overlay, so the test canvas has to be
         // large enough to hold it even though a real capture never is.
@@ -347,6 +447,64 @@ mod tests {
             (blue as i32, green as i32),
             pointer,
             "the marked square must hold the pixel under the pointer"
+        );
+    }
+
+    #[test]
+    fn magnify_covers_the_whole_content_area_with_the_capture() {
+        // The single-pixel test above passed while the panel was coming out **solid white
+        // on screen**. One pixel cannot tell an image from a flat fill: it proved the
+        // marked pixel was right and said nothing about the other 12 543.
+        //
+        // A real capture is not one colour, so this requires the content area to hold many
+        // different colours — which is what an actual magnified picture looks like and what
+        // a white rectangle does not.
+        let (width, height) = (200u32, 200u32);
+        let canvas = coordinate_canvas(width, height);
+        let pointer = (100, 100);
+
+        let source = geometry::magnifier_source(pointer);
+        let visible = geometry::intersect(&source, width, height);
+        assert_eq!(visible, source, "the sample must lie fully on the capture");
+
+        let panel = RECT {
+            left: 0,
+            top: 0,
+            right: geometry::MAGNIFIER_PANEL,
+            bottom: geometry::MAGNIFIER_PANEL,
+        };
+        let content = geometry::magnifier_content(&panel);
+        let dest = geometry::magnifier_dest(&content, &source, &visible);
+        canvas.magnify(&dest, &visible);
+
+        let mut colours = std::collections::HashSet::new();
+        let mut white = 0;
+        let mut total = 0;
+        for y in content.top..content.bottom {
+            for x in content.left..content.right {
+                let pixel = canvas.back_pixel_for_test(x, y);
+                if pixel == (0xFF, 0xFF, 0xFF) {
+                    white += 1;
+                }
+                colours.insert(pixel);
+                total += 1;
+            }
+        }
+
+        assert!(
+            total > 0,
+            "the content area is empty, so there is nothing to check"
+        );
+        assert!(
+            white < total / 2,
+            "{white} of {total} content pixels are pure white, so the magnified capture \
+             did not reach the panel"
+        );
+        assert!(
+            colours.len() > 20,
+            "the content area holds only {} distinct colours, which is a flat fill rather \
+             than a magnified picture",
+            colours.len()
         );
     }
 }

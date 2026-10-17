@@ -60,6 +60,30 @@ impl Button {
     pub fn starts_a_group(self) -> bool {
         matches!(self, Button::Colour | Button::Undo | Button::Save)
     }
+
+    /// A short name, for a test failure to say which button it was about.
+    ///
+    /// Only the tests want this. The program never needs to name a button: it draws one,
+    /// or it acts on one.
+    #[cfg(test)]
+    pub fn as_str_for_test(self) -> &'static str {
+        match self {
+            Button::Tool(tool) => match tool {
+                Tool::Move => "move",
+                Tool::Arrow => "arrow",
+                Tool::Rectangle => "rectangle",
+                Tool::Ellipse => "ellipse",
+                Tool::Pencil => "pencil",
+            },
+            Button::Colour => "colour",
+            Button::Thickness => "thickness",
+            Button::Undo => "undo",
+            Button::Redo => "redo",
+            Button::Save => "save",
+            Button::Copy => "copy",
+            Button::Cancel => "cancel",
+        }
+    }
 }
 
 /// Which side of the selection the strip ended up on.
