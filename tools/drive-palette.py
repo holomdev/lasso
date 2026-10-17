@@ -143,6 +143,13 @@ def palette_open(image):
     return all(count(image, COLOURS[c], PALETTE_BAND) >= 100 for c in SATURATED)
 
 
+def strip_on_screen(image):
+    """Whether the strip's plate is anywhere on screen, which says the drag worked."""
+    plate = np.all(np.abs(image.astype(int) - np.array((42, 42, 42))) <= 2, axis=2)
+    # The plate is a tall card: far more pixels than the scattered ones in a wallpaper.
+    return int(plate.sum()) > 2000
+
+
 def held(image):
     counts = {c: count(image, COLOURS[c], BUTTON_BAND) for c in COLOURS}
     name = max(counts, key=lambda c: counts[c])
@@ -162,12 +169,18 @@ if process.poll() is not None:
     sys.exit("the overlay exited before it was used")
 
 try:
+    # A warm-up move, because the very first one after the window appears can be coalesced
+    # with wherever the pointer already was: the drag then starts from the wrong place and
+    # the whole run measures a screen with no strip on it.
+    move_to(REGION[0] + 11, REGION[1] + 13)
+    time.sleep(0.2)
+
     # A region, held and dragged: releasing on the corner would leave nothing selected.
     left, top, right, bottom = REGION
     move_to(left, top)
-    time.sleep(0.12)
+    time.sleep(0.2)
     press()
-    time.sleep(0.06)
+    time.sleep(0.08)
     for step in range(1, 7):
         move_to(
             left + (right - left) * step // 6,
@@ -183,6 +196,14 @@ try:
     time.sleep(0.35)
     closed = shot("0-no-hover")
 
+    # The setup has to be checked before the thing being tested, or a failure to select a
+    # region is reported as a palette that does not work.
+    if not strip_on_screen(closed):
+        sys.exit(
+            "the setup failed: no strip on screen after the drag, so nothing about the "
+            "palette can be measured. The pointer may not have been delivered."
+        )
+
     # Straight into the palette's area, which is the reported fault.
     move_to(*swatch(3))
     time.sleep(0.4)
@@ -194,6 +215,21 @@ try:
     move_to(*COLOUR)
     time.sleep(0.4)
     hovered = shot("1-hover")
+
+    # Past the swatches and back, which is what a hand does when it goes too far. Without
+    # a grace the palette is gone the moment the pointer is in neither, and there is no way
+    # back except through the colour button.
+    move_to(PALETTE_BAND[2] + 120, COLOUR[1])
+    time.sleep(0.10)
+    move_to(*swatch(1))
+    time.sleep(0.30)
+    overshoot = shot("1c-back-after-overshoot")
+
+    # Away, then onto the colour button again for the journey proper.
+    move_to(*away)
+    time.sleep(0.5)
+    move_to(*COLOUR)
+    time.sleep(0.35)
 
     # Onto a swatch in small steps, the way a hand moves. This is where it used to close:
     # the pointer crossed the gap between the strip and the palette and was in neither.
@@ -225,6 +261,10 @@ if palette_open(inside):
         "the palette opened from empty space: the pointer entered its area without touching "
         "the colour button"
     )
+if not palette_open(overshoot):
+    failures.append(
+        "the palette was gone after the pointer went past the swatches and came back"
+    )
 if not palette_open(hovered):
     failures.append("pointing at the colour button does not open the palette")
 if not palette_open(on_swatch):
@@ -244,6 +284,7 @@ for name, image in [
     ("0-no-hover", closed),
     ("0b-inside-closed", inside),
     ("1-hover", hovered),
+    ("1c-after-overshoot", overshoot),
     ("2-on-swatch", on_swatch),
     ("3-picked-blue", picked),
     ("4-closed", after),

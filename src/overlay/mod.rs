@@ -55,15 +55,28 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, HCURSOR,
     HWND_TOPMOST, IDC_CROSS, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
     LoadCursorW, MSG, PostQuitMessage, RegisterClassW, SW_SHOW, SWP_SHOWWINDOW, SetCursor,
-    SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, WM_DESTROY, WM_ERASEBKGND,
-    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR,
-    WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TranslateMessage, WM_DESTROY,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN,
+    WM_SETCURSOR, WM_TIMER, KillTimer, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::capture::Frame;
 use annotation::{Annotations, Colour, Frame as SelectionFrame, Point, Shape, Stroke, Tool};
 use geometry::{Edges, Zone};
 use toolbar::{Button, Metrics, Placement, Region};
+
+/// The timer that closes the palette after the pointer has left it.
+///
+/// Its own id rather than zero, so it cannot be confused with any other timer this window
+/// might grow later.
+const PALETTE_TIMER: usize = 1;
+
+/// How long the palette waits after the pointer leaves before it closes.
+///
+/// Long enough for a hand that went a little past the swatches to come back, short enough
+/// that it never sits in the way of the region being adjusted. Below about a fifth of a
+/// second it is not felt at all; above half a second it starts to look stuck.
+const PALETTE_GRACE_MS: u32 = 260;
 
 /// A region of the capture, in frame pixels.
 ///
@@ -287,6 +300,13 @@ struct State {
     /// palette, and those two are not the same test. Without this flag, crossing the empty
     /// space where the swatches would be opened a palette out of nothing.
     palette_open: bool,
+    /// Whether the timer that closes the palette after the pointer has left is running.
+    ///
+    /// Without it the palette closed the instant the pointer was in neither the strip nor the
+    /// panel, which punished anybody whose hand went a little past the swatches: there was no
+    /// way back except through the colour button. A short grace is what makes "move onto it"
+    /// and "move across it" different actions.
+    palette_grace: bool,
     /// An action button of the strip that was pressed, which closes the window.
     pressed: Option<Pressed>,
     /// The strip's metrics for this display's scale.
@@ -384,6 +404,7 @@ pub fn select_region(frame: &Frame) -> Result<Option<Composed>> {
             strip: None,
             hovered: None,
         palette_open: false,
+        palette_grace: false,
             pressed: None,
             metrics: toolbar::metrics_for(crate::ui_layout::factor(unsafe {
                 windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd)
@@ -842,8 +863,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             );
                             palette.keeps_open(point.0, point.1)
                         });
-                        st.palette_open =
-                            toolbar::palette_visible(st.palette_open, over_colour, inside_palette);
+                        if toolbar::palette_visible(
+                            st.palette_open,
+                            over_colour,
+                            inside_palette,
+                        ) {
+                            st.palette_open = true;
+                            // Back inside: the clock stops, and the palette never flickered.
+                            if st.palette_grace {
+                                unsafe {
+                                    let _ = KillTimer(Some(hwnd), PALETTE_TIMER);
+                                }
+                                st.palette_grace = false;
+                            }
+                        } else if st.palette_open && !st.palette_grace {
+                            // Out of the zone with the palette showing: it stays for a moment
+                            // rather than vanishing under a hand that has not finished moving.
+                            unsafe {
+                                let _ = SetTimer(Some(hwnd), PALETTE_TIMER, PALETTE_GRACE_MS, None);
+                            }
+                            st.palette_grace = true;
+                        }
 
                         st.active_cursor = if st.hovered.is_some() {
                             st.cursors.cross
@@ -1160,6 +1200,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     relayout(hwnd, st, &[previous, previous_strip.map(rect_of)]);
                 });
             }
+            LRESULT(0)
+        }
+
+        WM_TIMER if wparam.0 == PALETTE_TIMER => {
+            STATE.with(|slot| {
+                let mut binding = slot.borrow_mut();
+                let Some(st) = binding.as_mut() else {
+                    return;
+                };
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), PALETTE_TIMER);
+                }
+                st.palette_grace = false;
+                if st.palette_open {
+                    st.palette_open = false;
+                    // Its area has to be repainted with the capture now that it is gone.
+                    relayout(hwnd, st, &[]);
+                }
+            });
             LRESULT(0)
         }
 

@@ -160,6 +160,10 @@ onto a swatch, the part a hover menu usually gets wrong — but it cannot open i
 crossing empty space where the swatches would be would make them appear from
 nothing. It closes when the pointer is on neither.
 
+It waits about a quarter of a second before closing, so a hand that goes a little
+past the swatches can come back. Without that pause the panel was gone the instant
+the pointer was in neither, and the only way back was through the colour button.
+
 It is a rectangle of the same buffer as everything else rather than a window of its
 own, so its swatches and its hit test come from one function and cannot disagree.
 
