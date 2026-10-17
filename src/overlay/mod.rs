@@ -916,21 +916,48 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                     Drag::Move { grab, start } => {
                         let moved = geometry::moved(&start, grab, point);
-                        let delta = (moved.left - start.left, moved.top - start.top);
+                        // The step, not the journey. `geometry::moved` measures from the rect
+                        // the drag started at, and that distance grows with every mouse move;
+                        // applying it each time carried the drawing twice as far as the region
+                        // on the first event and further on every one after, which is how a
+                        // mark disappeared while the region was being dragged over it.
+                        let delta = match previous_selection {
+                            Some(before) => (moved.left - before.left, moved.top - before.top),
+                            None => (0, 0),
+                        };
                         st.current = Some(moved);
-                        // The drawing belongs to the selection, so it travels with it.
-                        st.annotations = st.annotations.moved(delta.0, delta.1);
+                        // The drawing marks what is on the screen, so it stays where it is:
+                        // a mark put on a face has to stay on the face when the region is
+                        // dragged over it. Coordinates are held relative to the region's
+                        // origin, so keeping the mark still means shifting it by the opposite
+                        // of the origin's own movement.
+                        //
+                        // It used to be shifted the same way, and since the origin moves too,
+                        // every mark travelled twice as far as the region: the drawing flew out
+                        // of the frame and was gone.
+                        if delta != (0, 0) {
+                            st.annotations = st.annotations.rebased(delta);
+                        }
+                        // Whatever the move has taken outside the region is not part of the
+                        // capture, so it is dropped rather than kept to reappear if the region
+                        // is dragged back.
+                        let frame = selection_frame(&moved);
+                        st.annotations = st.annotations.clip_to(frame.width, frame.height);
                         st.strip = strip_for(&st.canvas, st.current, &st.metrics);
                     }
                     Drag::Resize { edges, start } => {
                         let resized = geometry::resized(&start, edges, point);
-                        // Resizing from the top or the left moves the origin as well as
-                        // the size, so the drawing has to be shifted by that much before
-                        // it is clipped — otherwise everything drawn would slide.
-                        let delta = (resized.left - start.left, resized.top - start.top);
+                        // Resizing from the top or the left moves the origin as well as the
+                        // size, so the drawing has to be shifted by the opposite of that step
+                        // before it is clipped — otherwise everything drawn would slide, and by
+                        // as much again on every mouse move as it moved here.
+                        let delta = match previous_selection {
+                            Some(before) => (resized.left - before.left, resized.top - before.top),
+                            None => (0, 0),
+                        };
                         st.current = Some(resized);
                         if delta != (0, 0) {
-                            st.annotations = st.annotations.moved(delta.0, delta.1);
+                            st.annotations = st.annotations.rebased(delta);
                         }
                         let frame = selection_frame(&resized);
                         st.annotations = st.annotations.clip_to(frame.width, frame.height);

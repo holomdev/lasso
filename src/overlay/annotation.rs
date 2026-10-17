@@ -379,6 +379,16 @@ impl Annotations {
         }
     }
 
+    /// The same drawing, re-based so it stays where it is on the screen.
+    ///
+    /// The region's origin has moved by `delta`, and these coordinates are relative to it, so
+    /// each one has to move by the opposite amount to keep the mark on the pixel it marks. The
+    /// sign is the whole of it, and it is here rather than in the window handler because a sign
+    /// in a handler is a sign no test can be wrong about.
+    pub fn rebased(&self, delta: (i32, i32)) -> Annotations {
+        self.moved(-delta.0, -delta.1)
+    }
+
     /// Everything outside a selection of this size removed.
     ///
     /// The redo stack is not clipped along with the strokes. It is a stack of things
@@ -527,10 +537,11 @@ mod tests {
     }
 
     #[test]
-    fn moving_the_selection_takes_the_drawing_with_it() {
-        // The property the whole coordinate choice exists for: after the region moves,
-        // a stroke sits at the same place inside it as before. Expressed as a
-        // round trip, so it holds whatever the numbers are.
+    fn moving_the_drawing_and_moving_it_back_is_a_no_op() {
+        // A round trip, so it holds whatever the numbers are. It used to be called "moving the
+        // selection takes the drawing with it", which described the coordinates rather than
+        // what anybody wants to happen: a mark stays on the screen, and the shift exists to
+        // keep it there as the origin moves under it.
         let annotations = {
             let mut a = Annotations::new();
             a.add(arrow((10, 20), (30, 40)));
@@ -540,6 +551,77 @@ mod tests {
         let moved = annotations.moved(7, -3);
         let back = moved.moved(-7, 3);
         assert_eq!(back.strokes(), annotations.strokes(), "a move and back is a no-op");
+    }
+
+    #[test]
+    fn a_mark_stays_on_the_screen_when_the_region_moves() {
+        // The report: paint something, drag the region, and the painting is gone. Coordinates
+        // are held relative to the region's origin, and the origin moves with the drag, so a
+        // mark shifted the same way as the region travels twice as far as it and leaves the
+        // frame. It has to be shifted the opposite way to stay put.
+        let frame = Frame::new(100, 100, 200, 200);
+        let mut annotations = Annotations::new();
+        annotations.add(Stroke::new(
+            Shape::Rectangle {
+                from: Point::new(10, 10),
+                to: Point::new(60, 60),
+            },
+            Colour::Red,
+            2,
+        ));
+        let corner = Point::new(10, 10);
+        let on_screen_before = frame.to_screen(corner);
+
+        let delta = (30, 20);
+        let moved_frame = Frame::new(
+            frame.x + delta.0,
+            frame.y + delta.1,
+            frame.width,
+            frame.height,
+        );
+        // Without clipping, because this is about where the mark sits: `clip_to` pulls a shape
+        // that crosses the edge back into the region, which would move this one and leave the
+        // test measuring the clip instead of the shift. `rebased` is what the overlay calls.
+        let after = annotations.rebased(delta);
+
+        let stroke = &after.strokes()[0];
+        let corner_now = match &stroke.shape {
+            Shape::Rectangle { from, .. } => *from,
+            other => panic!("the shape changed: {other:?}"),
+        };
+        assert_eq!(
+            moved_frame.to_screen(corner_now),
+            on_screen_before,
+            "the mark moved on the screen when only the region was dragged"
+        );
+    }
+
+    #[test]
+    fn dragging_the_region_away_drops_what_falls_outside() {
+        // What the move takes out of the region is not part of the capture, so it goes: half a
+        // box left outside is not saved, and does not come back when the region is dragged over
+        // it again.
+        let mut annotations = Annotations::new();
+        annotations.add(Stroke::new(
+            Shape::Rectangle {
+                from: Point::new(80, 10),
+                to: Point::new(120, 40),
+            },
+            Colour::Red,
+            2,
+        ));
+
+        // The region moves right by 40, so the box is now at 40..80 and stays.
+        let kept = annotations.moved(-40, 0).clip_to(100, 100);
+        assert_eq!(kept.strokes().len(), 1, "a box still inside was dropped");
+
+        // Far enough that it is wholly outside drops it entirely.
+        let gone = annotations.moved(-200, 0).clip_to(100, 100);
+        assert!(
+            gone.strokes().is_empty(),
+            "a box dragged out of the region is still there: {:?}",
+            gone.strokes()
+        );
     }
 
     #[test]
