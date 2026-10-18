@@ -16,14 +16,16 @@ import numpy as np
 from PIL import Image, ImageGrab
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import layout  # noqa: E402
 EXE = ROOT / "target" / "debug" / "lasso.exe"
 OUT = ROOT / "target" / "overlay-strip"
 REGION = (600, 250, 1200, 700)
 
 # From the metrics: the strip stands off the region by the standoff, and is one button wide plus
 # its padding.
-BUTTON, PADDING, STANDOFF = 36, 6, 10
-STRIP_WIDTH = BUTTON + PADDING * 2
+BUTTON, PADDING = layout.BUTTON, layout.PADDING
+STRIP_WIDTH = layout.STRIP_WIDTH
 
 user32 = ctypes.windll.user32
 
@@ -122,8 +124,13 @@ try:
 
     image = ImageGrab.grab()
     image.save(OUT / "screen.png")
-    strip_left = left - STANDOFF - STRIP_WIDTH
-    crop = image.crop((strip_left, top, strip_left + STRIP_WIDTH, bottom))
+    # The card is taller than the region: it is 506 pixels and a region is often shorter, so the
+    # crop has to be the card's own height, and its top is the region's unless it was pulled up.
+    strip_left = layout.strip_x(REGION)
+    strip_top = layout.strip_top(REGION)
+    crop = image.crop(
+        (strip_left, strip_top, strip_left + STRIP_WIDTH, strip_top + layout.STRIP_HEIGHT)
+    )
     crop = crop.resize((crop.width * 2, crop.height * 2), Image.NEAREST)
     crop.save(OUT / "strip.png")
     print(f"strip crop: {crop.width}x{crop.height} at ({strip_left}, {top})")

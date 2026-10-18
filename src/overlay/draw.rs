@@ -19,9 +19,10 @@
 
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
-    CreatePen, CreateSolidBrush, DeleteObject, Ellipse, FrameRect, GetObjectW, GetStockObject, HDC,
-    HGDIOBJ, HPEN, LineTo, LOGBRUSH, MoveToEx, NULL_BRUSH, NULL_PEN, PS_SOLID, Polyline, Rectangle,
-    RoundRect, SelectObject,
+    BS_SOLID, CreatePen, CreateSolidBrush, DeleteObject, Ellipse, ExtCreatePen, FrameRect,
+    GetObjectW, GetStockObject, HDC, HGDIOBJ, HPEN, LineTo, LOGBRUSH, MoveToEx, NULL_BRUSH,
+    NULL_PEN, PEN_STYLE, PS_ENDCAP_ROUND, PS_GEOMETRIC, PS_JOIN_ROUND, PS_SOLID, Polyline, RoundRect,
+    SelectObject,
 };
 
 use super::annotation::{Point, Shape, Stroke};
@@ -293,33 +294,33 @@ pub fn draw_palette(
                 }
             }
             PaletteKind::Thickness => {
-                // A dot of that width, centred in its cell. The cell is only outlined, so the
-                // dot is the mark and the outline is not mistaken for one.
+                // A bar of that width, as the button shows it. A disc of the width was honest and
+                // unreadable at the thin end, and a row of discs does not look like the widths it
+                // offers; a row of bars does, and it matches the button that opens it.
                 let thickness = THICKNESS_STEPS[index];
                 let cell = (square.right - square.left).min(square.bottom - square.top);
-                let diameter = (thickness as i32).clamp(4, (cell - 6).max(4));
-                let centre = (
-                    (square.left + square.right) / 2,
-                    (square.top + square.bottom) / 2,
-                );
+                let wide = (thickness as i32).clamp(2, (cell - 6).max(2));
+                let centre_x = (square.left + square.right) / 2;
+                let bar = RECT {
+                    left: centre_x - wide / 2,
+                    top: square.top + 4,
+                    right: centre_x - wide / 2 + wide,
+                    bottom: square.bottom - 4,
+                };
                 let dot = unsafe { CreateSolidBrush(BUTTON_INK) };
                 if !dot.is_invalid() {
-                    let half = diameter / 2;
-                    // Both objects are selected and both are put back. The pen matters as much
-                    // as the brush: `Ellipse` outlines with the pen, so a dot two pixels across
-                    // has no interior at all and came out as the pen's colour instead of the
-                    // row's — a mark of the wrong size and the wrong brightness. With no pen
-                    // the dot is exactly the width it was asked for.
                     let no_pen = unsafe { GetStockObject(NULL_PEN) };
                     let previous_pen = unsafe { SelectObject(hdc, no_pen) };
                     let previous_brush = unsafe { SelectObject(hdc, HGDIOBJ(dot.0)) };
                     unsafe {
-                        let _ = Ellipse(
+                        let _ = RoundRect(
                             hdc,
-                            centre.0 - half,
-                            centre.1 - half,
-                            centre.0 - half + diameter,
-                            centre.1 - half + diameter,
+                            bar.left,
+                            bar.top,
+                            bar.right,
+                            bar.bottom,
+                            wide,
+                            wide,
                         );
                         SelectObject(hdc, previous_brush);
                         SelectObject(hdc, previous_pen);
@@ -375,6 +376,27 @@ fn brush_colour(brush: windows::Win32::Graphics::Gdi::HBRUSH) -> COLORREF {
         BUTTON_INK
     } else {
         log.lbColor
+    }
+}
+
+/// A pen with round ends and round joins, which is what a Phosphor icon is drawn with.
+///
+/// A plain `CreatePen` makes square ends, and every stroke then has a chopped-off tip; the round
+/// cap is most of what makes these icons look like themselves at eighteen pixels.
+fn geometric_pen(width: i32, colour: COLORREF) -> HPEN {
+    let brush = LOGBRUSH {
+        lbStyle: BS_SOLID,
+        lbColor: colour,
+        lbHatch: 0,
+    };
+    unsafe {
+        // The style is a `PEN_STYLE`, not the bare flags, and a solid line carries no dash pattern.
+        ExtCreatePen(
+            PEN_STYLE(PS_GEOMETRIC.0 | PS_SOLID.0 | PS_ENDCAP_ROUND.0 | PS_JOIN_ROUND.0),
+            width.max(1) as u32,
+            &brush,
+            None,
+        )
     }
 }
 
@@ -547,261 +569,280 @@ fn draw_button_glyph(hdc: HDC, button: Button, rect: &RECT, ink: COLORREF, state
     let width = rect.right - rect.left;
     let height = rect.bottom - rect.top;
     let centre = (rect.left + width / 2, rect.top + height / 2);
-    // A quarter of the button's side: big enough to read, small enough to leave the
-    // padding that makes the strip look uncrowded.
-    let arm = (width.min(height) / 4).max(2);
-    let pen = unsafe { CreatePen(PS_SOLID, 2, ink) };
+    let side = width.min(height);
+
+    // Phosphor draws for a twenty-four pixel box with a two-pixel stroke, and its marks reach nine
+    // pixels from the centre. Both are derived from the button's side, so the weight and the
+    // proportion survive a strip drawn at any scale.
+    let stroke = (side * 2 / 24).max(2);
+    let arm = (side * 9 / 24).max(4);
+    // A chevron's legs are shorter than the arm they cap: at half the arm the four of them met
+    // in the middle and the mark read as a diamond with a cross through it.
+    let head = (arm / 3).max(2);
+
+    let pen = geometric_pen(stroke, ink);
     if pen.is_invalid() {
-        // A pen that cannot be created is a glyph that vanishes while the plate and the
-        // separators — which are `FillRect` and create nothing — carry on looking right.
-        // That is the exact shape of the fault that was reported, so it says so out loud
-        // instead of returning quietly.
+        // A pen that cannot be created is a glyph that vanishes while the plate and the rules —
+        // which create nothing — carry on looking right. That is the shape of the fault that was
+        // reported once, so it says so out loud instead of returning quietly.
         eprintln!(
-            "[strip] CreatePen failed for {button:?}: {} GDI objects held",
+            "[strip] the pen for {button:?} could not be created: {} GDI objects held",
             user_objects()
         );
         return;
     }
-    // The same colour as a brush, for the two glyphs that are framed rather than stroked.
-    //
-    // Both objects are selected into the context and **both** are put back afterwards. The
-    // brush used to be selected and never restored, and then deleted: deleting an object
-    // that is still selected into a device context does not release the handle, and the
-    // twelve glyphs of every repaint leaked about seven objects a frame between them. The
-    // process ran out at around ten thousand, after which `CreatePen` failed and the strip
-    // drew its plate and separators — which create nothing — with no icons in it.
-    let brush = unsafe { CreateSolidBrush(ink) };
     let saved_pen = unsafe { SelectObject(hdc, HGDIOBJ(pen.0)) };
-    let saved_brush = if brush.is_invalid() {
-        None
-    } else {
-        Some(unsafe { SelectObject(hdc, HGDIOBJ(brush.0)) })
-    };
 
     let line = |from: (i32, i32), to: (i32, i32)| unsafe {
         let _ = MoveToEx(hdc, from.0, from.1, None);
         let _ = LineTo(hdc, to.0, to.1);
     };
+    // Every straight mark is a line with round ends; `rounded` covers the two glyphs that are
+    // outlines. Nothing here fills, so no brush is selected and nothing has to be put back.
+    let hollow = |rect: &RECT, radius: i32| rounded(hdc, rect, radius, None, pen);
 
     match button {
         Button::Tool(super::annotation::Tool::Move) => {
-            // Four small arrows: the universal "move" mark.
+            // `arrows-out-cardinal`: a cross with a chevron at each of its four ends.
             line((centre.0 - arm, centre.1), (centre.0 + arm, centre.1));
             line((centre.0, centre.1 - arm), (centre.0, centre.1 + arm));
-            line((centre.0 - arm, centre.1), (centre.0 - arm + 2, centre.1 - 2));
-            line((centre.0 - arm, centre.1), (centre.0 - arm + 2, centre.1 + 2));
-            line((centre.0 + arm, centre.1), (centre.0 + arm - 2, centre.1 - 2));
-            line((centre.0 + arm, centre.1), (centre.0 + arm - 2, centre.1 + 2));
-            line((centre.0, centre.1 - arm), (centre.0 - 2, centre.1 - arm + 2));
-            line((centre.0, centre.1 - arm), (centre.0 + 2, centre.1 - arm + 2));
-            line((centre.0, centre.1 + arm), (centre.0 - 2, centre.1 + arm - 2));
-            line((centre.0, centre.1 + arm), (centre.0 + 2, centre.1 + arm - 2));
+            for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                let tip = (centre.0 + dx * arm, centre.1 + dy * arm);
+                // The two strokes of the chevron point back along the arm they cap.
+                line(tip, (tip.0 - dx * head + dy * head, tip.1 - dy * head + dx * head));
+                line(tip, (tip.0 - dx * head - dy * head, tip.1 - dy * head - dx * head));
+            }
         }
         Button::Tool(super::annotation::Tool::Arrow) => {
-            line(
-                (centre.0 - arm, centre.1 + arm),
-                (centre.0 + arm, centre.1 - arm),
-            );
-            let head = arm;
-            line(
-                (centre.0 + arm, centre.1 - arm),
-                (centre.0 + arm - head, centre.1 - arm),
-            );
-            line(
-                (centre.0 + arm, centre.1 - arm),
-                (centre.0 + arm, centre.1 - arm + head),
-            );
+            // `arrow-up-right`: the shaft, and a chevron opening back down the shaft.
+            let head_at = (centre.0 + arm, centre.1 - arm);
+            let tail = (centre.0 - arm, centre.1 + arm);
+            line(tail, head_at);
+            line(head_at, (head_at.0 - head, head_at.1));
+            line(head_at, (head_at.0, head_at.1 + head));
         }
         Button::Tool(super::annotation::Tool::Rectangle) => {
-            // Hollow. `Rectangle` fills with the brush the context holds, and that brush is the
-            // ink — which made this a solid square, and on a light card a solid dark one. An
-            // outline is what the reference shows and what the tool draws.
+            // `square`, with a corner radius small enough to read as a square at this size.
             let box_rect = RECT {
                 left: centre.0 - arm,
                 top: centre.1 - arm,
-                right: centre.0 + arm + 1,
-                bottom: centre.1 + arm + 1,
+                right: centre.0 + arm,
+                bottom: centre.1 + arm,
             };
-            let hollow = unsafe { SelectObject(hdc, GetStockObject(NULL_BRUSH)) };
-            unsafe {
-                let _ = Rectangle(hdc, box_rect.left, box_rect.top, box_rect.right, box_rect.bottom);
-                SelectObject(hdc, hollow);
-            }
+            hollow(&box_rect, (stroke * 2).max(2));
         }
         Button::Tool(super::annotation::Tool::Ellipse) => {
-            // Hollow, for the same reason as the square above.
-            let hollow = unsafe { SelectObject(hdc, GetStockObject(NULL_BRUSH)) };
+            // `circle`: an open outline, which is also what the tool draws.
+            let (rx, ry) = (arm, arm);
+            let background = unsafe { GetStockObject(NULL_BRUSH) };
+            let saved = unsafe { SelectObject(hdc, background) };
             unsafe {
                 let _ = Ellipse(
                     hdc,
-                    centre.0 - arm,
-                    centre.1 - arm,
-                    centre.0 + arm + 1,
-                    centre.1 + arm + 1,
+                    centre.0 - rx,
+                    centre.1 - ry,
+                    centre.0 + rx,
+                    centre.1 + ry,
                 );
-                SelectObject(hdc, hollow);
+                SelectObject(hdc, saved);
             }
         }
         Button::Tool(super::annotation::Tool::Pencil) => {
-            line(
-                (centre.0 - arm, centre.1 + arm),
-                (centre.0 + arm, centre.1 - arm),
-            );
-            line(
-                (centre.0 - arm, centre.1 + arm),
-                (centre.0 - arm + 2, centre.1 + arm),
-            );
+            // `pencil-simple`: a body running up to the right with a point at the lower left. A
+            // single stroke with a chevron at its end read as an arrow, which is the next button
+            // along; the body has to have a width for the mark to say "pencil".
+            let tip = (centre.0 - arm, centre.1 + arm);
+            let far = (centre.0 + arm, centre.1 - arm);
+            let half = (stroke * 3 / 2).max(2);
+            // The body runs at forty-five degrees, so its two sides are offset along the other
+            // diagonal by half its width.
+            let points = [
+                windows::Win32::Foundation::POINT {
+                    x: tip.0,
+                    y: tip.1,
+                },
+                windows::Win32::Foundation::POINT {
+                    x: tip.0 + half,
+                    y: tip.1 + half,
+                },
+                windows::Win32::Foundation::POINT {
+                    x: far.0 + half,
+                    y: far.1 + half,
+                },
+                windows::Win32::Foundation::POINT {
+                    x: far.0 - half,
+                    y: far.1 - half,
+                },
+                windows::Win32::Foundation::POINT {
+                    x: tip.0 - half,
+                    y: tip.1 - half,
+                },
+                windows::Win32::Foundation::POINT {
+                    x: tip.0,
+                    y: tip.1,
+                },
+            ];
+            unsafe {
+                let _ = Polyline(hdc, &points);
+            }
         }
         Button::Colour => {
-            // The button is a swatch of the colour itself: a filled square with a dark rim,
-            // so white and yellow read against the light plate instead of vanishing into it.
-            // This is the only place the colour appears, and a swatch that is not the colour
-            // is a button with no answer.
-            //
-            // Written without an early `return`, deliberately: returning here would skip the
-            // pen and brush this function selects into the context at its top, and those two
-            // objects would leak on every repaint. The leak test said so — "every ten
-            // repaints of the strip add 20 GDI objects" — which is exactly what a return
-            // placed above the cleanup costs.
-            let colour = state.colour.to_colorref();
-            // Inset by the padding the other glyphs keep, so the colour is a pill inside the
-            // button rather than a block that fills it edge to edge.
-            let pill = RECT {
-                left: rect.left + 3,
-                top: rect.top + 3,
-                right: rect.right - 3,
-                bottom: rect.bottom - 3,
-            };
-            let usable = pill.right > pill.left && pill.bottom > pill.top;
-            if usable {
-                let paint = unsafe { CreateSolidBrush(colour) };
-                let rim = unsafe { CreateSolidBrush(PLATE_SHADOW) };
-                if !paint.is_invalid() {
-                    unsafe {
-                        windows::Win32::Graphics::Gdi::FillRect(hdc, &pill, paint);
-                    }
-                }
-                if !rim.is_invalid() {
-                    // Inside the swatch, so the colour keeps its full size and the rim is what
-                    // separates it from the plate.
-                    unsafe {
-                        FrameRect(hdc, &pill, rim);
-                    }
+            // The colour itself, as a disc: the only place the colour appears, and a swatch that
+            // is not the colour is a button with no answer. The rim is what lets white and yellow
+            // read against a light card.
+            let paint = unsafe { CreateSolidBrush(state.colour.to_colorref()) };
+            let rim = geometric_pen(1, PLATE_SHADOW);
+            if !paint.is_invalid() {
+                let saved_brush = unsafe { SelectObject(hdc, HGDIOBJ(paint.0)) };
+                let saved_rim = if rim.is_invalid() {
+                    None
+                } else {
+                    Some(unsafe { SelectObject(hdc, HGDIOBJ(rim.0)) })
+                };
+                unsafe {
+                    let _ = Ellipse(
+                        hdc,
+                        centre.0 - arm,
+                        centre.1 - arm,
+                        centre.0 + arm,
+                        centre.1 + arm,
+                    );
                 }
                 unsafe {
-                    if !paint.is_invalid() {
-                        let _ = DeleteObject(HGDIOBJ(paint.0));
-                    }
-                    if !rim.is_invalid() {
+                    if let Some(previous) = saved_rim {
+                        SelectObject(hdc, previous);
                         let _ = DeleteObject(HGDIOBJ(rim.0));
                     }
-                }
-            }
-            if !usable {
-                // No room for a swatch: an empty square says "a colour goes here".
-                let empty = unsafe { CreateSolidBrush(ink) };
-                if !empty.is_invalid() {
-                    unsafe {
-                        FrameRect(hdc, rect, empty);
-                        let _ = DeleteObject(HGDIOBJ(empty.0));
-                    }
+                    SelectObject(hdc, saved_brush);
+                    let _ = DeleteObject(HGDIOBJ(paint.0));
                 }
             }
         }
         Button::Thickness => {
-            // A dot of the width in force. The width is what the button is for, and a dot is
-            // the only way to show it: a number would need a font and would still need the
-            // scale explained, while the dot is the mark a stroke will make.
+            // A bar as wide as the stroke, standing the height of the icon box.
             //
-            // Clamped to the button, so the widest does not paint over its neighbours.
-            let diameter = (state.thickness as i32).clamp(4, (width.min(height) - 6).max(4));
-            let dot = unsafe { CreateSolidBrush(ink) };
-            if !dot.is_invalid() {
-                let half = diameter / 2;
-                // Selected, not merely created: `Ellipse` fills with the brush the context
-                // holds, so a brush that is only created is a brush that is never used. And no
-                // pen, because the outline would add a pixel to every width and make the
-                // thinnest indistinguishable from the pen's own colour.
+            // A disc of the width was honest and unreadable: the thinnest stroke is four pixels, so
+            // the mark was a speck in a thirty-six pixel button. A bar keeps the width as its width
+            // and takes its length from the icon, which is how the reference shows it — and it is
+            // the width that the button is for.
+            let wide = (state.thickness as i32).clamp(4, (side - 6).max(4));
+            let bar = RECT {
+                left: centre.0 - wide / 2,
+                top: centre.1 - arm,
+                right: centre.0 - wide / 2 + wide,
+                bottom: centre.1 + arm,
+            };
+            let paint = unsafe { CreateSolidBrush(ink) };
+            if !paint.is_invalid() {
+                // Its corners are rounded to the width, so the thinnest reads as a line and the
+                // widest as a pill rather than as a rectangle.
                 let no_pen = unsafe { GetStockObject(NULL_PEN) };
-                let previous_pen = unsafe { SelectObject(hdc, no_pen) };
-                let previous_brush = unsafe { SelectObject(hdc, HGDIOBJ(dot.0)) };
+                let saved_pen = unsafe { SelectObject(hdc, no_pen) };
+                let saved_brush = unsafe { SelectObject(hdc, HGDIOBJ(paint.0)) };
                 unsafe {
-                    let _ = Ellipse(
+                    let _ = RoundRect(
                         hdc,
-                        centre.0 - half,
-                        centre.1 - half,
-                        centre.0 - half + diameter,
-                        centre.1 - half + diameter,
+                        bar.left,
+                        bar.top,
+                        bar.right,
+                        bar.bottom,
+                        wide,
+                        wide,
                     );
-                    SelectObject(hdc, previous_brush);
-                    SelectObject(hdc, previous_pen);
-                    let _ = DeleteObject(HGDIOBJ(dot.0));
+                    SelectObject(hdc, saved_brush);
+                    SelectObject(hdc, saved_pen);
+                    let _ = DeleteObject(HGDIOBJ(paint.0));
                 }
             }
         }
-        Button::Undo => {
-            line((centre.0 + arm, centre.1 + arm), (centre.0 - arm, centre.1 + arm));
-            line(
-                (centre.0 - arm, centre.1 + arm),
-                (centre.0 - arm + 2, centre.1 + arm - 2),
-            );
-            line(
-                (centre.0 - arm, centre.1 + arm),
-                (centre.0 - arm + 2, centre.1 + arm + 2),
-            );
-        }
-        Button::Redo => {
-            line((centre.0 - arm, centre.1 + arm), (centre.0 + arm, centre.1 + arm));
-            line(
-                (centre.0 + arm, centre.1 + arm),
-                (centre.0 + arm - 2, centre.1 + arm - 2),
-            );
-            line(
-                (centre.0 + arm, centre.1 + arm),
-                (centre.0 + arm - 2, centre.1 + arm + 2),
-            );
+        Button::Undo | Button::Redo => {
+            // `arrow-u-up-left` and its mirror: a leg down one side, a half circle over the top,
+            // and a chevron at the other end pointing back the way it came.
+            //
+            // The curve is a polyline rather than `Arc`. `Arc` starts and ends at the points where
+            // two rays cross the ellipse and sweeps one way only, and which way that looks on
+            // screen depends on the sign of y — the first attempt drew a shape like an s. Eight
+            // points and round joins give the half circle that is wanted, with no convention to
+            // get wrong.
+            let sign = if button == Button::Undo { 1 } else { -1 };
+            let r = arm;
+            let mut curve = Vec::with_capacity(9);
+            for step in 0..=8 {
+                let angle = std::f64::consts::PI * step as f64 / 8.0;
+                let x = centre.0 + sign * (r as f64 * angle.cos()).round() as i32;
+                let y = centre.1 - (r as f64 * angle.sin()).round() as i32;
+                curve.push(windows::Win32::Foundation::POINT { x, y });
+            }
+            // The leg, from where the curve starts down to the bottom of the icon box.
+            let start = (curve[0].x, curve[0].y);
+            line(start, (start.0, centre.1 + r));
+            unsafe {
+                let _ = Polyline(hdc, &curve);
+            }
+            // The chevron at the other end, opening back along the curve.
+            let end = (curve[8].x, curve[8].y);
+            line(end, (end.0 - sign * head, end.1 - head));
+            line(end, (end.0 - sign * head, end.1 + head));
         }
         Button::Save => {
-            let box_rect = RECT {
+            // `floppy-disk`: the case, the shutter at the top and the label at the bottom.
+            let case = RECT {
                 left: centre.0 - arm,
                 top: centre.1 - arm,
-                right: centre.0 + arm + 1,
-                bottom: centre.1 + arm + 1,
+                right: centre.0 + arm,
+                bottom: centre.1 + arm,
             };
-            unsafe {
-                windows::Win32::Graphics::Gdi::FrameRect(hdc, &box_rect, brush);
-            }
-            line((centre.0 - arm, centre.1 + arm), (centre.0 + arm, centre.1 - arm));
-            line((centre.0 + arm, centre.1 - arm), (centre.0 + arm, centre.1));
-            line((centre.0 + arm, centre.1), (centre.0 + arm - 2, centre.1 - 2));
+            hollow(&case, (stroke * 2).max(2));
+            let shutter = RECT {
+                left: centre.0 - head,
+                top: centre.1 - arm,
+                right: centre.0 + head,
+                bottom: centre.1 - head,
+            };
+            hollow(&shutter, 1);
+            line(
+                (centre.0 - head, centre.1 + head),
+                (centre.0 + head, centre.1 + head),
+            );
+            line(
+                (centre.0 - head, centre.1 + arm),
+                (centre.0 + head, centre.1 + arm),
+            );
         }
         Button::Copy => {
+            // `copy`: the sheet in front, and the corner of the one behind it.
             let front = RECT {
-                left: centre.0 - arm + 2,
-                top: centre.1 - arm + 2,
-                right: centre.0 + arm + 1,
-                bottom: centre.1 + arm + 1,
+                left: centre.0 - arm,
+                top: centre.1 - arm + head,
+                right: centre.0 + arm - head,
+                bottom: centre.1 + arm,
             };
-            unsafe {
-                windows::Win32::Graphics::Gdi::FrameRect(hdc, &front, brush);
-            }
-            line((centre.0 - arm, centre.1 - arm), (centre.0 + arm - 2, centre.1 - arm));
-            line((centre.0 - arm, centre.1 - arm), (centre.0 - arm, centre.1 + arm - 2));
+            hollow(&front, (stroke * 2).max(2));
+            line(
+                (centre.0 - arm + head, centre.1 - arm),
+                (centre.0 + arm, centre.1 - arm),
+            );
+            line(
+                (centre.0 + arm, centre.1 - arm),
+                (centre.0 + arm, centre.1 + arm - head),
+            );
         }
         Button::Cancel => {
-            line((centre.0 - arm, centre.1 - arm), (centre.0 + arm, centre.1 + arm));
-            line((centre.0 - arm, centre.1 + arm), (centre.0 + arm, centre.1 - arm));
+            // `x`, two crossing strokes with round ends.
+            line(
+                (centre.0 - arm, centre.1 - arm),
+                (centre.0 + arm, centre.1 + arm),
+            );
+            line(
+                (centre.0 - arm, centre.1 + arm),
+                (centre.0 + arm, centre.1 - arm),
+            );
         }
     }
 
     unsafe {
-        // Put back what was there before either object is released: an object that is still
-        // the one a context holds cannot be deleted, and `DeleteObject` on it fails and
-        // leaves the handle behind.
-        if let Some(previous) = saved_brush {
-            SelectObject(hdc, previous);
-            let _ = DeleteObject(HGDIOBJ(brush.0));
-        }
+        // Put back what was there before the pen is released: an object that is still the one a
+        // context holds cannot be deleted, and `DeleteObject` on it fails and leaves the handle.
         SelectObject(hdc, saved_pen);
         let _ = DeleteObject(HGDIOBJ(pen.0));
     }

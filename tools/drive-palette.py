@@ -173,9 +173,19 @@ def strip_on_screen(image):
 
 
 def held(image):
-    counts = {c: count(image, COLOURS[c], BUTTON_BAND) for c in COLOURS}
-    name = max(counts, key=lambda c: counts[c])
-    return name if counts[name] >= 100 else None
+    """The colour the button shows, read at its centre.
+
+    Counting each palette colour over the button and taking the winner was the first version, and
+    it started answering "white" for every colour: the card's plate is #FAFAFA, five levels from
+    white, so a tolerance wide enough to read a screenshot also counted the plate as a white
+    swatch. The swatch is a disc centred in its button, so one pixel is both enough and exact.
+    """
+    x, y = layout.button_centre(5, REGION)
+    pixel = tuple(int(v) for v in image[y, x])
+    for name, colour in COLOURS.items():
+        if max(abs(a - b) for a, b in zip(pixel, colour)) <= 3:
+            return name
+    return "#{:02X}{:02X}{:02X}".format(*pixel)
 
 
 # --- the run ----------------------------------------------------------------------------

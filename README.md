@@ -148,8 +148,8 @@ in force is the one with both a fill and a darker outline.
 | 3 | Rectangle | `R` | Drag two opposite corners. The box is **open, not filled**: a box on a screenshot marks something, and filling it would hide what is being marked. Its sides are the width in force, drawn inside the corners so a thick box never reaches past what was dragged. |
 | 4 | Ellipse | `E` | The same, as an open oval. |
 | 5 | Pencil | `P` | Freehand. A press without movement still leaves a dot, so a single point can be marked. |
-| 6 | Colour | `C` | A swatch of the colour in force, filled with it. Pointing at it opens a palette of the five colours beside the strip; clicking one chooses it. `C` cycles them for the keyboard. |
-| 7 | Thickness | `+` `-` | A dot of the width in force. Pointing at it opens a palette of six widths beside the strip, each drawn as a dot of its own size; clicking one chooses it. `+` and `-` move through the same six, so the keyboard and the palette never disagree about what widths exist. |
+| 6 | Colour | `C` | A disc of the colour in force, in that colour. Pointing at it opens a palette of the five colours beside the strip; clicking one chooses it. `C` cycles them for the keyboard. |
+| 7 | Thickness | `+` `-` | A bar as wide as the stroke. Pointing at it opens a palette of six widths beside the strip, each drawn as a bar of its own width; clicking one chooses it. `+` and `-` move through the same six, so the keyboard and the palette never disagree about what widths exist. |
 | 8 | Undo | `Ctrl+Z` | Removes the last stroke. Drawn faint and ignored when there is nothing to undo. |
 | 9 | Redo | `Ctrl+Y` | Puts back the last stroke that was undone. Faint and ignored when there is nothing to redo. |
 | 10 | Save | `Enter` | Writes the region with its annotations and closes. |
