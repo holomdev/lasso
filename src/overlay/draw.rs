@@ -564,6 +564,9 @@ fn soft_shadow(hdc: HDC, rect: &RECT, radius: i32, source: &ShadowSource) {
         SelectClipRgn,
     };
 
+    // A radius of zero is a rectangle: `CreateRoundRectRgn` takes the corner diameter, and GDI
+    // treats a zero one as square. That is how the card and its shadow keep the same shape.
+    //
     // Outermost first, so an inner ring lands on top of the fainter one outside it.
     //
     // The alphas are small because the rings *stack*: a pixel near the card is covered by all four,
@@ -667,17 +670,29 @@ pub fn draw_strip(
     };
 
     // The shadow, then the card, then everything else.
+    //
+    // The card's corners are square. Rounded ones softened the strip's own edge and, at this size,
+    // the curve read as a smear on the corner of a bar that is otherwise a straight line: the
+    // buttons are the things with corners worth drawing, and a rectangle is sharper than a radius.
     if let Some(source) = ShadowSource::new() {
-        soft_shadow(hdc, &body, metrics.panel_radius, &source);
+        soft_shadow(hdc, &body, 0, &source);
     }
     let border_pen = unsafe { CreatePen(PS_SOLID, 1, crate::theme::colorref(crate::theme::BAR_BORDER)) };
-    rounded(
-        hdc,
-        &body,
-        metrics.panel_radius,
-        Some(chrome.bar_bg),
-        Some(border_pen).filter(|pen| !pen.is_invalid()),
-    );
+    // A frame rather than four bars: `FrameRect` is one hairline and cannot leave a gap at a
+    // corner.
+    let edge = if border_pen.is_invalid() {
+        None
+    } else {
+        unsafe { Some(CreateSolidBrush(crate::theme::colorref(crate::theme::BAR_BORDER))) }
+            .filter(|brush| !brush.is_invalid())
+    };
+    unsafe {
+        windows::Win32::Graphics::Gdi::FillRect(hdc, &body, chrome.bar_bg);
+        if let Some(edge) = edge {
+            FrameRect(hdc, &body, edge);
+            let _ = DeleteObject(HGDIOBJ(edge.0));
+        }
+    }
 
     // The rules between groups: one pixel, short enough to read as a separator rather than as a cut.
     for y in metrics.separators() {
@@ -1950,22 +1965,24 @@ fn ink_pixel(colour: COLORREF) -> (u8, u8, u8) {
         };
         let covered = painted(&canvas, &body);
         let area = (body.right - body.left) as usize * (body.bottom - body.top) as usize;
-        // Everything but the four rounded corners. The corners are a quarter of a circle each, so
-        // a square of the radius around every one of them is a generous bound on what is missing —
-        // and a hole anywhere else would take the count far below it.
-        let corners = 4 * (metrics.panel_radius * metrics.panel_radius) as usize;
-        assert!(
-            covered + corners >= area,
+        // Every pixel of the placement, corners included: the card is a rectangle, and a card one
+        // pixel short anywhere leaves a line of the capture showing through.
+        assert_eq!(
+            covered, area,
             "the plate covered {covered} of its {area} pixels, so something shows through"
         );
-        assert!(
-            covered < area,
-            "the plate covered its corners too, so it is not rounded"
-        );
-        assert!(
-            pixel(&canvas, body.left, body.top) == (0, 0, 0),
-            "the corner is painted, so the card has square corners"
-        );
+        for corner in [
+            (body.left, body.top),
+            (body.right - 1, body.top),
+            (body.left, body.bottom - 1),
+            (body.right - 1, body.bottom - 1),
+        ] {
+            assert_ne!(
+                pixel(&canvas, corner.0, corner.1),
+                (0, 0, 0),
+                "the corner at {corner:?} is not painted, so the card is not square"
+            );
+        }
 
         // And nothing outside it.
         let mut strays = 0;

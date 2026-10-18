@@ -134,8 +134,11 @@ tools, then how a stroke looks, then history, then the way out. The group is the
 order things are reached for, and the separator is so the eye can skip the ones
 it is not using.
 
-It is drawn as a card: a light plate, a hairline border, a soft shadow and a
-short rule between the groups. The shadow is four rounded rings blended over
+It is drawn as a card: a light plate with square corners, a hairline border, a
+soft shadow and a short rule between the groups. Square, because a rounded
+container softens the strip's own edge and at this size the curve reads as a
+smear on a bar that is otherwise a straight line; the buttons are the things with
+corners worth drawing. The shadow is four rounded rings blended over
 whatever is behind them, because GDI cannot blur and a flat grey halo would look
 like a mistake on a photograph.
 

@@ -143,8 +143,6 @@ pub struct Metrics {
     pub standoff: i32,
     /// Corner radius of a button.
     pub radius: i32,
-    /// Corner radius of the strip itself, larger so the card reads as one shape.
-    pub panel_radius: i32,
 }
 
 impl Metrics {
@@ -156,7 +154,6 @@ impl Metrics {
         group_gap: 10,
         standoff: 10,
         radius: 10,
-        panel_radius: 15,
     };
 
     /// The strip's width, which is one button plus its padding on both sides.
@@ -560,7 +557,6 @@ pub fn metrics_for(factor: f64) -> Metrics {
         group_gap: scale(Metrics::BASE.group_gap),
         standoff: scale(Metrics::BASE.standoff),
         radius: scale(Metrics::BASE.radius).max(1),
-        panel_radius: scale(Metrics::BASE.panel_radius).max(1),
     }
 }
 
