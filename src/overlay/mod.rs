@@ -134,9 +134,9 @@ const LABEL_BG: COLORREF = COLORREF(0x0020_2020);
 /// rather than as a hole in it. Deliberately not the system's `COLOR_BTNFACE`: this
 /// floats over arbitrary content, where a system-grey panel would look like a piece of
 /// some other window.
-const PLATE_BG: COLORREF = COLORREF(0x002A_2A2A);
-const PLATE_EDGE: COLORREF = COLORREF(0x0055_5555);
-const BUTTON_FACE: COLORREF = COLORREF(0x0048_4848);
+const PLATE_BG: COLORREF = COLORREF(0x00FA_FAFA);
+const PLATE_EDGE: COLORREF = COLORREF(0x00D0_D0D0);
+const BUTTON_FACE: COLORREF = COLORREF(0x00E8_E8E8);
 
 /// The stroke width a new stroke starts at, in 96-DPI pixels.
 const DEFAULT_THICKNESS: u32 = annotation::THICKNESS_STEPS[0];

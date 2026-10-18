@@ -16,6 +16,8 @@ import numpy as np
 from PIL import ImageGrab
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import layout  # noqa: E402
 EXE = ROOT / "target" / "debug" / "lasso.exe"
 OUT = ROOT / "target" / "overlay-clipboard"
 # Wallpaper, as in the saved-file check: a flat screen region cannot tell "the capture is there"
@@ -23,32 +25,10 @@ OUT = ROOT / "target" / "overlay-clipboard"
 # happened to be an even dark panel.
 REGION = (200, 640, 680, 1020)
 
-# The strip stands off the region's left edge. The copy button's place comes from the same walk
-# the toolbar does — a closed form got it wrong by twenty pixels, and the click landed on the
-# button below.
-STRIP_WIDTH, BUTTON, GAP, PADDING, GROUP_GAP, STANDOFF = 34, 26, 2, 4, 5, 8
-GROUPS = {5, 7, 9}  # Colour, Undo, Save start a group
-BUTTONS = 12
-COPY_INDEX = 10
+# The strip and its buttons come from the shared layout, so a change to the card's size does not
+# have to be made here by hand — the copy button is index 10.
+COPY_BUTTON = layout.button_centre(10, REGION)
 
-
-def button_top(index):
-    """The top of a button, from the layout the toolbar uses."""
-    y = PADDING
-    for i in range(index):
-        y += GAP
-        if i in GROUPS:
-            y += GROUP_GAP
-        y += BUTTON
-    if index in GROUPS:
-        y += GROUP_GAP - GAP
-    return y
-
-
-COPY_BUTTON = (
-    REGION[0] - STANDOFF - STRIP_WIDTH + PADDING + BUTTON // 2,
-    REGION[1] + button_top(COPY_INDEX) + BUTTON // 2,
-)
 STROKE = (0xEF, 0x44, 0x44)
 
 user32 = ctypes.windll.user32
@@ -168,8 +148,7 @@ try:
         time.sleep(0.2)
         drag((left, top), (right, bottom))
         screen = np.array(ImageGrab.grab().convert("RGB"))
-        plate = np.all(np.abs(screen.astype(int) - np.array((42, 42, 42))) <= 2, axis=2)
-        if plate.sum() > 2000:
+        if layout.strip_visible(screen, REGION):
             break
         print(f"  the drag did not take (attempt {attempt + 1})")
     else:

@@ -19,23 +19,24 @@
 
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
-    CreatePen, CreateSolidBrush, DeleteObject, Ellipse, FrameRect, GetStockObject, HDC, HGDIOBJ,
-    LineTo, MoveToEx, NULL_BRUSH, NULL_PEN, PS_SOLID, Polyline, Rectangle, SelectObject,
+    CreatePen, CreateSolidBrush, DeleteObject, Ellipse, FrameRect, GetObjectW, GetStockObject, HDC,
+    HGDIOBJ, HPEN, LineTo, LOGBRUSH, MoveToEx, NULL_BRUSH, NULL_PEN, PS_SOLID, Polyline, Rectangle,
+    RoundRect, SelectObject,
 };
 
 use super::annotation::{Point, Shape, Stroke};
 use super::toolbar::{Button, Metrics, Placement};
 
 /// The colour a usable button's glyph is drawn in.
-const BUTTON_INK: COLORREF = COLORREF(0x00E0_E0E0);
+const BUTTON_INK: COLORREF = COLORREF(0x002A_2A2A);
 /// The colour of one that cannot be used: close to the plate, so it reads as unavailable.
-const DIM_INK: COLORREF = COLORREF(0x0070_7070);
+const DIM_INK: COLORREF = COLORREF(0x00B0_B0B0);
 /// The rim around the colour swatch.
 ///
 /// Near black, because the swatch has to be visible whatever colour it holds: white and
 /// yellow on a light plate need an edge of their own, and a dark one reads against every
 /// colour in the set.
-const PLATE_SHADOW: COLORREF = COLORREF(0x0010_1010);
+const PLATE_SHADOW: COLORREF = COLORREF(0x0088_8888);
 
 /// The narrowest a stroke is allowed to be drawn, so a set thickness of zero cannot
 /// produce a shape that is invisible and looks like nothing happened.
@@ -357,6 +358,53 @@ pub fn draw_palette(
 }
 
 /// Draw the strip: its plate, its separators, and every button.
+/// The colour a solid brush was made from.
+///
+/// The brushes are made once and handed around, so the pen that outlines them has to take its
+/// colour from the brush rather than from a second constant that could drift away from the first.
+fn brush_colour(brush: windows::Win32::Graphics::Gdi::HBRUSH) -> COLORREF {
+    let mut log = LOGBRUSH::default();
+    let read = unsafe {
+        GetObjectW(
+            HGDIOBJ(brush.0),
+            std::mem::size_of::<LOGBRUSH>() as i32,
+            Some(&mut log as *mut LOGBRUSH as *mut std::ffi::c_void),
+        )
+    };
+    if read == 0 {
+        BUTTON_INK
+    } else {
+        log.lbColor
+    }
+}
+
+/// A rounded rectangle, filled and outlined with the objects it is given.
+///
+/// `RoundRect` takes the corner *diameter*, so the radius is doubled here rather than at every
+/// call. Both objects are put back, because the context outlives this call.
+fn rounded(hdc: HDC, rect: &RECT, radius: i32, fill: Option<windows::Win32::Graphics::Gdi::HBRUSH>, pen: HPEN) {
+    let brush = match fill {
+        Some(brush) => HGDIOBJ(brush.0),
+        // No fill: the corner is round but the plate shows through the middle.
+        None => unsafe { GetStockObject(NULL_BRUSH) },
+    };
+    let saved_brush = unsafe { SelectObject(hdc, brush) };
+    let saved_pen = unsafe { SelectObject(hdc, HGDIOBJ(pen.0)) };
+    unsafe {
+        let _ = RoundRect(
+            hdc,
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+            radius * 2,
+            radius * 2,
+        );
+        SelectObject(hdc, saved_pen);
+        SelectObject(hdc, saved_brush);
+    }
+}
+
 pub fn draw_strip(
     hdc: HDC,
     placement: &Placement,
@@ -372,14 +420,37 @@ pub fn draw_strip(
         right: placement.x + placement.width as i32,
         bottom: placement.y + placement.height as i32,
     };
-    unsafe {
-        windows::Win32::Graphics::Gdi::FillRect(hdc, &body, plate);
+    let edge_pen = unsafe { CreatePen(PS_SOLID, 1, brush_colour(edge)) };
+    // The card first: a light plate with a hairline border, so it reads as a card laid on the
+    // capture rather than a hole cut into it.
+    if !edge_pen.is_invalid() {
+        rounded(hdc, &body, metrics.panel_radius, Some(plate), edge_pen);
+    } else {
+        unsafe {
+            windows::Win32::Graphics::Gdi::FillRect(hdc, &body, plate);
+        }
     }
-    // A one-pixel border, then a lighter inner line: the plate reads as a card rather
-    // than as a hole in the capture, which matters because it sits next to one.
-    unsafe {
-        windows::Win32::Graphics::Gdi::FrameRect(hdc, &body, edge);
+
+    // The rules between groups. One pixel, inset from the card's edges so they read as separators
+    // inside it rather than as cuts through it.
+    if !edge_pen.is_invalid() {
+        for y in metrics.separators() {
+            let rule = RECT {
+                left: body.left + metrics.padding + 2,
+                top: body.top + y,
+                right: body.right - metrics.padding - 2,
+                bottom: body.top + y + 1,
+            };
+            if rule.right > rule.left {
+                unsafe {
+                    windows::Win32::Graphics::Gdi::FillRect(hdc, &rule, edge);
+                }
+            }
+        }
     }
+
+    let ink_pen = unsafe { CreatePen(PS_SOLID, 1, BUTTON_INK) };
+    let outline_in_ink = !ink_pen.is_invalid();
 
     for (button, x, y, width, height) in metrics.button_rects() {
         let rect = RECT {
@@ -389,25 +460,12 @@ pub fn draw_strip(
             bottom: placement.y + y + height as i32,
         };
 
-        if button.starts_a_group() {
-            // The separator goes in the gap above the button, which is why the metrics
-            // reserve a wider gap there.
-            let line = RECT {
-                left: rect.left + 4,
-                top: rect.top - metrics.group_gap / 2 - 1,
-                right: rect.right - 4,
-                bottom: rect.top - metrics.group_gap / 2,
-            };
-            unsafe {
-                windows::Win32::Graphics::Gdi::FillRect(hdc, &line, edge);
-            }
-        }
-
-        if state.active == Some(button) {
-            unsafe {
-                windows::Win32::Graphics::Gdi::FillRect(hdc, &rect, face);
-                windows::Win32::Graphics::Gdi::FrameRect(hdc, &rect, edge);
-            }
+        // Every button is outlined, and the one in force is also filled and outlined darker: the
+        // outline says "this is a button", the fill and the darker line say "this is the one".
+        let filled = state.active == Some(button);
+        let pen = if filled && outline_in_ink { ink_pen } else { edge_pen };
+        if !pen.is_invalid() {
+            rounded(hdc, &rect, metrics.radius, filled.then_some(face), pen);
         }
 
         // An unavailable button keeps its glyph, drawn in a colour close to the plate: it
@@ -416,6 +474,18 @@ pub fn draw_strip(
         // the next.
         let ink = if state.is_disabled(button) { DIM_INK } else { BUTTON_INK };
         draw_button_glyph(hdc, button, &rect, ink, state);
+    }
+
+    // Both pens, released. Nothing is selected into the context by the time they are freed —
+    // `rounded` puts back what it took — and a pen that is still selected cannot be released,
+    // which is the leak that took the icons away once already.
+    unsafe {
+        if !edge_pen.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(edge_pen.0));
+        }
+        if !ink_pen.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(ink_pen.0));
+        }
     }
 }
 
@@ -543,17 +613,24 @@ fn draw_button_glyph(hdc: HDC, button: Button, rect: &RECT, ink: COLORREF, state
             );
         }
         Button::Tool(super::annotation::Tool::Rectangle) => {
+            // Hollow. `Rectangle` fills with the brush the context holds, and that brush is the
+            // ink — which made this a solid square, and on a light card a solid dark one. An
+            // outline is what the reference shows and what the tool draws.
             let box_rect = RECT {
                 left: centre.0 - arm,
                 top: centre.1 - arm,
                 right: centre.0 + arm + 1,
                 bottom: centre.1 + arm + 1,
             };
+            let hollow = unsafe { SelectObject(hdc, GetStockObject(NULL_BRUSH)) };
             unsafe {
                 let _ = Rectangle(hdc, box_rect.left, box_rect.top, box_rect.right, box_rect.bottom);
+                SelectObject(hdc, hollow);
             }
         }
         Button::Tool(super::annotation::Tool::Ellipse) => {
+            // Hollow, for the same reason as the square above.
+            let hollow = unsafe { SelectObject(hdc, GetStockObject(NULL_BRUSH)) };
             unsafe {
                 let _ = Ellipse(
                     hdc,
@@ -562,6 +639,7 @@ fn draw_button_glyph(hdc: HDC, button: Button, rect: &RECT, ink: COLORREF, state
                     centre.0 + arm + 1,
                     centre.1 + arm + 1,
                 );
+                SelectObject(hdc, hollow);
             }
         }
         Button::Tool(super::annotation::Tool::Pencil) => {
@@ -755,6 +833,16 @@ mod tests {
     /// reversed. Deriving it means a change of palette does not have to be made twice; the
     /// values themselves are pinned in `annotation`, where they are a decision rather than an
     /// accident of layout.
+    /// A `COLORREF`, which is 0x00BBGGRR, in the order the buffer holds: blue, green, red.
+    fn ink_pixel(colour: COLORREF) -> (u8, u8, u8) {
+        let raw = colour.0;
+        (
+            ((raw >> 16) & 0xFF) as u8,
+            ((raw >> 8) & 0xFF) as u8,
+            (raw & 0xFF) as u8,
+        )
+    }
+
     fn buffer_pixel(colour: crate::overlay::annotation::Colour) -> (u8, u8, u8) {
         // `COLORREF` is 0x00BBGGRR, so the low byte is red and the high one is blue; the buffer
         // wants blue first. Reading them in the same order is what made this return red in the
@@ -991,7 +1079,7 @@ mod tests {
                 for x in cell.left..cell.right {
                     // The dots are drawn in the button ink; the cell's own outline is the edge
                     // colour, so counting only the ink counts only the dot.
-                    if pixel(&canvas, x, y) == (0xE0, 0xE0, 0xE0) {
+                    if pixel(&canvas, x, y) == ink_pixel(BUTTON_INK) {
                         ink += 1;
                     }
                 }
@@ -1479,7 +1567,8 @@ mod tests {
         // line of the capture showing through, which reads as a drawing fault.
         use crate::overlay::toolbar::{self, Button, Region};
 
-        let canvas = blank(300, 400);
+        // Tall enough for the strip: it is taller than any region it sits beside.
+        let canvas = blank(300, 700);
         let metrics = toolbar::Metrics::BASE;
         let placement = toolbar::place(
             Region {
@@ -1515,14 +1604,26 @@ mod tests {
         };
         let covered = painted(&canvas, &body);
         let area = (body.right - body.left) as usize * (body.bottom - body.top) as usize;
-        assert_eq!(
-            covered, area,
+        // Everything but the four rounded corners. The corners are a quarter of a circle each, so
+        // a square of the radius around every one of them is a generous bound on what is missing —
+        // and a hole anywhere else would take the count far below it.
+        let corners = 4 * (metrics.panel_radius * metrics.panel_radius) as usize;
+        assert!(
+            covered + corners >= area,
             "the plate covered {covered} of its {area} pixels, so something shows through"
+        );
+        assert!(
+            covered < area,
+            "the plate covered its corners too, so it is not rounded"
+        );
+        assert!(
+            pixel(&canvas, body.left, body.top) == (0, 0, 0),
+            "the corner is painted, so the card has square corners"
         );
 
         // And nothing outside it.
         let mut strays = 0;
-        for y in 0..400 {
+        for y in 0..700 {
             for x in 0..300 {
                 let inside = x >= body.left && x < body.right && y >= body.top && y < body.bottom;
                 if !inside && pixel(&canvas, x, y) != (0, 0, 0) {
@@ -1605,7 +1706,7 @@ mod tests {
                     Button::Colour => {
                         buffer_pixel(crate::overlay::annotation::Colour::Red)
                     }
-                    _ => (0xE0, 0xE0, 0xE0),
+                    _ => ink_pixel(BUTTON_INK),
                 };
                 let mut ink = 0;
                 for py in rect.top..rect.bottom {
@@ -1679,7 +1780,7 @@ mod tests {
                     height: 120,
                 },
                 300,
-                400,
+                700,
                 &metrics,
             );
             let plate = unsafe { CreateSolidBrush(COLORREF(0x0020_2020)) };

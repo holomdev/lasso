@@ -29,30 +29,21 @@ EXE = ROOT / "target" / "debug" / "lasso.exe"
 OUT = ROOT / "target" / "overlay-palette"
 REGION = (600, 250, 1200, 700)
 
-# The strip's geometry at 100%, the same arithmetic the program does.
-BUTTON, GAP, PADDING, GROUP_GAP, STANDOFF = 26, 2, 4, 5, 8
-GROUPS = {5, 7, 9}
+# The geometry comes from the one module that mirrors the program's metrics, so a change to the
+# strip's size does not have to be made in every check by hand — which is what broke them all when
+# the card was redrawn.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import layout  # noqa: E402
 
-
-def button_top(index):
-    y = PADDING
-    for i in range(index):
-        y += GAP
-        if i in GROUPS:
-            y += GROUP_GAP
-        y += BUTTON
-    if index in GROUPS:
-        y += GROUP_GAP - GAP
-    return y
-
-
-STRIP_X = REGION[0] - STANDOFF - (BUTTON + PADDING * 2)
+# The icons are drawn in dark ink on the light card.
+INK = (0x2A, 0x2A, 0x2A)
+BUTTON, GAP, PADDING = layout.BUTTON, layout.GAP, layout.PADDING
+STRIP_X = layout.strip_x(REGION)
 STRIP_Y = REGION[1]
-COLOUR = (STRIP_X + PADDING + BUTTON // 2, STRIP_Y + button_top(5) + BUTTON // 2)
-PALETTE_W = 5 * BUTTON + 4 * GAP + 2 * PADDING
-PALETTE_H = BUTTON + 2 * PADDING
-PALETTE_X = STRIP_X + (BUTTON + PADDING * 2) + STANDOFF
-PALETTE_Y = COLOUR[1] - PALETTE_H // 2
+COLOUR = layout.button_centre(5, REGION)
+THICKNESS = layout.button_centre(6, REGION)
+
+PALETTE_X, PALETTE_Y, PALETTE_W, PALETTE_H = layout.palette_box(5, 5, REGION)
 PALETTE_BAND = (PALETTE_X, PALETTE_Y, PALETTE_X + PALETTE_W, PALETTE_Y + PALETTE_H)
 BUTTON_BAND = (
     STRIP_X + PADDING,
@@ -61,12 +52,7 @@ BUTTON_BAND = (
     COLOUR[1] + BUTTON // 2,
 )
 
-
-THICKNESS = (STRIP_X + PADDING + BUTTON // 2, STRIP_Y + button_top(6) + BUTTON // 2)
-THICK_PALETTE_W = 6 * BUTTON + 5 * GAP + 2 * PADDING
-THICK_PALETTE_H = BUTTON + 2 * PADDING
-THICK_PALETTE_X = STRIP_X + (BUTTON + PADDING * 2) + STANDOFF
-THICK_PALETTE_Y = THICKNESS[1] - THICK_PALETTE_H // 2
+THICK_PALETTE_X, THICK_PALETTE_Y, THICK_PALETTE_W, THICK_PALETTE_H = layout.palette_box(6, 6, REGION)
 THICK_BAND = (
     THICK_PALETTE_X,
     THICK_PALETTE_Y,
@@ -82,15 +68,12 @@ THICK_BUTTON_BAND = (
 
 
 def thick_swatch(index):
-    return (
-        THICK_PALETTE_X + PADDING + index * (BUTTON + GAP) + BUTTON // 2,
-        THICK_PALETTE_Y + PADDING + BUTTON // 2,
-    )
+    return layout.cell_centre(index, 6, 6, REGION)
 
 
 def ink_area(image, band):
     """The ink pixels in a band, which for a dot is its area."""
-    return count(image, (0xE0, 0xE0, 0xE0), band)
+    return count(image, INK, band)
 
 
 def ink_per_cell(image):
@@ -99,9 +82,8 @@ def ink_per_cell(image):
 
 
 def thick_cell(index):
-    left = THICK_PALETTE_X + PADDING + index * (BUTTON + GAP)
-    top = THICK_PALETTE_Y + PADDING
-    return (left, top, left + BUTTON, top + BUTTON)
+    x, y, w, h = layout.cell_box(index, 6, 6, REGION)
+    return (x, y, x + w, y + h)
 
 
 def swatch(index):
@@ -186,10 +168,8 @@ def palette_open(image):
 
 
 def strip_on_screen(image):
-    """Whether the strip's plate is anywhere on screen, which says the drag worked."""
-    plate = np.all(np.abs(image.astype(int) - np.array((42, 42, 42))) <= 2, axis=2)
-    # The plate is a tall card: far more pixels than the scattered ones in a wallpaper.
-    return int(plate.sum()) > 2000
+    """Whether the card is on screen, which says the drag worked."""
+    return layout.strip_visible(image, REGION)
 
 
 def held(image):
@@ -326,7 +306,7 @@ if any(size < 4 for size in sizes_open):
     failures.append(f"a thickness cell is empty, so no dot was drawn there: {sizes_open}")
 if not all(a < b for a, b in zip(sizes_open, sizes_open[1:])):
     failures.append(f"the thickness dots do not grow across the row: {sizes_open}")
-if sizes_open and count(thick_open, (0x2A, 0x2A, 0x2A), THICK_BAND) < 1000:
+if sizes_open and count(thick_open, layout.PLATE, THICK_BAND) < 1000:
     failures.append("the thickness palette is not on screen when its button is hovered")
 if ink_area(thick_before, THICK_BUTTON_BAND) >= ink_area(thick_chosen, THICK_BUTTON_BAND):
     failures.append(

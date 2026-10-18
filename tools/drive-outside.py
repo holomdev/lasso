@@ -22,6 +22,8 @@ import numpy as np
 from PIL import Image, ImageGrab
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import layout  # noqa: E402
 EXE = ROOT / "target" / "debug" / "lasso.exe"
 OUT = ROOT / "target" / "overlay-outside"
 REGION = (600, 250, 1200, 700)
@@ -139,8 +141,7 @@ try:
         time.sleep(0.2)
         drag((left, top), (right, bottom))
         screen = np.array(ImageGrab.grab().convert("RGB"))
-        plate = np.all(np.abs(screen.astype(int) - np.array((42, 42, 42))) <= 2, axis=2)
-        if plate.sum() > 2000:
+        if layout.strip_visible(screen, REGION):
             break
         print(f"  the drag did not take (attempt {attempt + 1})")
     else:

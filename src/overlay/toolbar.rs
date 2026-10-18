@@ -141,16 +141,22 @@ pub struct Metrics {
     pub group_gap: i32,
     /// How far the strip stands off the selection.
     pub standoff: i32,
+    /// Corner radius of a button.
+    pub radius: i32,
+    /// Corner radius of the strip itself, larger so the card reads as one shape.
+    pub panel_radius: i32,
 }
 
 impl Metrics {
     /// The sizes at 100%. Everything else follows from these.
     pub const BASE: Metrics = Metrics {
-        button: 26,
-        gap: 2,
-        padding: 4,
-        group_gap: 5,
-        standoff: 8,
+        button: 36,
+        gap: 4,
+        padding: 6,
+        group_gap: 10,
+        standoff: 10,
+        radius: 8,
+        panel_radius: 12,
     };
 
     /// The strip's width, which is one button plus its padding on both sides.
@@ -168,6 +174,27 @@ impl Metrics {
             .count() as i32
             * self.group_gap;
         (buttons * self.button + gaps + groups + self.padding * 2).max(1) as u32
+    }
+
+    /// The y of each rule that separates the groups, in the strip's own coordinates.
+    ///
+    /// A rule sits in the middle of the extra space a group gap opens up, not in the middle of the
+    /// whole gap: the gap above a button is already as wide as every other gap, and only the extra
+    /// is there for the rule.
+    pub fn separators(&self) -> Vec<i32> {
+        let mut out = Vec::new();
+        let mut y = self.padding;
+        for (index, button) in Button::ALL.iter().enumerate() {
+            if index > 0 {
+                y += self.gap;
+            }
+            if button.starts_a_group() && index > 0 {
+                out.push(y + (self.group_gap - self.gap) / 2);
+                y += self.group_gap - self.gap;
+            }
+            y += self.button;
+        }
+        out
     }
 
     /// The rectangle of each button, in the strip's own coordinates.
@@ -532,6 +559,8 @@ pub fn metrics_for(factor: f64) -> Metrics {
         padding: scale(Metrics::BASE.padding),
         group_gap: scale(Metrics::BASE.group_gap),
         standoff: scale(Metrics::BASE.standoff),
+        radius: scale(Metrics::BASE.radius).max(1),
+        panel_radius: scale(Metrics::BASE.panel_radius).max(1),
     }
 }
 

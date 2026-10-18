@@ -134,6 +134,13 @@ tools, then how a stroke looks, then history, then the way out. The group is the
 order things are reached for, and the separator is so the eye can skip the ones
 it is not using.
 
+It is drawn as a light card: a rounded plate with a hairline border, a rounded
+outline around every button, dark ink inside, and the rules between the groups
+inset from the card's edges. A card rather than a dark slab because it sits
+beside a capture it must not be mistaken for — the border is what separates it
+from a white page, and it is the reason the buttons are outlined too. The button
+in force is the one with both a fill and a darker outline.
+
 | # | Button | Key | What it does |
 |---|---|---|---|
 | 1 | Move | `S` | Arms nothing. The pointer goes back to a four-way arrow and the region can be moved and resized; this is the state the overlay starts in. |
@@ -248,8 +255,14 @@ tools/
   ui-probe.ps1       Captures it printed and copied, with or without a scale change
   ui-size.ps1        Prints the window and client rectangles
   ui-roundtrip.ps1   Drives the window and checks the settings file it wrote
-  overlay-check.ps1  Drives the selection overlay and captures what it shows
   overlay-actions.ps1 Presses each of the strip's action buttons and reports the effect
+  layout.py          The strip's geometry, shared by the checks that have to click it
+  check-saved.py     Compares the saved file with the screen, pixel for pixel
+  check-clipboard.py Clicks the copy button and reads the clipboard back
+  drive-palette.py   Drives both palettes and measures what they show
+  drive-move.py      Drags the region and checks the drawing stayed where it was
+  drive-outside.py   Paints outside the region and checks what the file kept
+  shot-strip.py      Photographs the strip
 ```
 
 ## Roadmap
