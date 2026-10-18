@@ -141,8 +141,6 @@ pub struct Metrics {
     pub group_gap: i32,
     /// How far the strip stands off the selection.
     pub standoff: i32,
-    /// Corner radius of a button.
-    pub radius: i32,
 }
 
 impl Metrics {
@@ -153,7 +151,6 @@ impl Metrics {
         padding: 6,
         group_gap: 10,
         standoff: 10,
-        radius: 10,
     };
 
     /// The strip's width, which is one button plus its padding on both sides.
@@ -556,7 +553,6 @@ pub fn metrics_for(factor: f64) -> Metrics {
         padding: scale(Metrics::BASE.padding),
         group_gap: scale(Metrics::BASE.group_gap),
         standoff: scale(Metrics::BASE.standoff),
-        radius: scale(Metrics::BASE.radius).max(1),
     }
 }
 

@@ -135,18 +135,18 @@ order things are reached for, and the separator is so the eye can skip the ones
 it is not using.
 
 It is drawn as a card: a light plate with square corners, a hairline border, a
-soft shadow and a short rule between the groups. Square, because a rounded
-container softens the strip's own edge and at this size the curve reads as a
-smear on a bar that is otherwise a straight line; the buttons are the things with
-corners worth drawing. The shadow is four rounded rings blended over
+soft shadow and a short rule between the groups. Square, and so are the
+buttons: a rounded container softened the strip's own edge, and at this size the
+curves read as a wobble on a control made of straight lines. The shadow is four rounded rings blended over
 whatever is behind them, because GDI cannot blur and a flat grey halo would look
 like a mistake on a photograph.
 
-**The buttons have no background and no border at rest.** That is what settles
-the strip down: twelve outlined boxes read as twelve competing things, and the
-marks alone read as one control surface. A button lights up when the pointer is
-over it, presses darker when it is held, and the tool in force carries a tinted
-fill and a blue icon. Save is the one filled button, in blue with a white icon,
+**Every button has a square container**, and the states fill it rather than
+changing its shape: a hairline of its own at rest, a tinted fill under the
+pointer, darker while held, and the tool in force in its own tint with a blue
+icon. The hairline is a neutral grey, a shade darker than the bar's border, so a
+button's edge reads against the plate it sits on. Save is the one filled button
+in blue with a white icon; Cancel's mark is red with a pale red hover. Save is the one filled button, in blue with a white icon,
 because it is the action the strip exists for. Cancel's mark is red and its
 hover is a pale red, so the way out is recognisable and still not a second
 primary action.

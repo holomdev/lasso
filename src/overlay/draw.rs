@@ -719,11 +719,16 @@ pub fn draw_strip(
             bottom: placement.y + y + height as i32,
         };
 
-        // No background and no border at rest. That is the change that settles the strip down: the
-        // buttons stop being twelve outlined boxes and become marks that light up when they are
-        // under the pointer or in force.
-        if let Some(brush) = background_for(button, state, chrome) {
-            rounded(hdc, &rect, metrics.radius, Some(brush), None);
+        // Every button has a container: a filled one where the state gives it a colour, and
+        // otherwise a hairline of its own. Square corners throughout — a radius on this many
+        // rectangles at this size reads as a wobble rather than as a curve.
+        match background_for(button, state, chrome) {
+            Some(brush) => unsafe {
+                windows::Win32::Graphics::Gdi::FillRect(hdc, &rect, brush);
+            },
+            None => unsafe {
+                FrameRect(hdc, &rect, chrome.button_border);
+            },
         }
 
         draw_button_glyph(

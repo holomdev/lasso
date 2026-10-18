@@ -17,6 +17,12 @@ pub const BAR_BORDER: u32 = 0xDCDFE6;
 /// The rules between groups.
 pub const SEPARATOR: u32 = 0xE1E4EA;
 
+/// The container around a button that is not filled.
+///
+/// Measured off the reference: a neutral grey, a shade darker than the bar's own border, so the
+/// button's edge reads against the plate it sits on.
+pub const BUTTON_BORDER: u32 = 0xC8C8CA;
+
 /// An icon at rest.
 pub const ICON: u32 = 0x374151;
 /// An icon whose button cannot act.
@@ -93,6 +99,7 @@ pub struct Chrome {
     pub bar_bg: HBRUSH,
     pub bar_border: HBRUSH,
     pub separator: HBRUSH,
+    pub button_border: HBRUSH,
     pub hover: HBRUSH,
     pub pressed: HBRUSH,
     pub active: HBRUSH,
@@ -115,6 +122,7 @@ impl Chrome {
             bar_bg: brush(BAR_BG),
             bar_border: brush(BAR_BORDER),
             separator: brush(SEPARATOR),
+            button_border: brush(BUTTON_BORDER),
             hover: brush(HOVER_BG),
             pressed: brush(PRESSED_BG),
             active: brush(ACTIVE_BG),
@@ -142,6 +150,7 @@ impl Drop for Chrome {
             self.bar_bg,
             self.bar_border,
             self.separator,
+            self.button_border,
             self.hover,
             self.pressed,
             self.active,
