@@ -97,10 +97,13 @@ def drag(start, end, steps=8):
 
 
 OUT.mkdir(parents=True, exist_ok=True)
+# stderr kept: a fallback that cannot be seen is a difference nobody looks for, and the program
+# says which icon family it ended up drawing with.
+error_log = OUT / "stderr.txt"
 process = subprocess.Popen(
     [str(EXE), "select"],
     stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
+    stderr=error_log.open("w", encoding="utf-8", errors="replace"),
 )
 time.sleep(2.5)
 if process.poll() is not None:

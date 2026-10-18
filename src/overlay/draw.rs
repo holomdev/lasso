@@ -19,13 +19,16 @@
 
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
-    BS_SOLID, CreatePen, CreateSolidBrush, DeleteObject, Ellipse, ExtCreatePen, FrameRect,
-    GetObjectW, GetStockObject, HDC, HGDIOBJ, HPEN, LineTo, LOGBRUSH, MoveToEx, NULL_BRUSH,
-    NULL_PEN, PEN_STYLE, PS_ENDCAP_ROUND, PS_GEOMETRIC, PS_JOIN_ROUND, PS_SOLID, Polyline, RoundRect,
-    SelectObject,
+    ANTIALIASED_QUALITY, BS_SOLID, CLIP_DEFAULT_PRECIS, CreateFontW, CreatePen, CreateSolidBrush,
+    BACKGROUND_MODE, DEFAULT_CHARSET, DEFAULT_PITCH, DeleteObject, Ellipse, ExtCreatePen, ExtTextOutW,
+    ETO_OPTIONS, FF_DONTCARE, FW_NORMAL, FrameRect, GetObjectW, GetStockObject, GetTextExtentPoint32W,
+    GetTextFaceW, HDC, HFONT, HGDIOBJ, HPEN, LineTo, LOGBRUSH, MoveToEx, NULL_BRUSH, NULL_PEN,
+    OUT_TT_PRECIS, PEN_STYLE, PS_ENDCAP_ROUND, PS_GEOMETRIC, PS_JOIN_ROUND, PS_SOLID, Polyline,
+    RoundRect, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 
 use super::annotation::{Point, Shape, Stroke};
+use windows::Win32::Foundation::SIZE;
 use super::toolbar::{Button, Metrics, Placement};
 
 /// The colour a usable button's glyph is drawn in.
@@ -379,6 +382,109 @@ fn brush_colour(brush: windows::Win32::Graphics::Gdi::HBRUSH) -> COLORREF {
     }
 }
 
+/// The face Windows draws its own interface with. It ships with the system, so nothing is bundled
+/// and nothing has to be licensed: the glyphs are the operating system's.
+const ICON_FACE: windows::core::PCWSTR = windows::core::w!("Segoe MDL2 Assets");
+
+/// The glyph a button takes from that font, or `None` for the two that show a value instead.
+///
+/// Colour and Thickness are not icons: one is a disc of the colour in force and the other a bar of
+/// the width in force, and replacing either with a fixed mark would leave the button unable to
+/// answer the only question it is asked.
+fn icon_glyph(button: Button) -> Option<u16> {
+    Some(match button {
+        Button::Tool(super::annotation::Tool::Move) => 0xE740,
+        Button::Tool(super::annotation::Tool::Arrow) => 0xE741,
+        Button::Tool(super::annotation::Tool::Rectangle) => 0xE739,
+        Button::Tool(super::annotation::Tool::Ellipse) => 0xEA3A,
+        Button::Tool(super::annotation::Tool::Pencil) => 0xE70F,
+        Button::Undo => 0xE7A7,
+        Button::Redo => 0xE7A6,
+        Button::Save => 0xE74E,
+        Button::Copy => 0xE8C8,
+        Button::Cancel => 0xE711,
+        Button::Colour | Button::Thickness => return None,
+    })
+}
+
+/// The font, selected into the context, or `None` when the system does not have it.
+///
+/// `CreateFontW` does not fail for a missing family: it asks the mapper for a substitute and hands
+/// back a font that is not the one asked for. So the check is the face that actually ended up
+/// selected, read back with `GetTextFaceW`, rather than the handle being valid.
+fn select_icon_font(hdc: HDC, side: i32) -> Option<(HFONT, HGDIOBJ)> {
+    // Phosphor proportion is not in question here: MDL2 is drawn for a sixteen-pixel box, so the
+    // icon is about half the button and the rest is the padding that makes a strip look calm.
+    let height = -((side * 17 / 36).max(8));
+    let font = unsafe {
+        CreateFontW(
+            height,
+            0,
+            0,
+            0,
+            FW_NORMAL.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET,
+            OUT_TT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            ANTIALIASED_QUALITY,
+            DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
+            ICON_FACE,
+        )
+    };
+    if font.is_invalid() {
+        return None;
+    }
+    let previous = unsafe { SelectObject(hdc, HGDIOBJ(font.0)) };
+    let mut face = [0u16; 64];
+    let _ = unsafe { GetTextFaceW(hdc, Some(&mut face)) };
+    // `GetTextFaceW` counts the terminator in its answer, so a slice of that length carries a
+    // trailing zero and compares unequal to the name it looks like. Cut at the first zero instead.
+    let end = face.iter().position(|unit| *unit == 0).unwrap_or(face.len());
+    let actual = String::from_utf16_lossy(&face[..end]);
+    if actual != "Segoe MDL2 Assets" {
+        // Said out loud: the fallback is invisible, and a strip drawn in the wrong icon family is
+        // a difference nobody would think to look for.
+        eprintln!("[strip] the icon font is missing, drawing the fallback: got {actual:?}");
+        unsafe {
+            SelectObject(hdc, previous);
+            let _ = DeleteObject(HGDIOBJ(font.0));
+        }
+        return None;
+    }
+    Some((font, previous))
+}
+
+/// One glyph, centred on a point in the ink colour.
+///
+/// Grayscale antialiasing rather than ClearType: subpixel rendering puts coloured fringes on the
+/// strokes, which is the last thing a capture tool should be drawing.
+fn draw_icon_glyph(hdc: HDC, glyph: u16, centre: (i32, i32), ink: COLORREF) {
+    // The glyph as a UTF-16 string of one unit, with a terminator so it can be handed over as a
+    // pointer, and the count given separately.
+    let text = [glyph, 0];
+    let mut size = SIZE::default();
+    let saved_colour = unsafe { SetTextColor(hdc, ink) };
+    let saved_mode = unsafe { SetBkMode(hdc, TRANSPARENT) };
+    unsafe {
+        let _ = GetTextExtentPoint32W(hdc, &text[..1], &mut size);
+        let _ = ExtTextOutW(
+            hdc,
+            centre.0 - size.cx / 2,
+            centre.1 - size.cy / 2,
+            ETO_OPTIONS(0),
+            None,
+            windows::core::PCWSTR(text.as_ptr()),
+            1,
+            None,
+        );
+        SetBkMode(hdc, BACKGROUND_MODE(saved_mode as u32));
+        SetTextColor(hdc, saved_colour);
+    }
+}
+
 /// A pen with round ends and round joins, which is what a Phosphor icon is drawn with.
 ///
 /// A plain `CreatePen` makes square ends, and every stroke then has a chopped-off tip; the round
@@ -474,6 +580,10 @@ pub fn draw_strip(
     let ink_pen = unsafe { CreatePen(PS_SOLID, 1, BUTTON_INK) };
     let outline_in_ink = !ink_pen.is_invalid();
 
+    // One font for the whole strip, not one per glyph: twelve creations and deletions a repaint is
+    // how the GDI handles ran out once already.
+    let icon_font = select_icon_font(hdc, metrics.button);
+
     for (button, x, y, width, height) in metrics.button_rects() {
         let rect = RECT {
             left: placement.x + x,
@@ -495,13 +605,18 @@ pub fn draw_strip(
         // every button below it and make the strip a different shape from one moment to
         // the next.
         let ink = if state.is_disabled(button) { DIM_INK } else { BUTTON_INK };
-        draw_button_glyph(hdc, button, &rect, ink, state);
+        // Only the handle is needed below; the object to put back is kept for the end.
+        draw_button_glyph(hdc, button, &rect, ink, state, icon_font.map(|(font, _)| font));
     }
 
     // Both pens, released. Nothing is selected into the context by the time they are freed —
     // `rounded` puts back what it took — and a pen that is still selected cannot be released,
     // which is the leak that took the icons away once already.
     unsafe {
+        if let Some((font, previous)) = icon_font {
+            SelectObject(hdc, previous);
+            let _ = DeleteObject(HGDIOBJ(font.0));
+        }
         if !edge_pen.is_invalid() {
             let _ = DeleteObject(HGDIOBJ(edge_pen.0));
         }
@@ -565,7 +680,14 @@ fn user_objects() -> u32 {
 /// `ink` colours both the lines and, where a shape needs it, the fill. A button that
 /// cannot be used is drawn in a colour close to the plate: present, and visibly not
 /// available.
-fn draw_button_glyph(hdc: HDC, button: Button, rect: &RECT, ink: COLORREF, state: &StripState) {
+fn draw_button_glyph(
+    hdc: HDC,
+    button: Button,
+    rect: &RECT,
+    ink: COLORREF,
+    state: &StripState,
+    font: Option<HFONT>,
+) {
     let width = rect.right - rect.left;
     let height = rect.bottom - rect.top;
     let centre = (rect.left + width / 2, rect.top + height / 2);
@@ -579,6 +701,14 @@ fn draw_button_glyph(hdc: HDC, button: Button, rect: &RECT, ink: COLORREF, state
     // A chevron's legs are shorter than the arm they cap: at half the arm the four of them met
     // in the middle and the mark read as a diamond with a cross through it.
     let head = (arm / 3).max(2);
+
+    // The system's own icon, when there is one for this button. Everything below is the fallback,
+    // and it is kept because a machine without the font should still show an icon rather than a
+    // blank button.
+    if let (Some(_), Some(glyph)) = (font, icon_glyph(button)) {
+        draw_icon_glyph(hdc, glyph, centre, ink);
+        return;
+    }
 
     let pen = geometric_pen(stroke, ink);
     if pen.is_invalid() {
@@ -690,6 +820,9 @@ fn draw_button_glyph(hdc: HDC, button: Button, rect: &RECT, ink: COLORREF, state
             // The colour itself, as a disc: the only place the colour appears, and a swatch that
             // is not the colour is a button with no answer. The rim is what lets white and yellow
             // read against a light card.
+            // The same seventeen-pixel box the font glyphs occupy, so the disc does not look like a
+            // button and a half next to them.
+            let reach = (side * 17 / 72).max(4);
             let paint = unsafe { CreateSolidBrush(state.colour.to_colorref()) };
             let rim = geometric_pen(1, PLATE_SHADOW);
             if !paint.is_invalid() {
@@ -702,10 +835,10 @@ fn draw_button_glyph(hdc: HDC, button: Button, rect: &RECT, ink: COLORREF, state
                 unsafe {
                     let _ = Ellipse(
                         hdc,
-                        centre.0 - arm,
-                        centre.1 - arm,
-                        centre.0 + arm,
-                        centre.1 + arm,
+                        centre.0 - reach,
+                        centre.1 - reach,
+                        centre.0 + reach,
+                        centre.1 + reach,
                     );
                 }
                 unsafe {
@@ -726,11 +859,14 @@ fn draw_button_glyph(hdc: HDC, button: Button, rect: &RECT, ink: COLORREF, state
             // and takes its length from the icon, which is how the reference shows it — and it is
             // the width that the button is for.
             let wide = (state.thickness as i32).clamp(4, (side - 6).max(4));
+            // The bar's height is the icon box, not the full reach: the width is the thing being
+            // shown and the length only has to be long enough to show it against.
+            let tall = (side * 17 / 72).max(4);
             let bar = RECT {
                 left: centre.0 - wide / 2,
-                top: centre.1 - arm,
+                top: centre.1 - tall,
                 right: centre.0 - wide / 2 + wide,
-                bottom: centre.1 + arm,
+                bottom: centre.1 + tall,
             };
             let paint = unsafe { CreateSolidBrush(ink) };
             if !paint.is_invalid() {
