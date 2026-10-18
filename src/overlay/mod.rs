@@ -128,15 +128,6 @@ const WHITE: COLORREF = COLORREF(0x00FF_FFFF);
 const BLACK: COLORREF = COLORREF(0x0000_0000);
 const LABEL_BG: COLORREF = COLORREF(0x0020_2020);
 
-/// The strip's plate, its border and its pressed button.
-///
-/// A dark plate with a lighter border, so the strip reads as a card laid on the capture
-/// rather than as a hole in it. Deliberately not the system's `COLOR_BTNFACE`: this
-/// floats over arbitrary content, where a system-grey panel would look like a piece of
-/// some other window.
-const PLATE_BG: COLORREF = COLORREF(0x00FA_FAFA);
-const PLATE_EDGE: COLORREF = COLORREF(0x00D0_D0D0);
-const BUTTON_FACE: COLORREF = COLORREF(0x00E8_E8E8);
 
 /// The stroke width a new stroke starts at, in 96-DPI pixels.
 const DEFAULT_THICKNESS: u32 = annotation::THICKNESS_STEPS[0];
@@ -265,10 +256,8 @@ struct State {
     white: HBRUSH,
     black: HBRUSH,
     label_bg: HBRUSH,
-    /// The strip's plate, its separator, its pressed button and its unavailable glyphs.
-    plate: HBRUSH,
-    edge: HBRUSH,
-    face: HBRUSH,
+    /// Every brush the strip is drawn with, made once and released together.
+    chrome: crate::theme::Chrome,
     drag: Drag,
     /// Last known pointer position, in client coordinates. `None` until the
     /// pointer first moves over the window, which is also when the marker and
@@ -316,14 +305,9 @@ struct State {
 impl Drop for State {
     fn drop(&mut self) {
         unsafe {
-            for brush in [
-                self.white,
-                self.black,
-                self.label_bg,
-                self.plate,
-                self.edge,
-                self.face,
-            ] {
+            // The strip's brushes release themselves with the chrome; these three are the
+            // selection's own.
+            for brush in [self.white, self.black, self.label_bg] {
                 let _ = DeleteObject(HGDIOBJ(brush.0));
             }
         }
@@ -389,9 +373,7 @@ pub fn select_region(frame: &Frame) -> Result<Option<Composed>> {
             white: unsafe { CreateSolidBrush(WHITE) },
             black: unsafe { CreateSolidBrush(BLACK) },
             label_bg: unsafe { CreateSolidBrush(LABEL_BG) },
-            plate: unsafe { CreateSolidBrush(PLATE_BG) },
-            edge: unsafe { CreateSolidBrush(PLATE_EDGE) },
-            face: unsafe { CreateSolidBrush(BUTTON_FACE) },
+            chrome: crate::theme::Chrome::new(),
             drag: Drag::Idle,
             pointer: None,
             current: None,
@@ -1412,9 +1394,8 @@ fn paint(window_dc: HDC, st: &State, invalid: &RECT) {
                         &palette,
                         &st.metrics,
                         &strip_state(st),
-                        st.plate,
-                        st.edge,
-                    );
+                        &st.chrome,
+                                    );
                 }
             }
             None => draw_hint(mem, &st.canvas),
@@ -1477,15 +1458,15 @@ fn dump_canvas(st: &State) {
 /// One builder rather than two: a palette that showed a different colour from the button that
 /// opened it would be a defect of exactly the kind this state exists to prevent.
 fn strip_state(st: &State) -> draw::StripState {
-    // The armed tool is highlighted, unless the pointer is over another button, in which case
-    // that one is: the highlight follows the pointer because that is what a press would act on.
-    let active = match st.hovered {
-        Some(button) => Some(button),
-        None if st.tool.draws() => Some(Button::Tool(st.tool)),
-        None => None,
-    };
     draw::StripState {
-        active,
+        // Always one of them: Move is a choice like the others, and the strip starts in it.
+        armed: Some(toolbar::Button::Tool(st.tool)),
+        hovered: st.hovered,
+        pressed: st.pressed.map(|pressed| match pressed {
+            Pressed::Save => toolbar::Button::Save,
+            Pressed::Copy => toolbar::Button::Copy,
+            Pressed::Cancel => toolbar::Button::Cancel,
+        }),
         can_undo: st.annotations.can_undo(),
         can_redo: st.annotations.can_redo(),
         colour: st.colour,
@@ -1494,15 +1475,7 @@ fn strip_state(st: &State) -> draw::StripState {
 }
 
 fn draw_strip(hdc: HDC, st: &State, placement: &Placement) {
-    draw::draw_strip(
-        hdc,
-        placement,
-        &st.metrics,
-        &strip_state(st),
-        st.plate,
-        st.edge,
-        st.face,
-    );
+    draw::draw_strip(hdc, placement, &st.metrics, &strip_state(st), &st.chrome);
 }
 
 fn draw_border(hdc: HDC, rect: &RECT, white: HBRUSH, black: HBRUSH) {

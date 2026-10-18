@@ -9,6 +9,7 @@
 
 mod capture;
 mod clipboard;
+mod theme;
 mod dpi;
 mod hotkey;
 mod icon;

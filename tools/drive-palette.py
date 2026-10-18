@@ -36,7 +36,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import layout  # noqa: E402
 
 # The icons are drawn in dark ink on the light card.
-INK = (0x2A, 0x2A, 0x2A)
+INK = (0x37, 0x41, 0x51)
 BUTTON, GAP, PADDING = layout.BUTTON, layout.GAP, layout.PADDING
 STRIP_X = layout.strip_x(REGION)
 STRIP_Y = REGION[1]
@@ -316,7 +316,7 @@ if any(size < 4 for size in sizes_open):
     failures.append(f"a thickness cell is empty, so no dot was drawn there: {sizes_open}")
 if not all(a < b for a, b in zip(sizes_open, sizes_open[1:])):
     failures.append(f"the thickness dots do not grow across the row: {sizes_open}")
-if sizes_open and count(thick_open, layout.PLATE, THICK_BAND) < 1000:
+if sizes_open and count(thick_open, layout.POPUP, THICK_BAND) < 1000:
     failures.append("the thickness palette is not on screen when its button is hovered")
 if ink_area(thick_before, THICK_BUTTON_BAND) >= ink_area(thick_chosen, THICK_BUTTON_BAND):
     failures.append(

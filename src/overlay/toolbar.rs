@@ -155,8 +155,8 @@ impl Metrics {
         padding: 6,
         group_gap: 10,
         standoff: 10,
-        radius: 8,
-        panel_radius: 12,
+        radius: 10,
+        panel_radius: 15,
     };
 
     /// The strip's width, which is one button plus its padding on both sides.

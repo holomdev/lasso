@@ -7,9 +7,11 @@ mistake the program itself made once, with its palette rules written twice. Thes
 """
 
 # The card's colours: a light plate, a hairline border, dark ink.
-PLATE = (0xFA, 0xFA, 0xFA)
-EDGE = (0xD0, 0xD0, 0xD0)
-INK = (0x2A, 0x2A, 0x2A)
+PLATE = (0xF7, 0xF8, 0xFA)
+EDGE = (0xDC, 0xDF, 0xE6)
+INK = (0x37, 0x41, 0x51)
+# A palette is drawn on white, not on the bar's plate.
+POPUP = (0xFF, 0xFF, 0xFF)
 
 BUTTON = 36
 GAP = 4
@@ -19,7 +21,10 @@ STANDOFF = 10
 RADIUS = 8
 PANEL_RADIUS = 12
 STRIP_WIDTH = BUTTON + PADDING * 2
-STRIP_HEIGHT = 12 * BUTTON + 11 * GAP + 3 * (GROUP_GAP - GAP) + 2 * PADDING
+# The program adds a gap between every pair of buttons and a group gap on top of that for
+# each group that starts, so the two are summed, not substituted. Getting this wrong cropped
+# the last button off every photograph of the strip.
+STRIP_HEIGHT = 12 * BUTTON + 11 * GAP + 3 * GROUP_GAP + 2 * PADDING
 
 # The buttons that start a group, by index: Colour, Undo, Save.
 GROUPS = {5, 7, 9}

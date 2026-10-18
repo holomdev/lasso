@@ -21,7 +21,7 @@ use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
     ANTIALIASED_QUALITY, BS_SOLID, CLIP_DEFAULT_PRECIS, CreateFontW, CreatePen, CreateSolidBrush,
     BACKGROUND_MODE, DEFAULT_CHARSET, DEFAULT_PITCH, DeleteObject, Ellipse, ExtCreatePen, ExtTextOutW,
-    ETO_OPTIONS, FF_DONTCARE, FW_NORMAL, FrameRect, GetObjectW, GetStockObject, GetTextExtentPoint32W,
+    ETO_OPTIONS, FF_DONTCARE, FW_NORMAL, FrameRect, GetStockObject, GetTextExtentPoint32W,
     GetTextFaceW, HDC, HFONT, HGDIOBJ, HPEN, LineTo, LOGBRUSH, MoveToEx, NULL_BRUSH, NULL_PEN,
     OUT_TT_PRECIS, PEN_STYLE, PS_ENDCAP_ROUND, PS_GEOMETRIC, PS_JOIN_ROUND, PS_SOLID, Polyline,
     RoundRect, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
@@ -30,17 +30,6 @@ use windows::Win32::Graphics::Gdi::{
 use super::annotation::{Point, Shape, Stroke};
 use windows::Win32::Foundation::SIZE;
 use super::toolbar::{Button, Metrics, Placement};
-
-/// The colour a usable button's glyph is drawn in.
-const BUTTON_INK: COLORREF = COLORREF(0x002A_2A2A);
-/// The colour of one that cannot be used: close to the plate, so it reads as unavailable.
-const DIM_INK: COLORREF = COLORREF(0x00B0_B0B0);
-/// The rim around the colour swatch.
-///
-/// Near black, because the swatch has to be visible whatever colour it holds: white and
-/// yellow on a light plate need an edge of their own, and a dark one reads against every
-/// colour in the set.
-const PLATE_SHADOW: COLORREF = COLORREF(0x0088_8888);
 
 /// The narrowest a stroke is allowed to be drawn, so a set thickness of zero cannot
 /// produce a shape that is invisible and looks like nothing happened.
@@ -247,11 +236,11 @@ pub fn draw_palette(
     palette: &super::toolbar::Palette,
     metrics: &Metrics,
     state: &StripState,
-    plate: windows::Win32::Graphics::Gdi::HBRUSH,
-    edge: windows::Win32::Graphics::Gdi::HBRUSH,
+    chrome: &crate::theme::Chrome,
 ) {
     use super::annotation::{thickness_index, Colour, THICKNESS_STEPS};
     use super::toolbar::PaletteKind;
+    use crate::theme as colours;
 
     let body = RECT {
         left: palette.x,
@@ -259,10 +248,20 @@ pub fn draw_palette(
         right: palette.x + palette.width as i32,
         bottom: palette.y + palette.height as i32,
     };
-    unsafe {
-        windows::Win32::Graphics::Gdi::FillRect(hdc, &body, plate);
-        FrameRect(hdc, &body, edge);
+
+    // The same card as the strip, with the same shadow: a popup that floats on its own looks like
+    // it came from somewhere else.
+    if let Some(source) = ShadowSource::new() {
+        soft_shadow(hdc, &body, PALETTE_RADIUS, &source);
     }
+    let border = unsafe { CreatePen(PS_SOLID, 1, colours::colorref(colours::POPUP_BORDER)) };
+    rounded(
+        hdc,
+        &body,
+        PALETTE_RADIUS,
+        Some(chrome.popup),
+        Some(border).filter(|pen| !pen.is_invalid()),
+    );
 
     // Which cell is the one in force. A width between two steps marks the nearer one, which is
     // where `+` and `-` would take it next.
@@ -274,19 +273,22 @@ pub fn draw_palette(
         PaletteKind::Thickness => thickness_index(state.thickness),
     };
 
-    let rim = unsafe { CreateSolidBrush(PLATE_SHADOW) };
+    let rim = unsafe { CreateSolidBrush(colours::colorref(colours::SWATCH_BORDER)) };
     for (index, square) in palette.swatches(metrics).into_iter().enumerate() {
+        // The cell in force is filled, so the palette says which one is in use before the ring is
+        // even looked at.
+        if index == selected {
+            rounded(hdc, &square, SWATCH_RADIUS, Some(chrome.active), None);
+        }
         match palette.kind {
             PaletteKind::Colour => {
                 let colour = Colour::ALL[index];
                 let paint = unsafe { CreateSolidBrush(colour.to_colorref()) };
                 if !paint.is_invalid() {
-                    unsafe {
-                        windows::Win32::Graphics::Gdi::FillRect(hdc, &square, paint);
-                    }
+                    rounded(hdc, &square, SWATCH_RADIUS, Some(paint), None);
                     if !rim.is_invalid() {
-                        // Inside the swatch, so the colour keeps its full size and the rim is
-                        // what separates it from the plate — which is what makes white visible.
+                        // A hairline inside the swatch, so the colour keeps its size and white and
+                        // yellow still have an edge against a white popup.
                         unsafe {
                             FrameRect(hdc, &square, rim);
                         }
@@ -297,9 +299,8 @@ pub fn draw_palette(
                 }
             }
             PaletteKind::Thickness => {
-                // A bar of that width, as the button shows it. A disc of the width was honest and
-                // unreadable at the thin end, and a row of discs does not look like the widths it
-                // offers; a row of bars does, and it matches the button that opens it.
+                // A bar of that width, as the button shows it: a row of bars is a row of widths,
+                // and a row of discs is a row of dots that happen to differ.
                 let thickness = THICKNESS_STEPS[index];
                 let cell = (square.right - square.left).min(square.bottom - square.top);
                 let wide = (thickness as i32).clamp(2, (cell - 6).max(2));
@@ -310,42 +311,25 @@ pub fn draw_palette(
                     right: centre_x - wide / 2 + wide,
                     bottom: square.bottom - 4,
                 };
-                let dot = unsafe { CreateSolidBrush(BUTTON_INK) };
+                let dot = unsafe { CreateSolidBrush(colours::colorref(colours::ICON)) };
                 if !dot.is_invalid() {
-                    let no_pen = unsafe { GetStockObject(NULL_PEN) };
-                    let previous_pen = unsafe { SelectObject(hdc, no_pen) };
-                    let previous_brush = unsafe { SelectObject(hdc, HGDIOBJ(dot.0)) };
+                    rounded(hdc, &bar, wide / 2, Some(dot), None);
                     unsafe {
-                        let _ = RoundRect(
-                            hdc,
-                            bar.left,
-                            bar.top,
-                            bar.right,
-                            bar.bottom,
-                            wide,
-                            wide,
-                        );
-                        SelectObject(hdc, previous_brush);
-                        SelectObject(hdc, previous_pen);
                         let _ = DeleteObject(HGDIOBJ(dot.0));
-                    }
-                }
-                if !rim.is_invalid() {
-                    unsafe {
-                        FrameRect(hdc, &square, edge);
                     }
                 }
             }
         }
-        // The choice in force is outlined, so the palette answers "which one am I using".
+        // The choice in force, ringed two pixels clear of the swatch so the ring does not change
+        // the colour it is pointing at.
         if index == selected {
-            let ring = unsafe { CreateSolidBrush(BUTTON_INK) };
+            let ring = unsafe { CreateSolidBrush(colours::colorref(colours::SAVE_BG)) };
             if !ring.is_invalid() {
                 let marker = RECT {
-                    left: square.left - 1,
-                    top: square.top - 1,
-                    right: square.right + 1,
-                    bottom: square.bottom + 1,
+                    left: square.left - RING_OFFSET,
+                    top: square.top - RING_OFFSET,
+                    right: square.right + RING_OFFSET,
+                    bottom: square.bottom + RING_OFFSET,
                 };
                 unsafe {
                     FrameRect(hdc, &marker, ring);
@@ -358,29 +342,12 @@ pub fn draw_palette(
         if !rim.is_invalid() {
             let _ = DeleteObject(HGDIOBJ(rim.0));
         }
+        if !border.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(border.0));
+        }
     }
 }
 
-/// Draw the strip: its plate, its separators, and every button.
-/// The colour a solid brush was made from.
-///
-/// The brushes are made once and handed around, so the pen that outlines them has to take its
-/// colour from the brush rather than from a second constant that could drift away from the first.
-fn brush_colour(brush: windows::Win32::Graphics::Gdi::HBRUSH) -> COLORREF {
-    let mut log = LOGBRUSH::default();
-    let read = unsafe {
-        GetObjectW(
-            HGDIOBJ(brush.0),
-            std::mem::size_of::<LOGBRUSH>() as i32,
-            Some(&mut log as *mut LOGBRUSH as *mut std::ffi::c_void),
-        )
-    };
-    if read == 0 {
-        BUTTON_INK
-    } else {
-        log.lbColor
-    }
-}
 
 /// The face Windows draws its own interface with. It ships with the system, so nothing is bundled
 /// and nothing has to be licensed: the glyphs are the operating system's.
@@ -415,7 +382,7 @@ fn icon_glyph(button: Button) -> Option<u16> {
 fn select_icon_font(hdc: HDC, side: i32) -> Option<(HFONT, HGDIOBJ)> {
     // Phosphor proportion is not in question here: MDL2 is drawn for a sixteen-pixel box, so the
     // icon is about half the button and the rest is the padding that makes a strip look calm.
-    let height = -((side * 17 / 36).max(8));
+    let height = -((side * 20 / 36).max(8));
     let font = unsafe {
         CreateFontW(
             height,
@@ -506,18 +473,29 @@ fn geometric_pen(width: i32, colour: COLORREF) -> HPEN {
     }
 }
 
-/// A rounded rectangle, filled and outlined with the objects it is given.
+/// A rounded rectangle, filled and optionally outlined.
 ///
-/// `RoundRect` takes the corner *diameter*, so the radius is doubled here rather than at every
-/// call. Both objects are put back, because the context outlives this call.
-fn rounded(hdc: HDC, rect: &RECT, radius: i32, fill: Option<windows::Win32::Graphics::Gdi::HBRUSH>, pen: HPEN) {
+/// `RoundRect` takes the corner *diameter*, so the radius is doubled here rather than at every call.
+/// Both objects are put back, because the context outlives this call — and with no outline asked
+/// for, the outline pen is the null one rather than a missing argument, so a button at rest draws
+/// its background and no edge.
+fn rounded(
+    hdc: HDC,
+    rect: &RECT,
+    radius: i32,
+    fill: Option<windows::Win32::Graphics::Gdi::HBRUSH>,
+    pen: Option<HPEN>,
+) {
     let brush = match fill {
         Some(brush) => HGDIOBJ(brush.0),
-        // No fill: the corner is round but the plate shows through the middle.
         None => unsafe { GetStockObject(NULL_BRUSH) },
     };
+    let stroke = match pen {
+        Some(pen) => HGDIOBJ(pen.0),
+        None => unsafe { GetStockObject(NULL_PEN) },
+    };
     let saved_brush = unsafe { SelectObject(hdc, brush) };
-    let saved_pen = unsafe { SelectObject(hdc, HGDIOBJ(pen.0)) };
+    let saved_pen = unsafe { SelectObject(hdc, stroke) };
     unsafe {
         let _ = RoundRect(
             hdc,
@@ -533,14 +511,153 @@ fn rounded(hdc: HDC, rect: &RECT, radius: i32, fill: Option<windows::Win32::Grap
     }
 }
 
+/// A single black pixel, for `AlphaBlend` to stretch across a clip.
+///
+/// GDI has no blur, so the bar's shadow is a few rounded rings, each wider and fainter than the
+/// last, blended over what is behind them. The source is this one pixel: blend it, do not paint
+/// grey over a screenshot, or the shadow will look like a halo on a photograph.
+struct ShadowSource {
+    dc: HDC,
+    previous: HGDIOBJ,
+    bitmap: windows::Win32::Graphics::Gdi::HBITMAP,
+}
+
+impl ShadowSource {
+    fn new() -> Option<Self> {
+        let black = [0u8, 0, 0, 0];
+        let bitmap = unsafe {
+            windows::Win32::Graphics::Gdi::CreateBitmap(1, 1, 1, 32, Some(black.as_ptr() as *const _))
+        };
+        if bitmap.is_invalid() {
+            return None;
+        }
+        let dc = unsafe { windows::Win32::Graphics::Gdi::CreateCompatibleDC(None) };
+        if dc.is_invalid() {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(bitmap.0));
+            }
+            return None;
+        }
+        let previous = unsafe { SelectObject(dc, HGDIOBJ(bitmap.0)) };
+        Some(Self {
+            dc,
+            previous,
+            bitmap,
+        })
+    }
+}
+
+impl Drop for ShadowSource {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.dc, self.previous);
+            let _ = DeleteObject(HGDIOBJ(self.bitmap.0));
+            let _ = windows::Win32::Graphics::Gdi::DeleteDC(self.dc);
+        }
+    }
+}
+
+/// Draw the bar's shadow under `rect`: four rings, outward and fainter, offset four pixels down.
+fn soft_shadow(hdc: HDC, rect: &RECT, radius: i32, source: &ShadowSource) {
+    use windows::Win32::Graphics::Gdi::{
+        AC_SRC_OVER, AlphaBlend, BLENDFUNCTION, CombineRgn, CreateRoundRectRgn, RGN_DIFF,
+        SelectClipRgn,
+    };
+
+    // Outermost first, so an inner ring lands on top of the fainter one outside it.
+    //
+    // The alphas are small because the rings *stack*: a pixel near the card is covered by all four,
+    // and four passes at thirty per cent leave fifty-eight per cent of black, which is a bruise
+    // rather than a shadow. These four compound to about sixteen per cent at the card and taper to
+    // eight at the outside.
+    for (spread, alpha) in [(5, 8u8), (4, 10), (3, 12), (2, 14)] {
+        let outer = RECT {
+            left: rect.left - spread,
+            top: rect.top - spread + 4,
+            right: rect.right + spread,
+            bottom: rect.bottom + spread + 4,
+        };
+        // The hole is the bar itself, not a ring inside it: left one pixel larger, and every ring
+        // stops short of the border and leaves a clean line of background between shadow and card,
+        // which reads as no shadow at all.
+        let inner = RECT {
+            left: rect.left,
+            top: rect.top + 4,
+            right: rect.right,
+            bottom: rect.bottom + 4,
+        };
+        unsafe {
+            let ring = CreateRoundRectRgn(
+                outer.left,
+                outer.top,
+                outer.right,
+                outer.bottom,
+                (radius + spread) * 2,
+                (radius + spread) * 2,
+            );
+            let hole = CreateRoundRectRgn(
+                inner.left,
+                inner.top,
+                inner.right,
+                inner.bottom,
+                radius * 2,
+                radius * 2,
+            );
+            if ring.is_invalid() || hole.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ(ring.0));
+                let _ = DeleteObject(HGDIOBJ(hole.0));
+                continue;
+            }
+            // Only the ring shows: the hole is subtracted so the middle is left alone until the
+            // card itself is drawn over it.
+            let _ = CombineRgn(Some(ring), Some(ring), Some(hole), RGN_DIFF);
+            let _ = DeleteObject(HGDIOBJ(hole.0));
+
+            let saved = windows::Win32::Graphics::Gdi::SaveDC(hdc);
+            SelectClipRgn(hdc, Some(ring));
+            let _ = AlphaBlend(
+                hdc,
+                outer.left,
+                outer.top,
+                outer.right - outer.left,
+                outer.bottom - outer.top,
+                source.dc,
+                0,
+                0,
+                1,
+                1,
+                BLENDFUNCTION {
+                    BlendOp: AC_SRC_OVER as u8,
+                    BlendFlags: 0,
+                    SourceConstantAlpha: alpha,
+                    AlphaFormat: 0,
+                },
+            );
+            if saved != 0 {
+                let _ = windows::Win32::Graphics::Gdi::RestoreDC(hdc, saved);
+            }
+            let _ = DeleteObject(HGDIOBJ(ring.0));
+        }
+    }
+}
+
+
+/// A palette's corner radius, larger than a button's so a popup reads as a different kind of thing.
+const PALETTE_RADIUS: i32 = 14;
+/// A colour swatch's corner radius.
+const SWATCH_RADIUS: i32 = 7;
+/// How far clear of a swatch the ring that marks the choice sits.
+const RING_OFFSET: i32 = 2;
+
+/// The rules between the strip's groups: twenty-two pixels, centred.
+const RULE_WIDTH: i32 = 22;
+
 pub fn draw_strip(
     hdc: HDC,
     placement: &Placement,
     metrics: &Metrics,
     state: &StripState,
-    plate: windows::Win32::Graphics::Gdi::HBRUSH,
-    edge: windows::Win32::Graphics::Gdi::HBRUSH,
-    face: windows::Win32::Graphics::Gdi::HBRUSH,
+    chrome: &crate::theme::Chrome,
 ) {
     let body = RECT {
         left: placement.x,
@@ -548,37 +665,32 @@ pub fn draw_strip(
         right: placement.x + placement.width as i32,
         bottom: placement.y + placement.height as i32,
     };
-    let edge_pen = unsafe { CreatePen(PS_SOLID, 1, brush_colour(edge)) };
-    // The card first: a light plate with a hairline border, so it reads as a card laid on the
-    // capture rather than a hole cut into it.
-    if !edge_pen.is_invalid() {
-        rounded(hdc, &body, metrics.panel_radius, Some(plate), edge_pen);
-    } else {
+
+    // The shadow, then the card, then everything else.
+    if let Some(source) = ShadowSource::new() {
+        soft_shadow(hdc, &body, metrics.panel_radius, &source);
+    }
+    let border_pen = unsafe { CreatePen(PS_SOLID, 1, crate::theme::colorref(crate::theme::BAR_BORDER)) };
+    rounded(
+        hdc,
+        &body,
+        metrics.panel_radius,
+        Some(chrome.bar_bg),
+        Some(border_pen).filter(|pen| !pen.is_invalid()),
+    );
+
+    // The rules between groups: one pixel, short enough to read as a separator rather than as a cut.
+    for y in metrics.separators() {
+        let rule = RECT {
+            left: body.left + (body.right - body.left) / 2 - RULE_WIDTH / 2,
+            top: body.top + y,
+            right: body.left + (body.right - body.left) / 2 + (RULE_WIDTH + 1) / 2,
+            bottom: body.top + y + 1,
+        };
         unsafe {
-            windows::Win32::Graphics::Gdi::FillRect(hdc, &body, plate);
+            windows::Win32::Graphics::Gdi::FillRect(hdc, &rule, chrome.separator);
         }
     }
-
-    // The rules between groups. One pixel, inset from the card's edges so they read as separators
-    // inside it rather than as cuts through it.
-    if !edge_pen.is_invalid() {
-        for y in metrics.separators() {
-            let rule = RECT {
-                left: body.left + metrics.padding + 2,
-                top: body.top + y,
-                right: body.right - metrics.padding - 2,
-                bottom: body.top + y + 1,
-            };
-            if rule.right > rule.left {
-                unsafe {
-                    windows::Win32::Graphics::Gdi::FillRect(hdc, &rule, edge);
-                }
-            }
-        }
-    }
-
-    let ink_pen = unsafe { CreatePen(PS_SOLID, 1, BUTTON_INK) };
-    let outline_in_ink = !ink_pen.is_invalid();
 
     // One font for the whole strip, not one per glyph: twelve creations and deletions a repaint is
     // how the GDI handles ran out once already.
@@ -592,37 +704,84 @@ pub fn draw_strip(
             bottom: placement.y + y + height as i32,
         };
 
-        // Every button is outlined, and the one in force is also filled and outlined darker: the
-        // outline says "this is a button", the fill and the darker line say "this is the one".
-        let filled = state.active == Some(button);
-        let pen = if filled && outline_in_ink { ink_pen } else { edge_pen };
-        if !pen.is_invalid() {
-            rounded(hdc, &rect, metrics.radius, filled.then_some(face), pen);
+        // No background and no border at rest. That is the change that settles the strip down: the
+        // buttons stop being twelve outlined boxes and become marks that light up when they are
+        // under the pointer or in force.
+        if let Some(brush) = background_for(button, state, chrome) {
+            rounded(hdc, &rect, metrics.radius, Some(brush), None);
         }
 
-        // An unavailable button keeps its glyph, drawn in a colour close to the plate: it
-        // reads as present but not available, which is what it is. Hiding it would move
-        // every button below it and make the strip a different shape from one moment to
-        // the next.
-        let ink = if state.is_disabled(button) { DIM_INK } else { BUTTON_INK };
-        // Only the handle is needed below; the object to put back is kept for the end.
-        draw_button_glyph(hdc, button, &rect, ink, state, icon_font.map(|(font, _)| font));
+        draw_button_glyph(
+            hdc,
+            button,
+            &rect,
+            ink_for(button, state),
+            state,
+            icon_font.map(|(font, _)| font),
+        );
     }
 
-    // Both pens, released. Nothing is selected into the context by the time they are freed —
-    // `rounded` puts back what it took — and a pen that is still selected cannot be released,
-    // which is the leak that took the icons away once already.
     unsafe {
         if let Some((font, previous)) = icon_font {
             SelectObject(hdc, previous);
             let _ = DeleteObject(HGDIOBJ(font.0));
         }
-        if !edge_pen.is_invalid() {
-            let _ = DeleteObject(HGDIOBJ(edge_pen.0));
+        if !border_pen.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(border_pen.0));
         }
-        if !ink_pen.is_invalid() {
-            let _ = DeleteObject(HGDIOBJ(ink_pen.0));
-        }
+    }
+}
+
+/// The background a button draws, if any.
+///
+/// One place for the order of precedence, because the same question asked in two places is the
+/// question that gets two answers: pressed beats hover beats the tool in force, Save is filled in
+/// every state, and Cancel only shows itself when it is being used.
+fn background_for(
+    button: Button,
+    state: &StripState,
+    chrome: &crate::theme::Chrome,
+) -> Option<windows::Win32::Graphics::Gdi::HBRUSH> {
+    if state.is_disabled(button) {
+        return None;
+    }
+    if button == Button::Save {
+        return Some(match state.pressed {
+            Some(pressed) if pressed == button => chrome.save_pressed,
+            _ if state.hovered == Some(button) => chrome.save_hover,
+            _ => chrome.save,
+        });
+    }
+    if button == Button::Cancel {
+        return match state.pressed {
+            Some(pressed) if pressed == button => Some(chrome.cancel_pressed),
+            _ if state.hovered == Some(button) => Some(chrome.cancel_hover),
+            _ => None,
+        };
+    }
+    if state.pressed == Some(button) {
+        return Some(chrome.pressed);
+    }
+    if state.hovered == Some(button) {
+        return Some(chrome.hover);
+    }
+    if state.armed == Some(button) {
+        return Some(chrome.active);
+    }
+    None
+}
+
+/// The colour a button's mark is drawn in.
+fn ink_for(button: Button, state: &StripState) -> COLORREF {
+    use crate::theme as colours;
+    if state.is_disabled(button) {
+        return colours::colorref(colours::ICON_DISABLED);
+    }
+    match button {
+        Button::Save => colours::colorref(colours::SAVE_ICON),
+        Button::Cancel => colours::colorref(colours::CANCEL_ICON),
+        _ if state.armed == Some(button) => colours::colorref(colours::ACTIVE_ICON),
+        _ => colours::colorref(colours::ICON),
     }
 }
 
@@ -633,8 +792,15 @@ pub fn draw_strip(
 /// and three positional arguments of which two are booleans is how they end up swapped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StripState {
-    /// The button to draw standing out: the armed tool, or whatever the pointer is over.
-    pub active: Option<Button>,
+    /// The tool in force, which is the one button drawn as chosen.
+    ///
+    /// One button only: hover is not a choice, and a strip that lights two buttons at once makes
+    /// the person look twice to find out which one they are painting with.
+    pub armed: Option<Button>,
+    /// The button the pointer is over, if any.
+    pub hovered: Option<Button>,
+    /// The button being held down, if any.
+    pub pressed: Option<Button>,
     /// Whether there is anything for undo to take back.
     pub can_undo: bool,
     /// Whether there is anything for redo to put back.
@@ -729,7 +895,7 @@ fn draw_button_glyph(
     };
     // Every straight mark is a line with round ends; `rounded` covers the two glyphs that are
     // outlines. Nothing here fills, so no brush is selected and nothing has to be put back.
-    let hollow = |rect: &RECT, radius: i32| rounded(hdc, rect, radius, None, pen);
+    let hollow = |rect: &RECT, radius: i32| rounded(hdc, rect, radius, None, Some(pen));
 
     match button {
         Button::Tool(super::annotation::Tool::Move) => {
@@ -822,9 +988,9 @@ fn draw_button_glyph(
             // read against a light card.
             // The same seventeen-pixel box the font glyphs occupy, so the disc does not look like a
             // button and a half next to them.
-            let reach = (side * 17 / 72).max(4);
+            let reach = (side * 22 / 72).max(5);
             let paint = unsafe { CreateSolidBrush(state.colour.to_colorref()) };
-            let rim = geometric_pen(1, PLATE_SHADOW);
+            let rim = geometric_pen(1, crate::theme::colorref(crate::theme::SWATCH_BORDER));
             if !paint.is_invalid() {
                 let saved_brush = unsafe { SelectObject(hdc, HGDIOBJ(paint.0)) };
                 let saved_rim = if rim.is_invalid() {
@@ -833,12 +999,20 @@ fn draw_button_glyph(
                     Some(unsafe { SelectObject(hdc, HGDIOBJ(rim.0)) })
                 };
                 unsafe {
-                    let _ = Ellipse(
+                    let swatch = RECT {
+                        left: centre.0 - reach,
+                        top: centre.1 - reach,
+                        right: centre.0 + reach,
+                        bottom: centre.1 + reach,
+                    };
+                    let _ = RoundRect(
                         hdc,
-                        centre.0 - reach,
-                        centre.1 - reach,
-                        centre.0 + reach,
-                        centre.1 + reach,
+                        swatch.left,
+                        swatch.top,
+                        swatch.right,
+                        swatch.bottom,
+                        SWATCH_RADIUS * 2 * 2 / 3,
+                        SWATCH_RADIUS * 2 * 2 / 3,
                     );
                 }
                 unsafe {
@@ -861,7 +1035,7 @@ fn draw_button_glyph(
             let wide = (state.thickness as i32).clamp(4, (side - 6).max(4));
             // The bar's height is the icon box, not the full reach: the width is the thing being
             // shown and the length only has to be long enough to show it against.
-            let tall = (side * 17 / 72).max(4);
+            let tall = (side * 20 / 72).max(5);
             let bar = RECT {
                 left: centre.0 - wide / 2,
                 top: centre.1 - tall,
@@ -1011,7 +1185,19 @@ mod tests {
     /// values themselves are pinned in `annotation`, where they are a decision rather than an
     /// accident of layout.
     /// A `COLORREF`, which is 0x00BBGGRR, in the order the buffer holds: blue, green, red.
-    fn ink_pixel(colour: COLORREF) -> (u8, u8, u8) {
+    /// Whether two colours are close enough to be the same mark.
+///
+/// The icons come from a font, so their edges are drawn in shades between the ink and whatever is
+/// behind them. A comparison that demanded the exact colour would count the middle of a two-pixel
+/// stroke in some glyphs and nothing at all in others, which is a test failing over its own
+/// arithmetic rather than over the picture.
+fn close(a: (u8, u8, u8), b: (u8, u8, u8), tolerance: u8) -> bool {
+    a.0.abs_diff(b.0) <= tolerance
+        && a.1.abs_diff(b.1) <= tolerance
+        && a.2.abs_diff(b.2) <= tolerance
+}
+
+fn ink_pixel(colour: COLORREF) -> (u8, u8, u8) {
         let raw = colour.0;
         (
             ((raw >> 16) & 0xFF) as u8,
@@ -1095,11 +1281,11 @@ mod tests {
             400,
             &metrics,
         );
-        let plate = unsafe { CreateSolidBrush(COLORREF(0x0020_2020)) };
-        let edge = unsafe { CreateSolidBrush(COLORREF(0x0060_6060)) };
-        let face = unsafe { CreateSolidBrush(COLORREF(0x0040_4040)) };
+        let chrome = crate::theme::Chrome::new();
         let state = StripState {
-            active: Some(Button::Tool(Tool::Arrow)),
+            armed: Some(Button::Tool(Tool::Arrow)),
+            hovered: None,
+            pressed: None,
             can_undo: true,
             colour: crate::overlay::annotation::Colour::Red,
             thickness: 2,
@@ -1114,18 +1300,12 @@ mod tests {
         let idle = growth_per_round(|| {}, 9, 40);
         let busy = growth_per_round(
             || {
-                draw_strip(canvas.dc(), &placement, &metrics, &state, plate, edge, face);
+                draw_strip(canvas.dc(), &placement, &metrics, &state, &chrome);
             },
             9,
             40,
         );
         let growth = busy - idle;
-
-        unsafe {
-            let _ = DeleteObject(HGDIOBJ(plate.0));
-            let _ = DeleteObject(HGDIOBJ(edge.0));
-            let _ = DeleteObject(HGDIOBJ(face.0));
-        }
 
         // One glyph's pen is one object. Forty repaints that leak one apiece leave forty behind;
         // what survives the idle subtraction is a few objects of timing noise, so ten separates
@@ -1225,26 +1405,22 @@ mod tests {
         let palette = toolbar::palette_for(PaletteKind::Thickness, &strip, 340, height, &metrics);
 
         let canvas = blank(340, height);
-        let plate = unsafe { CreateSolidBrush(COLORREF(0x0020_2020)) };
-        let edge = unsafe { CreateSolidBrush(COLORREF(0x0060_6060)) };
+        let chrome = crate::theme::Chrome::new();
         draw_palette(
             canvas.dc(),
             &palette,
             &metrics,
             &StripState {
-                active: None,
+                armed: None,
+                hovered: None,
+                pressed: None,
                 can_undo: false,
                 can_redo: false,
                 colour: crate::overlay::annotation::Colour::Red,
                 thickness: THICKNESS_STEPS[0],
             },
-            plate,
-            edge,
+            &chrome,
         );
-        unsafe {
-            let _ = DeleteObject(HGDIOBJ(plate.0));
-            let _ = DeleteObject(HGDIOBJ(edge.0));
-        }
         unsafe {
             let _ = GdiFlush();
         }
@@ -1256,7 +1432,7 @@ mod tests {
                 for x in cell.left..cell.right {
                     // The dots are drawn in the button ink; the cell's own outline is the edge
                     // colour, so counting only the ink counts only the dot.
-                    if pixel(&canvas, x, y) == ink_pixel(BUTTON_INK) {
+                    if pixel(&canvas, x, y) == ink_pixel(crate::theme::colorref(crate::theme::ICON)) {
                         ink += 1;
                     }
                 }
@@ -1311,29 +1487,22 @@ mod tests {
 
         for colour in [Colour::Red, Colour::Blue, Colour::White] {
             let canvas = blank(200, metrics.height() + 40);
-            let plate = unsafe { CreateSolidBrush(COLORREF(0x0020_2020)) };
-            let edge = unsafe { CreateSolidBrush(COLORREF(0x0060_6060)) };
-            let face = unsafe { CreateSolidBrush(COLORREF(0x0040_4040)) };
+            let chrome = crate::theme::Chrome::new();
             draw_strip(
                 canvas.dc(),
                 &placement,
                 &metrics,
                 &StripState {
-                    active: None,
+                    armed: None,
+                    hovered: None,
+                    pressed: None,
                     can_undo: false,
                     can_redo: false,
                     colour,
                     thickness: 2,
                 },
-                plate,
-                edge,
-                face,
+                &chrome,
             );
-            unsafe {
-                let _ = DeleteObject(HGDIOBJ(plate.0));
-                let _ = DeleteObject(HGDIOBJ(edge.0));
-                let _ = DeleteObject(HGDIOBJ(face.0));
-            }
 
             let wanted = buffer_pixel(colour);
             let mut found = 0;
@@ -1758,17 +1927,17 @@ mod tests {
             400,
             &metrics,
         );
-        let plate = unsafe { CreateSolidBrush(COLORREF(0x0020_2020)) };
-        let edge = unsafe { CreateSolidBrush(COLORREF(0x0060_6060)) };
-        let face = unsafe { CreateSolidBrush(COLORREF(0x0040_4040)) };
+        let chrome = crate::theme::Chrome::new();
         let state = StripState {
-            active: Some(Button::Tool(Tool::Arrow)),
+            armed: Some(Button::Tool(Tool::Arrow)),
+            hovered: None,
+            pressed: None,
             can_undo: true,
             colour: crate::overlay::annotation::Colour::Red,
             thickness: 2,
             can_redo: false,
         };
-        draw_strip(canvas.dc(), &placement, &metrics, &state, plate, edge, face);
+        draw_strip(canvas.dc(), &placement, &metrics, &state, &chrome);
         unsafe {
             let _ = GdiFlush();
         }
@@ -1809,12 +1978,6 @@ mod tests {
             }
         }
         assert_eq!(strays, 0, "the strip drew outside its placement");
-
-        unsafe {
-            let _ = DeleteObject(HGDIOBJ(plate.0));
-            let _ = DeleteObject(HGDIOBJ(edge.0));
-            let _ = DeleteObject(HGDIOBJ(face.0));
-        }
     }
 
     #[test]
@@ -1844,26 +2007,20 @@ mod tests {
                 &metrics,
             );
             let canvas = blank(width, height);
-            let plate = unsafe { CreateSolidBrush(COLORREF(0x0020_2020)) };
-            let edge = unsafe { CreateSolidBrush(COLORREF(0x0060_6060)) };
-            let face = unsafe { CreateSolidBrush(COLORREF(0x0040_4040)) };
-            draw_strip(
-                canvas.dc(),
-                &placement,
-                &metrics,
-                // Every button usable, so a greyed glyph cannot be mistaken for a missing
-                // one: the report was about the icons going, not about undo being dim.
-                &StripState {
-                    active: None,
-                    can_undo: true,
-                    colour: crate::overlay::annotation::Colour::Red,
-                    thickness: 2,
-                    can_redo: true,
-                },
-                plate,
-                edge,
-                face,
-            );
+            let chrome = crate::theme::Chrome::new();
+            // Named, so the ink each button is expected to use can be asked of the program below.
+            // Every button usable, so a greyed glyph cannot be mistaken for a missing one: the
+            // report was about the icons going, not about undo being dim.
+            let state = StripState {
+                armed: None,
+                hovered: None,
+                pressed: None,
+                can_undo: true,
+                colour: crate::overlay::annotation::Colour::Red,
+                thickness: 2,
+                can_redo: true,
+            };
+            draw_strip(canvas.dc(), &placement, &metrics, &state, &chrome);
             unsafe {
                 let _ = GdiFlush();
             }
@@ -1878,17 +2035,17 @@ mod tests {
                 // The colour button does not draw a glyph in ink: it is a swatch of the
                 // colour itself, so it is counted by that colour instead. Every other button
                 // is counted by the ink, which is what "the icons went" was about.
+                // Asked of the program, not restated: Save is drawn in white on its fill and
+                // Cancel in red, and a test that kept its own table would be testing the table.
                 let wanted = match button {
                     // The state this test draws with is red.
-                    Button::Colour => {
-                        buffer_pixel(crate::overlay::annotation::Colour::Red)
-                    }
-                    _ => ink_pixel(BUTTON_INK),
+                    Button::Colour => buffer_pixel(crate::overlay::annotation::Colour::Red),
+                    _ => ink_pixel(ink_for(button, &state)),
                 };
                 let mut ink = 0;
                 for py in rect.top..rect.bottom {
                     for px in rect.left..rect.right {
-                        if pixel(&canvas, px, py) == wanted {
+                        if close(pixel(&canvas, px, py), wanted, 40) {
                             ink += 1;
                         }
                     }
@@ -1903,12 +2060,6 @@ mod tests {
                     w,
                     h
                 );
-            }
-
-            unsafe {
-                let _ = DeleteObject(HGDIOBJ(plate.0));
-                let _ = DeleteObject(HGDIOBJ(edge.0));
-                let _ = DeleteObject(HGDIOBJ(face.0));
             }
         }
     }
@@ -1960,23 +2111,21 @@ mod tests {
                 700,
                 &metrics,
             );
-            let plate = unsafe { CreateSolidBrush(COLORREF(0x0020_2020)) };
-            let edge = unsafe { CreateSolidBrush(COLORREF(0x0060_6060)) };
-            let face = unsafe { CreateSolidBrush(COLORREF(0x0040_4040)) };
+            let chrome = crate::theme::Chrome::new();
             draw_strip(
                 canvas.dc(),
                 &placement,
                 &metrics,
                 &StripState {
-                    active: None,
+                    armed: None,
+                    hovered: None,
+                    pressed: None,
                     can_undo,
                     can_redo,
                     colour: crate::overlay::annotation::Colour::Red,
                 thickness: 2,
                 },
-                plate,
-                edge,
-                face,
+                &chrome,
             );
             unsafe {
                 let _ = GdiFlush();
@@ -1993,27 +2142,18 @@ mod tests {
                 right: placement.x + x + w as i32,
                 bottom: placement.y + y + h as i32,
             };
-            let wanted = if can_undo { BUTTON_INK } else { DIM_INK };
-            let want = (
-                (wanted.0 & 0xFF) as u8,
-                ((wanted.0 >> 8) & 0xFF) as u8,
-                ((wanted.0 >> 16) & 0xFF) as u8,
-            );
+            let wanted = if can_undo { crate::theme::colorref(crate::theme::ICON) } else { crate::theme::colorref(crate::theme::ICON_DISABLED) };
+            let want = ink_pixel(wanted);
             let mut matching = 0;
             for py in rect.top..rect.bottom {
                 for px in rect.left..rect.right {
-                    if pixel(&canvas, px, py) == want {
+                    // Antialiased, so the stroke's core is the ink and its edge is not.
+                    if close(pixel(&canvas, px, py), want, 40) {
                         matching += 1;
                     }
                 }
             }
             counts.push((button, matching));
-
-            unsafe {
-                let _ = DeleteObject(HGDIOBJ(plate.0));
-                let _ = DeleteObject(HGDIOBJ(edge.0));
-                let _ = DeleteObject(HGDIOBJ(face.0));
-            }
         }
 
         let (button, unavailable) = counts[0];
