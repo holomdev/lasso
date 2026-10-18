@@ -151,9 +151,10 @@ because it is the action the strip exists for. Cancel's mark is red and its
 hover is a pale red, so the way out is recognisable and still not a second
 primary action.
 
-Colour and Thickness are not icons: one is a rounded square of the colour in
-force and the other a bar as wide as the stroke, and either would be a button
-that could not answer the question it is asked. Every colour lives in
+Colour and Thickness are not icons: one is a square of the colour in force and the
+other a bar as wide as the stroke, both square-cornered like the rest, and either
+would be a button that could not answer the question it is asked. The palettes
+they open are square too, down to the swatches inside them. Every colour lives in
 `src/theme.rs`, in `0xRRGGBB` order, converted to GDI's `0x00BBGGRR` at one
 boundary.
 

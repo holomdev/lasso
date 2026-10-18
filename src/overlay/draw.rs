@@ -249,19 +249,19 @@ pub fn draw_palette(
         bottom: palette.y + palette.height as i32,
     };
 
-    // The same card as the strip, with the same shadow: a popup that floats on its own looks like
-    // it came from somewhere else.
+    // The same card as the strip, with the same shadow, and the same square corners: a popup that
+    // floats on its own looks like it came from somewhere else.
     if let Some(source) = ShadowSource::new() {
-        soft_shadow(hdc, &body, PALETTE_RADIUS, &source);
+        soft_shadow(hdc, &body, 0, &source);
     }
-    let border = unsafe { CreatePen(PS_SOLID, 1, colours::colorref(colours::POPUP_BORDER)) };
-    rounded(
-        hdc,
-        &body,
-        PALETTE_RADIUS,
-        Some(chrome.popup),
-        Some(border).filter(|pen| !pen.is_invalid()),
-    );
+    let border = unsafe { CreateSolidBrush(colours::colorref(colours::POPUP_BORDER)) };
+    unsafe {
+        windows::Win32::Graphics::Gdi::FillRect(hdc, &body, chrome.popup);
+        if !border.is_invalid() {
+            FrameRect(hdc, &body, border);
+            let _ = DeleteObject(HGDIOBJ(border.0));
+        }
+    }
 
     // Which cell is the one in force. A width between two steps marks the nearer one, which is
     // where `+` and `-` would take it next.
@@ -278,14 +278,18 @@ pub fn draw_palette(
         // The cell in force is filled, so the palette says which one is in use before the ring is
         // even looked at.
         if index == selected {
-            rounded(hdc, &square, SWATCH_RADIUS, Some(chrome.active), None);
+            unsafe {
+                windows::Win32::Graphics::Gdi::FillRect(hdc, &square, chrome.active);
+            }
         }
         match palette.kind {
             PaletteKind::Colour => {
                 let colour = Colour::ALL[index];
                 let paint = unsafe { CreateSolidBrush(colour.to_colorref()) };
                 if !paint.is_invalid() {
-                    rounded(hdc, &square, SWATCH_RADIUS, Some(paint), None);
+                    unsafe {
+                        windows::Win32::Graphics::Gdi::FillRect(hdc, &square, paint);
+                    }
                     if !rim.is_invalid() {
                         // A hairline inside the swatch, so the colour keeps its size and white and
                         // yellow still have an edge against a white popup.
@@ -313,7 +317,9 @@ pub fn draw_palette(
                 };
                 let dot = unsafe { CreateSolidBrush(colours::colorref(colours::ICON)) };
                 if !dot.is_invalid() {
-                    rounded(hdc, &bar, wide / 2, Some(dot), None);
+                    unsafe {
+                        windows::Win32::Graphics::Gdi::FillRect(hdc, &bar, dot);
+                    }
                     unsafe {
                         let _ = DeleteObject(HGDIOBJ(dot.0));
                     }
@@ -645,10 +651,6 @@ fn soft_shadow(hdc: HDC, rect: &RECT, radius: i32, source: &ShadowSource) {
 }
 
 
-/// A palette's corner radius, larger than a button's so a popup reads as a different kind of thing.
-const PALETTE_RADIUS: i32 = 14;
-/// A colour swatch's corner radius.
-const SWATCH_RADIUS: i32 = 7;
 /// How far clear of a swatch the ring that marks the choice sits.
 const RING_OFFSET: i32 = 2;
 
@@ -1019,21 +1021,16 @@ fn draw_button_glyph(
                     Some(unsafe { SelectObject(hdc, HGDIOBJ(rim.0)) })
                 };
                 unsafe {
+                    // Square, like everything else in the strip now: a rounded swatch beside square
+            // buttons reads as a different kind of control.
                     let swatch = RECT {
                         left: centre.0 - reach,
                         top: centre.1 - reach,
                         right: centre.0 + reach,
                         bottom: centre.1 + reach,
                     };
-                    let _ = RoundRect(
-                        hdc,
-                        swatch.left,
-                        swatch.top,
-                        swatch.right,
-                        swatch.bottom,
-                        SWATCH_RADIUS * 2 * 2 / 3,
-                        SWATCH_RADIUS * 2 * 2 / 3,
-                    );
+                    let _ =
+                        windows::Win32::Graphics::Gdi::FillRect(hdc, &swatch, paint);
                 }
                 unsafe {
                     if let Some(previous) = saved_rim {
@@ -1064,23 +1061,11 @@ fn draw_button_glyph(
             };
             let paint = unsafe { CreateSolidBrush(ink) };
             if !paint.is_invalid() {
-                // Its corners are rounded to the width, so the thinnest reads as a line and the
-                // widest as a pill rather than as a rectangle.
-                let no_pen = unsafe { GetStockObject(NULL_PEN) };
-                let saved_pen = unsafe { SelectObject(hdc, no_pen) };
-                let saved_brush = unsafe { SelectObject(hdc, HGDIOBJ(paint.0)) };
+                // Square ends, like the bars in its own palette and like everything else in the
+                // strip: the two are the same mark at two sizes, and a rounded end here would make
+                // the thinnest width a dot rather than a line.
                 unsafe {
-                    let _ = RoundRect(
-                        hdc,
-                        bar.left,
-                        bar.top,
-                        bar.right,
-                        bar.bottom,
-                        wide,
-                        wide,
-                    );
-                    SelectObject(hdc, saved_brush);
-                    SelectObject(hdc, saved_pen);
+                    windows::Win32::Graphics::Gdi::FillRect(hdc, &bar, paint);
                     let _ = DeleteObject(HGDIOBJ(paint.0));
                 }
             }
