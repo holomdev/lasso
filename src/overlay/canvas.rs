@@ -144,6 +144,13 @@ impl Canvas {
         unsafe {
             std::ptr::copy_nonoverlapping(self.bits as *const u8, out.as_mut_ptr(), length);
         }
+        // Everything a pen or a brush touched came back with its alpha at zero: GDI writes
+        // colour and leaves the fourth byte alone. A screenshot is opaque, so the byte is set
+        // here, at the one place pixels leave the buffer, rather than at each of the two places
+        // they are written out.
+        for pixel in out.chunks_exact_mut(4) {
+            pixel[3] = 0xFF;
+        }
         out
     }
 
@@ -334,8 +341,8 @@ mod tests {
 
         let empty = canvas.composed_bgra();
         assert!(
-            empty.iter().all(|byte| *byte == 0),
-            "a fresh canvas is not empty, so this test no longer describes the trap"
+            empty.chunks_exact(4).all(|pixel| pixel[..3] == [0, 0, 0]),
+            "a fresh canvas is not black, so this test no longer describes the trap"
         );
 
         canvas.fill_with_capture();
@@ -351,5 +358,44 @@ mod tests {
             // reads it — which is a transparency nobody asked for.
             assert_eq!(pixel[3], 0xFF, "the composed pixels are not opaque");
         }
+    }
+
+    #[test]
+    fn pixels_a_pen_touched_come_back_opaque() {
+        // GDI writes colour into a 32-bit DIB and leaves the fourth byte alone, so every pixel a
+        // stroke covers reads back with an alpha of zero. A viewer that honours alpha then shows
+        // the drawing as a hole: the report was "the coloured lines are not there", while the
+        // colours were present in the pixels. Anything that leaves this buffer has to be opaque,
+        // and the check has to look at the alpha byte, since dropping it is what hid this.
+        use crate::overlay::annotation::{Colour, Point, Shape, Stroke};
+        use crate::overlay::draw::draw_stroke;
+
+        let capture: Vec<u8> = (0..16 * 16).flat_map(|_| [0x40u8, 0x60, 0x80, 0x00]).collect();
+        let canvas = Canvas::new(&capture, 16, 16).expect("a canvas");
+        canvas.fill_with_capture();
+        draw_stroke(
+            canvas.dc(),
+            &Stroke::new(
+                Shape::Rectangle {
+                    from: Point::new(2, 2),
+                    to: Point::new(12, 12),
+                },
+                Colour::Red,
+                2,
+            ),
+            (0, 0),
+        );
+
+        let pixels = canvas.composed_bgra();
+        assert!(
+            pixels.chunks_exact(4).all(|p| p[3] == 0xFF),
+            "a pixel came back with an alpha below opaque"
+        );
+        // And the stroke is really there, so the test cannot pass by drawing nothing.
+        let red = pixels
+            .chunks_exact(4)
+            .filter(|p| p[..3] == [0x44, 0x44, 0xEF])
+            .count();
+        assert!(red > 20, "the stroke did not reach the buffer: {red} red pixels");
     }
 }

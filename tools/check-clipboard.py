@@ -18,9 +18,37 @@ from PIL import ImageGrab
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 EXE = ROOT / "target" / "debug" / "lasso.exe"
 OUT = ROOT / "target" / "overlay-clipboard"
-REGION = (600, 250, 1200, 700)
-# The copy button, from the strip's layout: the eleventh of twelve, in the last group.
-COPY_BUTTON = (575, 557)
+# Wallpaper, as in the saved-file check: a flat screen region cannot tell "the capture is there"
+# from "the capture is a colour", and the first version of this check failed on a region that
+# happened to be an even dark panel.
+REGION = (200, 640, 680, 1020)
+
+# The strip stands off the region's left edge. The copy button's place comes from the same walk
+# the toolbar does — a closed form got it wrong by twenty pixels, and the click landed on the
+# button below.
+STRIP_WIDTH, BUTTON, GAP, PADDING, GROUP_GAP, STANDOFF = 34, 26, 2, 4, 5, 8
+GROUPS = {5, 7, 9}  # Colour, Undo, Save start a group
+BUTTONS = 12
+COPY_INDEX = 10
+
+
+def button_top(index):
+    """The top of a button, from the layout the toolbar uses."""
+    y = PADDING
+    for i in range(index):
+        y += GAP
+        if i in GROUPS:
+            y += GROUP_GAP
+        y += BUTTON
+    if index in GROUPS:
+        y += GROUP_GAP - GAP
+    return y
+
+
+COPY_BUTTON = (
+    REGION[0] - STANDOFF - STRIP_WIDTH + PADDING + BUTTON // 2,
+    REGION[1] + button_top(COPY_INDEX) + BUTTON // 2,
+)
 STROKE = (0xEF, 0x44, 0x44)
 
 user32 = ctypes.windll.user32
@@ -150,7 +178,7 @@ try:
     # A box inside the region, so the clipboard should carry it too.
     key(0x52)  # R
     time.sleep(0.25)
-    drag((700, 350), (900, 500))
+    drag((left + 80, top + 80), (left + 300, top + 240))
 
     # The copy button.
     click(*COPY_BUTTON)
@@ -169,6 +197,15 @@ if image is None:
     failures.append("the clipboard holds no image — nothing was copied")
     saved = None
 else:
+    if image.mode == "RGBA":
+        alpha = np.array(image)[:, :, 3]
+        transparent = int((alpha != 255).sum())
+        print(f"transparent pixels on the clipboard: {transparent}")
+        if transparent:
+            failures.append(
+                f"{transparent} pixels of the pasted image are not opaque, so it is a hole "
+                "wherever alpha is honoured"
+            )
     saved = np.array(image.convert("RGB"))
     brightness = float(saved.astype(float).mean())
     distinct = len(np.unique(saved.reshape(-1, 3), axis=0))

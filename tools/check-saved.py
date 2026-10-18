@@ -184,7 +184,19 @@ if not SAVED.exists():
     failures.append("no file was saved")
     saved = None
 else:
-    saved = np.array(Image.open(SAVED).convert("RGB"))
+    # Read it as written, alpha included: the strokes came back at alpha zero once, and the file
+    # looked empty in any viewer that honours it while every RGB comparison passed.
+    as_saved = Image.open(SAVED)
+    if as_saved.mode == "RGBA":
+        alpha = np.array(as_saved)[:, :, 3]
+        transparent = int((alpha != 255).sum())
+        print(f"transparent pixels in the file: {transparent}")
+        if transparent:
+            failures.append(
+                f"{transparent} pixels of the file are not opaque, so the drawing is a hole in "
+                "any viewer that honours alpha"
+            )
+    saved = np.array(as_saved.convert("RGB"))
     want = (right - left, bottom - top)
     if (saved.shape[1], saved.shape[0]) != want:
         failures.append(
